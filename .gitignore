@@ -1,0 +1,34 @@
+.venv/
+.venv-path
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+models/
+tmp/
+reference/
+vendor/openai-whisper/
+.env
+__pycache__/
+*.pyc
+
+# Local media, subtitle references, and generated exports.
+*.wav
+*.mp3
+*.mp4
+*.mov
+*.m4a
+*.aac
+*.flac
+*.srt
+*.ass
+*.vtt
+
+# ML/model caches that can be recreated by WhisperX, Hugging Face, or PyTorch.
+.cache/
+huggingface/
+torch/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
