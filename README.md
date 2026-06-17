@@ -51,10 +51,10 @@ For very long files, the backend skips diarization by default and returns a sing
 
 ## Project layout
 
-- [backend/app/main.py](/C:/Users/mizel/OneDrive/Desktop/codex/subtitles/backend/app/main.py)
-- [backend/app/text_processing.py](/C:/Users/mizel/OneDrive/Desktop/codex/subtitles/backend/app/text_processing.py)
-- [frontend/src/App.tsx](/C:/Users/mizel/OneDrive/Desktop/codex/subtitles/frontend/src/App.tsx)
-- [scripts/install.ps1](/C:/Users/mizel/OneDrive/Desktop/codex/subtitles/scripts/install.ps1)
+- `backend/app/main.py`
+- `backend/app/text_processing.py`
+- `frontend/src/App.tsx`
+- `scripts/install.ps1`
 
 ## Configure
 
