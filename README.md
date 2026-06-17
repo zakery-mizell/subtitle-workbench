@@ -2,7 +2,7 @@
 
 Local web app for:
 
-- transcribing audio with OpenAI Whisper
+- transcribing audio with WhisperX / faster-whisper
 - generating editable `.srt` subtitles
 - generating a paragraph transcript `.txt`
 - creating a second `.srt` edit guide with `SILENT`, `CUT`, and `REPEAT` blocks
@@ -10,8 +10,8 @@ Local web app for:
 ## What is implemented
 
 - drag and drop audio upload
-- Whisper model dropdown, defaulted to `large-v3`
-- GPU-first backend setup for an RTX 3090
+- WhisperX model dropdown, defaulted to `large-v3`, with `turbo` also available
+- GPU-first backend setup for NVIDIA CUDA on Windows
 - optional speaker diarization path with named speakers
 - transcript review view with clickable words and low-confidence highlighting
 - subtitle editing view with:
@@ -64,6 +64,14 @@ For very long files, the backend skips diarization by default and returns a sing
 4. If you want the Whisper model cache elsewhere, update `WHISPER_CACHE_DIR`.
 5. Make sure `ffmpeg` is on `PATH`; waveform analysis and range retranscription use it to decode audio/video.
 
+## Requirements
+
+- Windows PowerShell
+- Python 3.12
+- Node.js and npm
+- ffmpeg on `PATH`
+- NVIDIA GPU recommended for larger WhisperX models
+
 ## Install
 
 Run:
@@ -74,8 +82,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 
 That script will:
 
-1. create `.venv` with Python 3.12
-2. install CUDA-enabled PyTorch pinned for Whisper and pyannote
+1. create `.venv` with Python 3.12, unless `SUBTITLE_WORKBENCH_VENV` or `.venv-path` points elsewhere
+2. install CUDA 12.8 PyTorch packages compatible with WhisperX 3.8.6
 3. install backend dependencies
 4. install frontend dependencies
 
@@ -109,7 +117,7 @@ Then open `http://localhost:5173`.
 - transcript and subtitle text are both directly editable in the UI
 - diarization quality depends on `pyannote.audio` and the Hugging Face token-backed model access
 - `huggingface_hub` must stay below `1.0` for the current `pyannote.audio` version in this project
-- `large-v3` is cached locally, but if your GPU already has heavy memory usage the backend will ask you to close other GPU apps or choose a smaller model
+- large models download on first use and need enough GPU memory; if memory is tight, choose `medium`, `small`, `base`, or `tiny`
 - long-form transcription uses Whisper with `condition_on_previous_text=False` to reduce repetition loops on large files
 
 ## Tests
