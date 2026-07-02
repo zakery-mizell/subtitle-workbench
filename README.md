@@ -38,6 +38,10 @@ Local web app for:
 - deterministic sentence-aware caption splitting (max 2 lines, 42 chars/line, no sentence carryover) with a "Re-split Captions" action
 - instant Original/Mastered A/B playback (both versions stay loaded and in sync; switching is gapless)
 - captions auto-scroll with playback (suspends briefly while you scroll manually)
+- custom transport (skip/play/speed/mute) with the waveform as the scrubber; waveform analysis runs automatically on load
+- caption list rendered as editor rows with clickable timecode gutters
+- light and dark themes (toggle in the view-options gear)
+- drag a file anywhere in the window to load it; transcription setup lives in a slide-over drawer once a session is open
 - speaker handoff / possible overlap markers on the waveform timeline
 - project file export/import for full-session resume, including guide blocks, timing metadata, confidence data, and embedded audio
 - export for:

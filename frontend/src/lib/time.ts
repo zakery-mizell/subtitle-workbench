@@ -13,6 +13,21 @@ export function formatClock(seconds: number): string {
   return `${pad(minutes)}:${pad(secs)}.${padMs(ms)}`;
 }
 
+export function formatGutterClock(seconds: number): string {
+  if (!Number.isFinite(seconds)) {
+    return "00:00.0";
+  }
+  const totalTenths = Math.max(0, Math.round(seconds * 10));
+  const hours = Math.floor(totalTenths / 36000);
+  const minutes = Math.floor((totalTenths % 36000) / 600);
+  const secs = Math.floor((totalTenths % 600) / 10);
+  const tenths = totalTenths % 10;
+  if (hours > 0) {
+    return `${hours}:${pad(minutes)}:${pad(secs)}.${tenths}`;
+  }
+  return `${pad(minutes)}:${pad(secs)}.${tenths}`;
+}
+
 export function formatSrtTimestamp(seconds: number): string {
   const totalMs = Math.max(0, Math.round(seconds * 1000));
   const hours = Math.floor(totalMs / 3600000);

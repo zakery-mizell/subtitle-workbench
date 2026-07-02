@@ -1,4 +1,24 @@
-import { memo, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
+import {
+  BookOpen,
+  ClipboardCheck,
+  Download,
+  Info,
+  Loader2,
+  Pause,
+  Play,
+  Redo2,
+  Rewind,
+  FastForward,
+  Scissors,
+  Settings2,
+  SlidersHorizontal,
+  Undo2,
+  Volume2,
+  VolumeX,
+  Wand2,
+  X,
+} from "lucide-react";
 
 import { buildExportFilename, captionsToSrt, guideToSrt } from "./lib/exporters";
 import {
@@ -12,7 +32,7 @@ import { buildQaReport, formatQaReport } from "./lib/qa";
 import { remapCaptions, remapGuideBlocks, remapTime, remapWords, unremapTime } from "./lib/cuts";
 import type { CutRegion, MasteringResult } from "./lib/mastering";
 import { parseSrt } from "./lib/srt";
-import { formatClock } from "./lib/time";
+import { formatClock, formatGutterClock } from "./lib/time";
 import MasteringPanel from "./MasteringPanel";
 import type {
   BackendCapabilities,
@@ -128,6 +148,7 @@ const SPEAKER_ASSIGNMENT_OPTIONS: Array<{ value: SpeakerAssignmentMode; label: s
   { value: "word", label: "Word (tighter switches)" },
 ];
 const FOLLOW_SCROLL_SUSPEND_MS = 3000;
+const THEME_STORAGE_KEY = "subtitle-workbench:theme";
 const AUTOSAVE_STORAGE_KEY = "subtitle-workbench:autosave";
 const AUTOSAVE_STORAGE_VERSION = 5;
 const PROJECT_FILE_VERSION = 1;
@@ -140,6 +161,13 @@ const SIDE_PANEL_TABS = [
   { id: "master", label: "Master" },
   { id: "export", label: "Export" },
 ] as const;
+const SIDE_PANEL_TAB_ICONS = {
+  guide: Scissors,
+  jargon: BookOpen,
+  qa: ClipboardCheck,
+  master: Wand2,
+  export: Download,
+} as const;
 const DEFAULT_GUIDE_PANEL_COLLAPSED = true;
 const WAVEFORM_START_PAD_SECONDS = 0.03;
 const WAVEFORM_END_PAD_SECONDS = 0.08;
@@ -1959,7 +1987,13 @@ interface WaveformTimelineProps {
   captions: Caption[];
   speakerEvents: SpeakerTimelineEvent[];
   currentTime: number;
+  theme: "light" | "dark";
   onSeek: (time: number, options?: { play?: boolean }) => void;
+}
+
+function themeColor(name: string, fallback: string): string {
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return value || fallback;
 }
 
 function drawWaveformTimeline(
@@ -1990,15 +2024,15 @@ function drawWaveformTimeline(
   const xForTime = (time: number) => clampNumber((time / duration) * width, 0, width);
 
   context.clearRect(0, 0, width, height);
-  context.fillStyle = "#ffffff";
+  context.fillStyle = themeColor("--wave-bg", "#ffffff");
   context.fillRect(0, 0, width, height);
 
   const gridStep =
     duration > 3600 ? 600 : duration > 1200 ? 300 : duration > 420 ? 60 : duration > 120 ? 20 : 5;
-  context.strokeStyle = "#e2e8f0";
+  context.strokeStyle = themeColor("--wave-grid", "#e2e8f0");
   context.lineWidth = 1;
-  context.fillStyle = "#647184";
-  context.font = "11px Segoe UI, sans-serif";
+  context.fillStyle = themeColor("--muted", "#647184");
+  context.font = "11px Inter, sans-serif";
   for (let time = 0; time <= duration; time += gridStep) {
     const x = xForTime(time);
     context.beginPath();
@@ -2011,15 +2045,15 @@ function drawWaveformTimeline(
   }
 
   if (analysis) {
-    context.fillStyle = "rgba(15, 118, 110, 0.12)";
+    context.fillStyle = themeColor("--wave-speech", "rgba(15, 118, 110, 0.12)");
     analysis.speech_spans.forEach((span) => {
       const x = xForTime(span.start);
       context.fillRect(x, 20, Math.max(1, xForTime(span.end) - x), height - 42);
     });
   }
 
-  context.fillStyle = "rgba(37, 99, 235, 0.2)";
-  context.strokeStyle = "rgba(37, 99, 235, 0.55)";
+  context.fillStyle = themeColor("--wave-caption-fill", "rgba(37, 99, 235, 0.2)");
+  context.strokeStyle = themeColor("--wave-caption-stroke", "rgba(37, 99, 235, 0.55)");
   captions.forEach((caption) => {
     const x = xForTime(caption.start);
     const w = Math.max(1, xForTime(caption.end) - x);
@@ -2029,7 +2063,7 @@ function drawWaveformTimeline(
 
   const centerY = height * 0.62;
   const waveScale = height * 0.31;
-  context.strokeStyle = analysis ? "#1d2635" : "#b8c3d4";
+  context.strokeStyle = themeColor("--wave-axis", "#b8c3d4");
   context.lineWidth = 1;
   context.beginPath();
   context.moveTo(0, centerY);
@@ -2037,7 +2071,7 @@ function drawWaveformTimeline(
   context.stroke();
 
   if (analysis?.frames.length) {
-    context.strokeStyle = "#334155";
+    context.strokeStyle = themeColor("--wave-ink", "#334155");
     context.beginPath();
     analysis.frames.forEach((frame) => {
       const x = xForTime(frame.time);
@@ -2048,14 +2082,18 @@ function drawWaveformTimeline(
     });
     context.stroke();
   } else {
-    context.fillStyle = "#647184";
-    context.fillText("Analyze waveform", 12, centerY - 10);
+    context.fillStyle = themeColor("--muted", "#647184");
+    context.fillText("Waveform appears after loading audio", 12, centerY - 10);
   }
 
   speakerEvents.forEach((event) => {
     const x = xForTime(event.time);
     context.strokeStyle =
-      event.kind === "overlap" ? "#c2410c" : event.kind === "tight_handoff" ? "#b7791f" : "#7c3aed";
+      event.kind === "overlap"
+        ? themeColor("--danger", "#c2410c")
+        : event.kind === "tight_handoff"
+          ? themeColor("--warning", "#b7791f")
+          : themeColor("--repeat", "#7c3aed");
     context.lineWidth = event.kind === "overlap" ? 2 : 1.5;
     context.beginPath();
     context.moveTo(x, 10);
@@ -2064,7 +2102,7 @@ function drawWaveformTimeline(
   });
 
   const playheadX = xForTime(currentTime);
-  context.strokeStyle = "#ef4444";
+  context.strokeStyle = themeColor("--playhead", "#ef4444");
   context.lineWidth = 2;
   context.beginPath();
   context.moveTo(playheadX, 0);
@@ -2105,29 +2143,58 @@ const WaveformTimeline = memo(function WaveformTimeline(props: WaveformTimelineP
     drawWaveformTimeline(canvas, props, size.width, size.height);
   }, [props, size]);
 
+  const scrubbing = useRef(false);
+
+  function seekFromPointer(clientX: number) {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return;
+    }
+    const rect = canvas.getBoundingClientRect();
+    const duration = Math.max(
+      props.analysis?.duration ?? 0,
+      props.captions[props.captions.length - 1]?.end ?? 0,
+      1,
+    );
+    const fraction = clampNumber((clientX - rect.left) / rect.width, 0, 1);
+    props.onSeek(fraction * duration, { play: false });
+  }
+
   return (
     <div className="waveform-timeline" ref={wrapperRef}>
       <canvas
         ref={canvasRef}
         className="waveform-canvas"
         onPointerDown={(event) => {
-          const canvas = canvasRef.current;
-          if (!canvas) {
-            return;
+          scrubbing.current = true;
+          event.currentTarget.setPointerCapture(event.pointerId);
+          seekFromPointer(event.clientX);
+        }}
+        onPointerMove={(event) => {
+          if (scrubbing.current) {
+            seekFromPointer(event.clientX);
           }
-          const rect = canvas.getBoundingClientRect();
-          const duration = Math.max(
-            props.analysis?.duration ?? 0,
-            props.captions[props.captions.length - 1]?.end ?? 0,
-            1,
-          );
-          const time = ((event.clientX - rect.left) / rect.width) * duration;
-          props.onSeek(time, { play: false });
+        }}
+        onPointerUp={(event) => {
+          scrubbing.current = false;
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        }}
+        onPointerCancel={() => {
+          scrubbing.current = false;
         }}
       />
     </div>
   );
 });
+
+function InfoTip({ text }: { text: string }) {
+  return (
+    <span className="info-tip" tabIndex={0}>
+      <Info size={13} aria-hidden />
+      <span className="info-tip-bubble" role="tooltip">{text}</span>
+    </span>
+  );
+}
 
 const TimedTextEditor = memo(function TimedTextEditor({
   value,
@@ -2367,7 +2434,23 @@ function App() {
   const [showSpeakerAttributionOptions, setShowSpeakerAttributionOptions] = useState(false);
   const [removeDisfluencies, setRemoveDisfluencies] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<Array<{ id: number; text: string }>>([]);
+  const toastIdRef = useRef(0);
+
+  function setStatusMessage(message: string | null) {
+    if (!message) {
+      return;
+    }
+    const id = ++toastIdRef.current;
+    setToasts((current) => [...current.slice(-3), { id, text: message }]);
+    window.setTimeout(() => {
+      setToasts((current) => current.filter((toast) => toast.id !== id));
+    }, 6000);
+  }
+
+  function dismissToast(id: number) {
+    setToasts((current) => current.filter((toast) => toast.id !== id));
+  }
   const [retranscribing, setRetranscribing] = useState(false);
   const [waveformLoading, setWaveformLoading] = useState(false);
   const [waveformAnalysis, setWaveformAnalysis] = useState<WaveformAnalysisResponse | null>(null);
@@ -2380,7 +2463,13 @@ function App() {
   const [playbackSource, setPlaybackSource] = useState<"original" | "processed">("original");
   const [resplitting, setResplitting] = useState(false);
   const [viewOptionsOpen, setViewOptionsOpen] = useState(false);
-  const [setupOpen, setSetupOpen] = useState(true);
+  const [setupDrawerOpen, setSetupDrawerOpen] = useState(false);
+  const [globalDragActive, setGlobalDragActive] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [audioDuration, setAudioDuration] = useState(0);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const [userMuted, setUserMuted] = useState(false);
+  const [themeDark, setThemeDark] = useState(() => window.localStorage.getItem(THEME_STORAGE_KEY) === "dark");
   const [resumeProjectFile, setResumeProjectFile] = useState<File | null>(null);
   const [resumeAudioFile, setResumeAudioFile] = useState<File | null>(null);
   const [resumeSubtitleFile, setResumeSubtitleFile] = useState<File | null>(null);
@@ -2592,7 +2681,64 @@ function App() {
     if (inactive) {
       inactive.muted = true;
     }
+    if (Number.isFinite(active.duration) && active.duration > 0) {
+      setAudioDuration(active.duration);
+    }
+    setIsPlaying(!active.paused);
   }, [playbackSource, processedAudio, audioUrl]);
+
+  // Transport state: play/pause indicator, duration, speed, and user mute.
+  useEffect(() => {
+    const elements = [originalAudioRef.current, masteredAudioRef.current].filter(
+      (element): element is HTMLAudioElement => element !== null,
+    );
+    if (!elements.length) {
+      return;
+    }
+
+    const onPlayState = (event: Event) => {
+      if (event.target === audioRef.current) {
+        setIsPlaying(event.type === "play");
+      }
+    };
+    const onMetadata = (event: Event) => {
+      const audio = event.target as HTMLAudioElement;
+      if (audio === audioRef.current && Number.isFinite(audio.duration)) {
+        setAudioDuration(audio.duration);
+      }
+    };
+    for (const element of elements) {
+      element.addEventListener("play", onPlayState);
+      element.addEventListener("pause", onPlayState);
+      element.addEventListener("loadedmetadata", onMetadata);
+      element.addEventListener("durationchange", onMetadata);
+    }
+    return () => {
+      for (const element of elements) {
+        element.removeEventListener("play", onPlayState);
+        element.removeEventListener("pause", onPlayState);
+        element.removeEventListener("loadedmetadata", onMetadata);
+        element.removeEventListener("durationchange", onMetadata);
+      }
+    };
+  }, [audioUrl, processedAudio, playbackSource]);
+
+  useEffect(() => {
+    for (const element of [originalAudioRef.current, masteredAudioRef.current]) {
+      if (element) {
+        element.playbackRate = playbackRate;
+        element.volume = userMuted ? 0 : 1;
+      }
+    }
+  }, [playbackRate, userMuted, audioUrl, processedAudio]);
+
+  function skipBy(seconds: number) {
+    const audio = audioRef.current;
+    if (!audio) {
+      return;
+    }
+    audio.currentTime = Math.max(0, Math.min(audio.currentTime + seconds, audio.duration || Number.POSITIVE_INFINITY));
+  }
 
   useEffect(() => {
     const elements = [originalAudioRef.current, masteredAudioRef.current].filter(
@@ -2769,6 +2915,11 @@ function App() {
     [acknowledgedLowConfidenceWordIds],
   );
 
+  useEffect(() => {
+    document.documentElement.dataset.theme = themeDark ? "dark" : "light";
+    window.localStorage.setItem(THEME_STORAGE_KEY, themeDark ? "dark" : "light");
+  }, [themeDark]);
+
   // Close the view-options popover on outside clicks.
   useEffect(() => {
     if (!viewOptionsOpen) {
@@ -2783,13 +2934,65 @@ function App() {
     return () => document.removeEventListener("mousedown", onPointerDown);
   }, [viewOptionsOpen]);
 
-  // Collapse the transcription setup rail once a session exists.
   const hasLoadedSession = Boolean(session || activeEditor);
+
+  // Close the setup drawer with Escape.
   useEffect(() => {
-    if (hasLoadedSession) {
-      setSetupOpen(false);
+    if (!setupDrawerOpen) {
+      return;
     }
-  }, [hasLoadedSession]);
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setSetupDrawerOpen(false);
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [setupDrawerOpen]);
+
+  // Accept audio dropped anywhere in the window, not just on the dropzone.
+  useEffect(() => {
+    let depth = 0;
+    const isFileDrag = (event: DragEvent) => Boolean(event.dataTransfer?.types.includes("Files"));
+    const onDragEnter = (event: DragEvent) => {
+      if (isFileDrag(event)) {
+        depth += 1;
+        setGlobalDragActive(true);
+      }
+    };
+    const onDragLeave = (event: DragEvent) => {
+      if (isFileDrag(event)) {
+        depth = Math.max(0, depth - 1);
+        if (depth === 0) {
+          setGlobalDragActive(false);
+        }
+      }
+    };
+    const onDragOver = (event: DragEvent) => {
+      if (isFileDrag(event)) {
+        event.preventDefault();
+      }
+    };
+    const onDrop = (event: DragEvent) => {
+      depth = 0;
+      setGlobalDragActive(false);
+      const file = event.dataTransfer?.files?.[0];
+      if (file && (file.type.startsWith("audio/") || file.type.startsWith("video/"))) {
+        event.preventDefault();
+        setAudioFile(file);
+      }
+    };
+    window.addEventListener("dragenter", onDragEnter);
+    window.addEventListener("dragleave", onDragLeave);
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragenter", onDragEnter);
+      window.removeEventListener("dragleave", onDragLeave);
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("drop", onDrop);
+    };
+  }, [audioUrl]);
 
   // Manual scrolling suspends follow-playback briefly so it never fights the user.
   useEffect(() => {
@@ -3151,6 +3354,10 @@ function App() {
       URL.revokeObjectURL(audioUrl);
     }
     setAudioUrl(file ? URL.createObjectURL(file) : null);
+    if (file) {
+      // The waveform is the scrubber, so analyze as soon as audio arrives.
+      void handleAnalyzeWaveform(file, { quiet: true });
+    }
   }
 
   async function refreshWaveformFromMaster(token: string) {
@@ -3414,23 +3621,27 @@ function App() {
     setStatusMessage("Reflowed caption line breaks.");
   }
 
-  async function handleAnalyzeWaveform() {
-    if (!selectedFile) {
+  async function handleAnalyzeWaveform(file?: File, options?: { quiet?: boolean }) {
+    const source = file ?? selectedFile;
+    if (!source) {
       setStatusMessage("Choose an audio file first.");
       return;
     }
 
     setWaveformLoading(true);
-    setStatusMessage("Analyzing waveform with FFmpeg...");
     try {
-      const analysis = await requestWaveformAnalysis(selectedFile);
+      const analysis = await requestWaveformAnalysis(source);
       setWaveformAnalysis(analysis);
-      setStatusMessage(
-        `Waveform analyzed: ${analysis.speech_spans.length} speech region${analysis.speech_spans.length === 1 ? "" : "s"} detected.`,
-      );
+      if (!options?.quiet) {
+        setStatusMessage(
+          `Waveform analyzed: ${analysis.speech_spans.length} speech region${analysis.speech_spans.length === 1 ? "" : "s"} detected.`,
+        );
+      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error";
-      setStatusMessage(message);
+      if (!options?.quiet) {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        setStatusMessage(message);
+      }
     } finally {
       setWaveformLoading(false);
     }
@@ -4160,28 +4371,9 @@ function App() {
     }
   }
 
-  return (
-    <div className="app-shell">
-      <aside className="control-rail">
-        <div className="brand-block">
-          <p className="eyebrow">Local WhisperX editor</p>
-          <h1>Subtitle Workbench</h1>
-          <p className="lede">Transcribe, edit directly in place, and export subtitles, transcript text, and an edit guide.</p>
-        </div>
-
+  const setupPanel = (
         <section className="panel">
           <h2>Source</h2>
-          {!setupOpen ? (
-            <div className="rail-summary">
-              <p className="rail-summary-file">{selectedFile?.name ?? session?.audio_filename ?? "No file loaded"}</p>
-              <div className="chip-row">
-                <span className="metric-chip">{model}</span>
-                {speakerCount > 1 ? <span className="metric-chip">{speakerCount} speakers</span> : null}
-              </div>
-              <button onClick={() => setSetupOpen(true)}>New transcription…</button>
-            </div>
-          ) : null}
-          <div className={setupOpen ? undefined : "rail-hidden"}>
           <label
             className={`dropzone ${dragActive ? "is-dragging" : ""}`}
             onDragOver={(event) => {
@@ -4250,7 +4442,6 @@ function App() {
           <button className="primary-button" disabled={loading || retranscribing || !selectedFile} onClick={handleTranscribe}>
             {loading ? "Transcribing..." : "Transcribe"}
           </button>
-          </div>
           <details className="rail-details">
             <summary>Project file (save / resume)</summary>
             <p className="helper-text">Project files preserve the full editor state, guide blocks, timings, confidence data, and embedded audio for playback.</p>
@@ -4281,19 +4472,79 @@ function App() {
               <button onClick={resetWorkspace}>Reset</button>
             </div>
           </details>
-          {statusMessage ? <p className="status-text">{statusMessage}</p> : null}
         </section>
-      </aside>
+  );
+
+  return (
+    <div className={`app-shell ${hasLoadedSession ? "no-rail" : ""}`}>
+      {!hasLoadedSession ? (
+        <aside className="control-rail">
+          <div className="brand-block">
+            <p className="eyebrow">Local WhisperX editor</p>
+            <h1>Subtitle Workbench</h1>
+            <p className="lede">Transcribe, edit directly in place, and export subtitles, transcript text, and an edit guide.</p>
+          </div>
+          {setupPanel}
+        </aside>
+      ) : null}
+
+      {setupDrawerOpen ? (
+        <div className="drawer-backdrop" onClick={() => setSetupDrawerOpen(false)}>
+          <aside className="setup-drawer" onClick={(event) => event.stopPropagation()}>
+            <div className="drawer-header">
+              <h2>Source and setup</h2>
+              <button className="icon-button" aria-label="Close setup" onClick={() => setSetupDrawerOpen(false)}>
+                <X size={16} />
+              </button>
+            </div>
+            {setupPanel}
+          </aside>
+        </div>
+      ) : null}
 
       <main className="workspace">
         <section className="player-panel">
-          <div className="player-meta">
-            <div>
-              <p className="eyebrow">Playback</p>
-              <h2>{selectedFile?.name ?? session?.audio_filename ?? "No file selected"}</h2>
+          <div className="transport-bar">
+            <div className="transport-cluster">
+              <button className="icon-button" onClick={() => skipBy(-3)} disabled={!audioUrl} title="Back 3 seconds" aria-label="Back 3 seconds">
+                <Rewind size={16} />
+              </button>
+              <button className="icon-button transport-play" onClick={togglePlayback} disabled={!audioUrl} aria-label={isPlaying ? "Pause" : "Play"}>
+                {isPlaying ? <Pause size={18} /> : <Play size={18} />}
+              </button>
+              <button className="icon-button" onClick={() => skipBy(3)} disabled={!audioUrl} title="Forward 3 seconds" aria-label="Forward 3 seconds">
+                <FastForward size={16} />
+              </button>
+              <button
+                className="icon-button"
+                onClick={() => setUserMuted((muted) => !muted)}
+                disabled={!audioUrl}
+                title={userMuted ? "Unmute" : "Mute"}
+                aria-label={userMuted ? "Unmute" : "Mute"}
+              >
+                {userMuted ? <VolumeX size={16} /> : <Volume2 size={16} />}
+              </button>
+              <select
+                className="transport-speed"
+                value={playbackRate}
+                onChange={(event) => setPlaybackRate(Number(event.target.value))}
+                aria-label="Playback speed"
+              >
+                <option value={0.75}>0.75×</option>
+                <option value={1}>1×</option>
+                <option value={1.25}>1.25×</option>
+                <option value={1.5}>1.5×</option>
+                <option value={2}>2×</option>
+              </select>
+              <span className="transport-clock">
+                {formatClock(currentTime)}
+                <span className="transport-clock-total"> / {formatClock(audioDuration)}</span>
+              </span>
             </div>
-            <div className="transport-meta">
-              <span>{formatClock(currentTime)}</span>
+            <span className="transport-file" title={selectedFile?.name ?? session?.audio_filename ?? undefined}>
+              {selectedFile?.name ?? session?.audio_filename ?? "No file loaded"}
+            </span>
+            <div className="transport-cluster">
               {processedAudio ? (
                 <div className="mode-toggle">
                   <button
@@ -4320,15 +4571,25 @@ function App() {
               >
                 Jump to current
               </button>
+              {hasLoadedSession ? (
+                <button
+                  className="icon-button"
+                  title="Source and setup"
+                  aria-label="Source and setup"
+                  onClick={() => setSetupDrawerOpen(true)}
+                >
+                  <SlidersHorizontal size={16} />
+                </button>
+              ) : null}
               <div className="view-options" ref={viewOptionsRef}>
                 <button
                   type="button"
-                  className={viewOptionsOpen ? "is-active" : ""}
+                  className={`icon-button ${viewOptionsOpen ? "is-active" : ""}`}
                   title="View options"
                   aria-label="View options"
                   onClick={() => setViewOptionsOpen((open) => !open)}
                 >
-                  ⚙
+                  <Settings2 size={16} />
                 </button>
                 {viewOptionsOpen ? (
                   <div className="view-options-popover">
@@ -4348,42 +4609,37 @@ function App() {
                       <input type="checkbox" checked={showTimingHighlights} onChange={(event) => setShowTimingHighlights(event.target.checked)} />
                       Show timing highlights
                     </label>
+                    <label className="toggle-row">
+                      <input type="checkbox" checked={themeDark} onChange={(event) => setThemeDark(event.target.checked)} />
+                      Dark theme
+                    </label>
                     <p className="helper-text">Clicks always seek. `Ctrl+Space` play/pause. `Shift+Space` toggles click autoplay.</p>
                   </div>
                 ) : null}
               </div>
             </div>
           </div>
-          <audio
-            ref={originalAudioRef}
-            controls
-            className={playbackSource === "processed" && processedAudio ? "peer-audio-hidden" : undefined}
-            src={audioUrl ?? undefined}
-            preload="auto"
-          />
+          <audio ref={originalAudioRef} className="peer-audio-hidden" src={audioUrl ?? undefined} preload="auto" />
           {processedAudio ? (
-            <audio
-              ref={masteredAudioRef}
-              controls
-              className={playbackSource === "processed" ? undefined : "peer-audio-hidden"}
-              src={processedAudio.url}
-              preload="auto"
-            />
+            <audio ref={masteredAudioRef} className="peer-audio-hidden" src={processedAudio.url} preload="auto" />
           ) : null}
           <WaveformTimeline
             analysis={waveformAnalysis}
             captions={activeEditor?.captions ?? []}
             speakerEvents={speakerTimelineEvents}
             currentTime={currentTime}
+            theme={themeDark ? "dark" : "light"}
             onSeek={seekAudio}
           />
           <div className="waveform-strip">
-            <button disabled={!selectedFile || waveformLoading} onClick={() => void handleAnalyzeWaveform()}>
-              {waveformLoading ? "Analyzing..." : "Analyze waveform"}
-            </button>
             <button disabled={!waveformAnalysis || !activeEditor?.captions.length} onClick={handleAlignCaptionsToWaveform}>
               Snap subtitle edges
             </button>
+            {waveformLoading ? (
+              <span className="metric-chip">
+                <Loader2 size={12} className="spin" aria-hidden /> Analyzing audio…
+              </span>
+            ) : null}
             {waveformAnalysis ? (
               <span className="metric-chip">{waveformAnalysis.speech_spans.length} speech regions</span>
             ) : null}
@@ -4421,12 +4677,13 @@ function App() {
             {viewMode === "transcript" ? (
               <div className="transcript-view">
                 <div className="editor-toolbar">
-                  <p className="line-mode-hint">
-                    Select text to mark it for cutting. Click in the text to seek audio to that point.{clickToPlay ? " Playback starts immediately after the click." : " Playback waits for `Ctrl+Space` when click autoplay is off."}
-                  </p>
+                  <span className="toolbar-title">
+                    Transcript
+                    <InfoTip text="Select text to mark it for cutting. Click in the text to seek audio to that point. Playback follows your click-to-play setting." />
+                  </span>
                   <div className="inline-actions">
-                    <button onClick={undo} disabled={!history.past.length}>Undo</button>
-                    <button onClick={redo} disabled={!history.future.length}>Redo</button>
+                    <button onClick={undo} disabled={!history.past.length}><Undo2 size={14} aria-hidden />&nbsp;Undo</button>
+                    <button onClick={redo} disabled={!history.future.length}><Redo2 size={14} aria-hidden />&nbsp;Redo</button>
                   </div>
                 </div>
                 {activeEditor ? (
@@ -4490,13 +4747,13 @@ function App() {
                 {activeEditor ? (
                   <>
                     <div className="editor-toolbar">
-                      <p className="line-mode-hint">
-                        Enter creates the next caption. Shift+Enter inserts a new line. Backspace at the start merges backward. Delete at the end merges forward.
-                        {clickToPlay ? " Clicks seek and start playback immediately." : " Clicks still seek, but playback waits for `Ctrl+Space`."}
-                      </p>
+                      <span className="toolbar-title">
+                        Subtitles
+                        <InfoTip text="Enter creates the next caption. Shift+Enter inserts a second line (captions max out at two). Backspace at the start merges backward; Delete at the end merges forward." />
+                      </span>
                       <div className="inline-actions">
-                        <button onClick={undo} disabled={!history.past.length}>Undo</button>
-                        <button onClick={redo} disabled={!history.future.length}>Redo</button>
+                        <button onClick={undo} disabled={!history.past.length}><Undo2 size={14} aria-hidden />&nbsp;Undo</button>
+                        <button onClick={redo} disabled={!history.future.length}><Redo2 size={14} aria-hidden />&nbsp;Redo</button>
                         <button disabled={!activeEditor?.captions.length} onClick={reflowAllCaptions}>Reflow Lines</button>
                         <button disabled={!activeWorkspace?.words.length || resplitting} onClick={() => void handleResplitCaptions()}>
                           {resplitting ? "Re-splitting..." : "Re-split Captions"}
@@ -4522,6 +4779,15 @@ function App() {
                                 <span className="speaker-pill">{caption.speaker_name ?? "Speaker"}</span>
                               </div>
                             ) : null}
+                            <div className="caption-row">
+                            <button
+                              type="button"
+                              className="caption-time"
+                              title="Seek to this caption"
+                              onClick={() => seekAudio(caption.start, { play: clickToPlay })}
+                            >
+                              {formatGutterClock(caption.start)}
+                            </button>
                             <TimedTextEditor
                               className="subtitle-editor"
                               minHeight={1}
@@ -4662,6 +4928,7 @@ function App() {
                                 }
                               }}
                             />
+                            </div>
                           </article>
                         );
                       })}
@@ -4692,15 +4959,24 @@ function App() {
             {!isGuidePanelCollapsed ? (
               <>
                 <div className="mode-toggle panel-tabbar">
-                  {SIDE_PANEL_TABS.map((tab) => (
-                    <button
-                      key={tab.id}
-                      className={sidePanelTab === tab.id ? "is-active" : ""}
-                      onClick={() => setSidePanelTab(tab.id)}
-                    >
-                      {tab.label}
-                    </button>
-                  ))}
+                  {SIDE_PANEL_TABS.map((tab) => {
+                    const TabIcon = SIDE_PANEL_TAB_ICONS[tab.id];
+                    return (
+                      <button
+                        key={tab.id}
+                        className={sidePanelTab === tab.id ? "is-active" : ""}
+                        onClick={() => setSidePanelTab(tab.id)}
+                      >
+                        <span className="panel-tab-label">
+                          <TabIcon size={14} aria-hidden />
+                          {tab.label}
+                          {tab.id === "qa" && qaReport.summary.issueCount > 0 ? (
+                            <span className="tab-badge">{qaReport.summary.issueCount}</span>
+                          ) : null}
+                        </span>
+                      </button>
+                    );
+                  })}
                 </div>
 
                 {sidePanelTab === "guide" ? (
@@ -4750,8 +5026,8 @@ function App() {
                         <h3>Tools</h3>
                       </div>
                       <div className="inline-actions">
-                        <button onClick={undo} disabled={!history.past.length}>Undo</button>
-                        <button onClick={redo} disabled={!history.future.length}>Redo</button>
+                        <button onClick={undo} disabled={!history.past.length}><Undo2 size={14} aria-hidden />&nbsp;Undo</button>
+                        <button onClick={redo} disabled={!history.future.length}><Redo2 size={14} aria-hidden />&nbsp;Redo</button>
                       </div>
                       <label>
                         Find
@@ -4996,25 +5272,52 @@ function App() {
                   <span className="metric-chip">{collapsedPanelMetaDetail}</span>
                 </div>
                 <div className="guide-collapsed-tabs">
-                  {SIDE_PANEL_TABS.map((tab) => (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      className={sidePanelTab === tab.id ? "is-active" : ""}
-                      onClick={() => {
-                        setSidePanelTab(tab.id);
-                        setIsGuidePanelCollapsed(false);
-                      }}
-                    >
-                      {tab.label}
-                    </button>
-                  ))}
+                  {SIDE_PANEL_TABS.map((tab) => {
+                    const TabIcon = SIDE_PANEL_TAB_ICONS[tab.id];
+                    return (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        className={`icon-button ${sidePanelTab === tab.id ? "is-active" : ""}`}
+                        title={tab.label}
+                        aria-label={tab.label}
+                        onClick={() => {
+                          setSidePanelTab(tab.id);
+                          setIsGuidePanelCollapsed(false);
+                        }}
+                      >
+                        <TabIcon size={16} aria-hidden />
+                        {tab.id === "qa" && qaReport.summary.issueCount > 0 ? (
+                          <span className="tab-badge">{qaReport.summary.issueCount}</span>
+                        ) : null}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
             )}
           </aside>
         </div>
       </main>
+
+      {globalDragActive ? (
+        <div className="drop-overlay">
+          <div className="drop-overlay-card">Drop the audio or video file to load it</div>
+        </div>
+      ) : null}
+
+      {toasts.length ? (
+        <div className="toast-stack" role="status">
+          {toasts.map((toast) => (
+            <div key={toast.id} className="toast">
+              <span>{toast.text}</span>
+              <button className="toast-dismiss" aria-label="Dismiss" onClick={() => dismissToast(toast.id)}>
+                <X size={14} />
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
