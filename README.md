@@ -142,7 +142,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run-frontend.ps1
 
 Then open `http://localhost:5173`.
 
-macOS equivalents:
+macOS single-click:
+
+Double-click `Run Subtitle Workbench (Mac).command` in Finder. It runs the installer if needed, starts the backend and frontend, and opens `http://localhost:5173`. Close the Terminal window (or press Ctrl+C) to stop it.
+
+macOS equivalents (from a terminal):
 
 ```bash
 ./scripts/run-app.sh        # backend + frontend together
