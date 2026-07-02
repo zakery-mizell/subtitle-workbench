@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     low_confidence_threshold: float = 0.55
     silence_seconds: float = 5.0
     default_language: str | None = None
+    mastering_output_dir: str = str(ROOT_DIR / "tmp" / "mastering")
+    mastering_device: str = "auto"
+    mastering_job_ttl_seconds: float = 14400.0
+    model_cache_dir: str = str(ROOT_DIR / "models")
 
     model_config = SettingsConfigDict(
         env_file=str(ROOT_DIR / ".env"),

@@ -9,8 +9,11 @@ import {
   parseGlossaryTerms,
 } from "./lib/glossary";
 import { buildQaReport, formatQaReport } from "./lib/qa";
+import { remapCaptions, remapGuideBlocks, remapWords } from "./lib/cuts";
+import type { MasteringResult } from "./lib/mastering";
 import { parseSrt } from "./lib/srt";
 import { formatClock } from "./lib/time";
+import MasteringPanel from "./MasteringPanel";
 import type {
   BackendCapabilities,
   Caption,
@@ -133,6 +136,7 @@ const SIDE_PANEL_TABS = [
   { id: "guide", label: "Guide" },
   { id: "jargon", label: "Jargon" },
   { id: "qa", label: "QA" },
+  { id: "master", label: "Master" },
 ] as const;
 const DEFAULT_GUIDE_PANEL_COLLAPSED = true;
 const WAVEFORM_START_PAD_SECONDS = 0.03;
@@ -2358,6 +2362,8 @@ function App() {
   const [retranscribing, setRetranscribing] = useState(false);
   const [waveformLoading, setWaveformLoading] = useState(false);
   const [waveformAnalysis, setWaveformAnalysis] = useState<WaveformAnalysisResponse | null>(null);
+  const [processedAudio, setProcessedAudio] = useState<{ url: string; filename: string; hasCutTimeline: boolean } | null>(null);
+  const [playbackSource, setPlaybackSource] = useState<"original" | "processed">("original");
   const [resumeProjectFile, setResumeProjectFile] = useState<File | null>(null);
   const [resumeAudioFile, setResumeAudioFile] = useState<File | null>(null);
   const [resumeSubtitleFile, setResumeSubtitleFile] = useState<File | null>(null);
@@ -2447,7 +2453,7 @@ function App() {
             showTimingHighlights: typeof saved.showTimingHighlights === "boolean" ? saved.showTimingHighlights : true,
             viewMode: saved.viewMode === "transcript" ? "transcript" : "subtitles",
             sidePanelTab:
-              saved.sidePanelTab === "jargon" || saved.sidePanelTab === "qa" || saved.sidePanelTab === "guide"
+              saved.sidePanelTab === "jargon" || saved.sidePanelTab === "qa" || saved.sidePanelTab === "guide" || saved.sidePanelTab === "master"
                 ? saved.sidePanelTab
                 : "guide",
             isGuidePanelCollapsed: DEFAULT_GUIDE_PANEL_COLLAPSED,
@@ -2606,11 +2612,17 @@ function App() {
             title: "Glossary",
             detail: `${jargonCandidates.length} candidates`,
           }
-        : {
-            eyebrow: "QA",
-            title: "Report",
-            detail: `${qaReport.summary.issueCount} issues`,
-          };
+        : sidePanelTab === "master"
+          ? {
+              eyebrow: "Master",
+              title: "Audio post production",
+              detail: processedAudio ? "Master ready" : "Not processed",
+            }
+          : {
+              eyebrow: "QA",
+              title: "Report",
+              detail: `${qaReport.summary.issueCount} issues`,
+            };
   const collapsedPanelMetaDetail =
     sidePanelTab === "guide"
       ? skipCuts
@@ -2618,7 +2630,11 @@ function App() {
         : "Playback skip off"
       : sidePanelTab === "jargon"
         ? `${glossaryTerms.length} term${glossaryTerms.length === 1 ? "" : "s"}`
-        : `${qaReport.summary.flaggedCaptionCount} caption${qaReport.summary.flaggedCaptionCount === 1 ? "" : "s"}`;
+        : sidePanelTab === "master"
+          ? processedAudio
+            ? "Processed audio loaded"
+            : "Local processing"
+          : `${qaReport.summary.flaggedCaptionCount} caption${qaReport.summary.flaggedCaptionCount === 1 ? "" : "s"}`;
   const multiSpeaker = (activeEditor?.speakers.length ?? speakerInputs.length) > 1;
 
   const activeCaptionIndex = useMemo(() => {
@@ -2821,7 +2837,7 @@ function App() {
     setShowTimingHighlights(Boolean(persisted.showTimingHighlights));
     setViewMode(persisted.viewMode === "transcript" ? "transcript" : "subtitles");
     setSidePanelTab(
-      persisted.sidePanelTab === "jargon" || persisted.sidePanelTab === "qa" || persisted.sidePanelTab === "guide"
+      persisted.sidePanelTab === "jargon" || persisted.sidePanelTab === "qa" || persisted.sidePanelTab === "guide" || persisted.sidePanelTab === "master"
         ? persisted.sidePanelTab
         : "guide",
     );
@@ -2980,10 +2996,58 @@ function App() {
     setSelectedFile(file);
     setWaveformAnalysis(null);
     setCurrentTime(0);
+    setProcessedAudio(null);
+    setPlaybackSource("original");
     if (audioUrl) {
       URL.revokeObjectURL(audioUrl);
     }
     setAudioUrl(file ? URL.createObjectURL(file) : null);
+  }
+
+  async function refreshWaveformFromMaster(token: string) {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/master/${token}/waveform`);
+      if (response.ok) {
+        setWaveformAnalysis((await response.json()) as WaveformAnalysisResponse);
+      }
+    } catch {
+      // The old waveform stays; it is only a visual aid.
+    }
+  }
+
+  function handleMasteringProcessed(result: MasteringResult, url: string) {
+    const previousTime = audioRef.current?.currentTime ?? 0;
+    const hasCutTimeline = result.duration_after < result.duration_before - 0.01;
+    setProcessedAudio({ url, filename: result.output_filename, hasCutTimeline });
+    setPlaybackSource("processed");
+    if (!hasCutTimeline) {
+      // Same timeline, so keep the listening position and refresh the waveform.
+      window.setTimeout(() => {
+        if (audioRef.current) {
+          audioRef.current.currentTime = previousTime;
+        }
+      }, 150);
+      void refreshWaveformFromMaster(result.token);
+    }
+    setStatusMessage("Mastering finished. Playback now uses the processed audio.");
+  }
+
+  function handleApplyCutsToSubtitles(result: MasteringResult) {
+    const cuts = [...result.cut_list].sort((a, b) => a.start - b.start);
+    if (!cuts.length || !activeWorkspace) {
+      return;
+    }
+    const remappedWords = remapWords(activeWorkspace.words, cuts);
+    const keptWordIds = new Set(remappedWords.map((word) => word.id));
+    commit(
+      (draft) => {
+        draft.captions = remapCaptions(draft.captions, cuts, keptWordIds);
+        draft.guideBlocks = remapGuideBlocks(draft.guideBlocks, cuts);
+      },
+      { transformWords: () => remappedWords },
+    );
+    void refreshWaveformFromMaster(result.token);
+    setStatusMessage("Cuts applied. Subtitles now match the processed audio (undo to restore).");
   }
 
   function buildTranscriptionFormData(audioFile: File): FormData {
@@ -4010,13 +4074,34 @@ function App() {
             </div>
             <div className="transport-meta">
               <span>{formatClock(currentTime)}</span>
+              {processedAudio ? (
+                <div className="mode-toggle">
+                  <button
+                    className={playbackSource === "original" ? "is-active" : ""}
+                    onClick={() => setPlaybackSource("original")}
+                  >
+                    Original
+                  </button>
+                  <button
+                    className={playbackSource === "processed" ? "is-active" : ""}
+                    onClick={() => setPlaybackSource("processed")}
+                  >
+                    Mastered
+                  </button>
+                </div>
+              ) : null}
               <div className="mode-toggle">
                 <button className={viewMode === "transcript" ? "is-active" : ""} onClick={() => setViewMode("transcript")}>Transcript</button>
                 <button className={viewMode === "subtitles" ? "is-active" : ""} onClick={() => setViewMode("subtitles")}>Subtitles</button>
               </div>
             </div>
           </div>
-          <audio ref={audioRef} controls src={audioUrl ?? undefined} preload="metadata" />
+          <audio
+            ref={audioRef}
+            controls
+            src={(playbackSource === "processed" && processedAudio ? processedAudio.url : audioUrl) ?? undefined}
+            preload="metadata"
+          />
           <WaveformTimeline
             analysis={waveformAnalysis}
             captions={activeEditor?.captions ?? []}
@@ -4600,6 +4685,17 @@ function App() {
                       <p className="helper-text">No likely jargon candidates detected yet.</p>
                     )}
                   </section>
+                ) : null}
+
+                {sidePanelTab === "master" ? (
+                  <MasteringPanel
+                    apiBaseUrl={API_BASE_URL}
+                    audioFile={selectedFile}
+                    words={activeWorkspace?.words ?? []}
+                    onProcessed={handleMasteringProcessed}
+                    onApplyCutsToSubtitles={handleApplyCutsToSubtitles}
+                    onSeek={(time) => seekAudio(time, { play: true })}
+                  />
                 ) : null}
 
                 {sidePanelTab === "qa" ? (

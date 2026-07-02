@@ -47,6 +47,14 @@ if (-not (Test-Path $venvPython)) {
 & $venvPython -m pip install --upgrade pip
 & $venvPip install --index-url https://download.pytorch.org/whl/cu128 torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
 & $venvPip install -r (Join-Path $root "backend\requirements.txt")
+# AI denoiser (MossFormer2-SE-48K). Optional: mastering degrades gracefully without it.
+# clearvoice pins numpy<2, so install it without deps and provide the runtime deps ourselves.
+try {
+  & $venvPip install -r (Join-Path $root "backend\requirements-denoise.txt")
+  & $venvPip install --no-deps clearvoice
+} catch {
+  Write-Warning "clearvoice install failed; AI denoising will be skipped."
+}
 
 Push-Location (Join-Path $root "frontend")
 try {

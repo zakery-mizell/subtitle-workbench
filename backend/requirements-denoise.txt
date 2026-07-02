@@ -1,0 +1,19 @@
+# Runtime dependencies for the ClearerVoice MossFormer2 denoiser.
+#
+# clearvoice itself is installed with --no-deps (see install scripts) because
+# it pins numpy<2.0, which conflicts with the rest of this project. Its speech
+# enhancement path works fine on numpy 2.x with the packages below; the pins
+# it needs for video tasks (opencv, scenedetect, gdown) are intentionally
+# omitted.
+librosa==0.10.2.post1
+einops
+rotary_embedding_torch==0.8.3
+yamlargparse
+python_speech_features==0.6
+torchinfo
+pydub
+scikit-learn
+huggingface-hub>=0.26.2
+joblib
+tqdm
+packaging

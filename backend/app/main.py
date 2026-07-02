@@ -13,8 +13,14 @@ from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 
+from fastapi.responses import FileResponse, PlainTextResponse
+
 from .config import settings
 from .diarization import assign_speaker_id, run_diarization
+from .jobs import registry as job_registry
+from .mastering.cutting import CutRegion, export_audacity_labels
+from .mastering.pipeline import find_master_artifact, run_mastering
+from .mastering.schemas import JobStatusResponse, MasterJobResponse, MasteringParams
 from .schemas import CapabilitiesResponse, RetranscribeRangeResponse, SpeakerAssignmentMode, SpeakerInput, TranscriptResponse, WarningItem, WaveformAnalysisResponse, WordToken
 from .text_processing import build_captions, build_guide_blocks, build_paragraphs, build_words, remove_disfluencies
 from .waveform_analysis import analyze_waveform
@@ -422,3 +428,119 @@ async def retranscribe_range(
     finally:
         delete_file_quietly(clip_path)
         delete_file_quietly(temp_path)
+
+
+def parse_mastering_params(params_json: str) -> MasteringParams:
+    try:
+        return MasteringParams.model_validate_json(params_json)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"params_json is not a valid mastering configuration. Details: {exc.error_count()} invalid field(s).") from exc
+
+
+def parse_words_json(words_json: str | None) -> list[dict[str, Any]] | None:
+    if not words_json:
+        return None
+    try:
+        payload = json.loads(words_json)
+        if not isinstance(payload, list):
+            raise TypeError("words_json must decode to a list")
+        return [dict(item) for item in payload if isinstance(item, dict)]
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail="words_json must be a JSON array of word objects.") from exc
+
+
+@app.post("/api/master", response_model=MasterJobResponse)
+async def master_audio(
+    audio: UploadFile = File(...),
+    params_json: str = Form("{}"),
+    words_json: str | None = Form(None),
+) -> MasterJobResponse:
+    params = parse_mastering_params(params_json)
+    words = parse_words_json(words_json)
+    source_filename = audio.filename or "audio"
+    temp_path = await save_upload_to_temp(audio)
+
+    job_registry.purge_expired(settings.mastering_job_ttl_seconds, delete_artifact=delete_file_quietly)
+
+    def run(job, reporter):
+        try:
+            result = run_mastering(temp_path, source_filename, params, words, reporter)
+        finally:
+            delete_file_quietly(temp_path)
+        artifact = find_master_artifact(result.token)
+        if artifact:
+            job.artifacts.append(str(artifact))
+        return result
+
+    return MasterJobResponse(job_id=job_registry.submit(run))
+
+
+@app.get("/api/jobs/{job_id}", response_model=JobStatusResponse)
+def job_status(job_id: str) -> JobStatusResponse:
+    job = job_registry.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown job id.")
+    return JobStatusResponse(
+        id=job.id,
+        status=job.status,
+        stage=job.stage,
+        progress=round(job.progress, 4),
+        message=job.message,
+        error=job.error,
+        result=job.result,
+    )
+
+
+def resolve_master_artifact(token: str) -> Path:
+    artifact = find_master_artifact(token)
+    if artifact is None or not artifact.is_file():
+        raise HTTPException(status_code=404, detail="No processed audio was found for this token. It may have expired.")
+    return artifact
+
+
+MASTER_MEDIA_TYPES = {
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".mp3": "audio/mpeg",
+    ".aac": "audio/aac",
+    ".opus": "audio/ogg",
+}
+
+
+@app.get("/api/master/{token}/audio")
+def master_audio_file(token: str) -> FileResponse:
+    artifact = resolve_master_artifact(token)
+    media_type = MASTER_MEDIA_TYPES.get(artifact.suffix.lower(), "application/octet-stream")
+    download_name = artifact.name.split("__", 1)[-1]
+    return FileResponse(str(artifact), media_type=media_type, filename=download_name)
+
+
+@app.get("/api/master/{token}/waveform", response_model=WaveformAnalysisResponse)
+def master_waveform(token: str) -> WaveformAnalysisResponse:
+    artifact = resolve_master_artifact(token)
+    try:
+        return analyze_waveform(str(artifact))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/master/{token}/cut-list")
+def master_cut_list(token: str, format: str = "json"):
+    job = next(
+        (candidate for candidate in job_registry.all_jobs() if getattr(candidate.result, "token", None) == token),
+        None,
+    )
+    if job is None or job.result is None:
+        raise HTTPException(status_code=404, detail="No cut list was found for this token. It may have expired.")
+    if format == "audacity":
+        cuts = [CutRegion(start=cut.start, end=cut.end, reason=cut.reason, label=cut.label) for cut in job.result.cut_list]
+        return PlainTextResponse(export_audacity_labels(cuts), media_type="text/plain")
+    return {"cut_list": [cut.model_dump() for cut in job.result.cut_list]}
+
+
+@app.delete("/api/master/{token}")
+def delete_master(token: str) -> dict[str, str]:
+    artifact = find_master_artifact(token)
+    if artifact:
+        delete_file_quietly(str(artifact))
+    return {"status": "deleted"}

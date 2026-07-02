@@ -32,3 +32,4 @@ torch/
 *.pth
 *.bin
 *.safetensors
+checkpoints/

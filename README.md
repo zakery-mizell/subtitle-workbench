@@ -6,6 +6,15 @@ Local web app for:
 - generating editable `.srt` subtitles
 - generating a paragraph transcript `.txt`
 - creating a second `.srt` edit guide with `SILENT`, `CUT`, and `REPEAT` blocks
+- Auphonic-style audio post production ("Master" tab), fully local:
+  - AI noise reduction (MossFormer2-SE-48K via ClearerVoice-Studio)
+  - hum removal (50/60 Hz + harmonics, auto-detected)
+  - adaptive high-pass filtering
+  - adaptive speech leveler with soft-knee compression
+  - loudness normalization (-16 podcast / -14 streaming / -23 EBU R128 / custom) with a 4x-oversampled true-peak limiter
+  - silence and filler-word ("um", "uh") cutting with subtitle timestamp remapping and Audacity label export
+  - before/after loudness report (LUFS, LRA, true peak, noise floor)
+  - encoded export: wav, flac, mp3, aac, opus
 
 ## What is implemented
 
@@ -49,12 +58,28 @@ For `pyannote/speaker-diarization-3.1`, the account also needs gated access to:
 The first multi-speaker run also needs internet access to download the gated pyannote models. After those assets are cached locally, later runs can work offline.
 For very long files, the backend skips diarization by default and returns a single-speaker transcript with a warning. This avoids a second long GPU-heavy pass after Whisper finishes.
 
+## Audio mastering ("Master" tab)
+
+The mastering pipeline runs entirely locally as a background job with staged progress:
+
+decode (48 kHz float) → hum removal → AI denoise → adaptive high-pass → cutting → adaptive leveler → compressor → loudness normalization → true-peak limit → encode
+
+Notes:
+
+- The MossFormer2 denoiser model (an extra download from Hugging Face on first use) is installed via `pip install clearvoice --no-deps` plus its runtime dependencies; if it is missing, mastering still runs and simply skips denoising with a warning. ClearVoice stores its checkpoints in `./checkpoints` relative to the backend working directory (the repo root when using the run scripts).
+- Cut lists are computed on the original timeline. "Apply cuts to subtitles" shifts every caption, word, and guide block to match the shortened audio (undo restores the original timing). "Detect only" mode exports an Audacity label track instead.
+- After mastering, the player gets an Original/Mastered A/B toggle.
+- Long files: mastering is limited to 4 hours per file.
+
 ## Project layout
 
 - `backend/app/main.py`
 - `backend/app/text_processing.py`
+- `backend/app/mastering/` (audio post production pipeline)
+- `backend/app/jobs.py` (in-process job registry for mastering)
 - `frontend/src/App.tsx`
-- `scripts/install.ps1`
+- `frontend/src/MasteringPanel.tsx`
+- `scripts/install.ps1` (Windows) / `scripts/install.sh` (macOS)
 
 ## Configure
 
@@ -66,18 +91,24 @@ For very long files, the backend skips diarization by default and returns a sing
 
 ## Requirements
 
-- Windows PowerShell
+- Windows PowerShell, or macOS with bash/zsh
 - Python 3.12
 - Node.js and npm
 - ffmpeg on `PATH`
-- NVIDIA GPU recommended for larger WhisperX models
+- NVIDIA GPU recommended for larger WhisperX models and fast AI denoising (Apple Silicon uses MPS on macOS)
 
 ## Install
 
-Run:
+Windows:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+```
+
+macOS:
+
+```bash
+./scripts/install.sh
 ```
 
 That script will:
@@ -110,6 +141,14 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run-frontend.ps1
 ```
 
 Then open `http://localhost:5173`.
+
+macOS equivalents:
+
+```bash
+./scripts/run-app.sh        # backend + frontend together
+./scripts/run-backend.sh
+./scripts/run-frontend.sh
+```
 
 ## Current limitations
 

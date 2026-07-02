@@ -212,3 +212,22 @@ It is based on the wired-up code in:
 - Audio is normalized to mono 16 kHz WAV when needed for diarization and retranscription clipping.
 - GPU out-of-memory handling returns a user-facing error that recommends closing other GPU apps or using a smaller model.
 - Warning propagation from backend to UI when alignment or diarization fall back.
+
+## 11. Audio Mastering (Master tab)
+
+Local Auphonic-style post production implemented in `backend/app/mastering/` and `frontend/src/MasteringPanel.tsx`:
+
+- Background job model with staged progress polling (`POST /api/master`, `GET /api/jobs/{id}`).
+- Full-quality 48 kHz float processing path, separate from the 16 kHz ASR path; stereo preserved with channel-linked gains.
+- AI noise reduction with MossFormer2-SE-48K (ClearerVoice-Studio), chunked with overlap crossfades, dry/wet amount, cuda→mps→cpu device selection, and graceful skip with a warning when the model is unavailable.
+- Hum detection (Welch PSD peak analysis, auto 50/60 Hz) and removal via zero-phase IIR notch cascade over the harmonics.
+- Adaptive zero-phase high-pass filter tuned below the detected voice fundamental.
+- Speech/music/background classification (noise-floor-anchored threshold, envelope-modulation music heuristic).
+- Adaptive leveler: segment-local momentary loudness, per-frame gain toward the median speech loudness with tight/moderate/soft clamps, background never boosted, flat conservative gain for music, asymmetric gain smoothing; followed by a soft-knee compressor.
+- Loudness normalization to preset targets (-16 podcast, -14 streaming, -23 EBU R128, -19 mono, custom) with measure→gain→limit→re-measure convergence.
+- True-peak limiter with 4x oversampling, block lookahead, and exponential release.
+- Automatic cutting: silence trimming with kept-pause preservation and filler-word regions from WhisperX word timestamps; modes remove / replace-with-silence / detect-only.
+- Cut list served on the original timeline (`GET /api/master/{token}/cut-list`), Audacity label export, and one-click subtitle remapping (captions, words, paragraphs, guide blocks) through the undo history.
+- Before/after loudness report: integrated LUFS, loudness range, true peak, noise floor, plus per-stage details.
+- Processed master playback via Original/Mastered A/B toggle, waveform refresh from the processed file, and encoded download (wav, flac, mp3, aac, opus).
+- Unit tests for loudness math, limiter, hum removal, leveler, classifier, cutting/remap, job registry, and endpoint contracts.
