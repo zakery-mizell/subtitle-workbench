@@ -9,8 +9,8 @@ import {
   parseGlossaryTerms,
 } from "./lib/glossary";
 import { buildQaReport, formatQaReport } from "./lib/qa";
-import { remapCaptions, remapGuideBlocks, remapWords } from "./lib/cuts";
-import type { MasteringResult } from "./lib/mastering";
+import { remapCaptions, remapGuideBlocks, remapTime, remapWords, unremapTime } from "./lib/cuts";
+import type { CutRegion, MasteringResult } from "./lib/mastering";
 import { parseSrt } from "./lib/srt";
 import { formatClock } from "./lib/time";
 import MasteringPanel from "./MasteringPanel";
@@ -127,6 +127,7 @@ const SPEAKER_ASSIGNMENT_OPTIONS: Array<{ value: SpeakerAssignmentMode; label: s
   { value: "segment", label: "Segment (stable)" },
   { value: "word", label: "Word (tighter switches)" },
 ];
+const FOLLOW_SCROLL_SUSPEND_MS = 3000;
 const AUTOSAVE_STORAGE_KEY = "subtitle-workbench:autosave";
 const AUTOSAVE_STORAGE_VERSION = 5;
 const PROJECT_FILE_VERSION = 1;
@@ -137,6 +138,7 @@ const SIDE_PANEL_TABS = [
   { id: "jargon", label: "Jargon" },
   { id: "qa", label: "QA" },
   { id: "master", label: "Master" },
+  { id: "export", label: "Export" },
 ] as const;
 const DEFAULT_GUIDE_PANEL_COLLAPSED = true;
 const WAVEFORM_START_PAD_SECONDS = 0.03;
@@ -720,7 +722,14 @@ function normalizeCaptionEditorLines(value: string): string[] {
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
-  return lines.length ? lines : [""];
+  if (!lines.length) {
+    return [""];
+  }
+  // Captions are at most two lines; fold any extras into the second line.
+  if (lines.length > 2) {
+    return [lines[0], normalizeEditableText(lines.slice(1).join(" "))];
+  }
+  return lines;
 }
 
 function isEditableTarget(target: EventTarget | null): boolean {
@@ -2348,7 +2357,7 @@ function App() {
   const [replaceText, setReplaceText] = useState("");
   const [skipCuts, setSkipCuts] = useState(true);
   const [clickToPlay, setClickToPlay] = useState(true);
-  const [followPlayback, setFollowPlayback] = useState(false);
+  const [followPlayback, setFollowPlayback] = useState(true);
   const [showLineGuides, setShowLineGuides] = useState(false);
   const [showTimingHighlights, setShowTimingHighlights] = useState(true);
   const [sidePanelTab, setSidePanelTab] = useState<SidePanelTab>("guide");
@@ -2362,8 +2371,16 @@ function App() {
   const [retranscribing, setRetranscribing] = useState(false);
   const [waveformLoading, setWaveformLoading] = useState(false);
   const [waveformAnalysis, setWaveformAnalysis] = useState<WaveformAnalysisResponse | null>(null);
-  const [processedAudio, setProcessedAudio] = useState<{ url: string; filename: string; hasCutTimeline: boolean } | null>(null);
+  const [processedAudio, setProcessedAudio] = useState<{
+    url: string;
+    filename: string;
+    hasCutTimeline: boolean;
+    cutList: CutRegion[];
+  } | null>(null);
   const [playbackSource, setPlaybackSource] = useState<"original" | "processed">("original");
+  const [resplitting, setResplitting] = useState(false);
+  const [viewOptionsOpen, setViewOptionsOpen] = useState(false);
+  const [setupOpen, setSetupOpen] = useState(true);
   const [resumeProjectFile, setResumeProjectFile] = useState<File | null>(null);
   const [resumeAudioFile, setResumeAudioFile] = useState<File | null>(null);
   const [resumeSubtitleFile, setResumeSubtitleFile] = useState<File | null>(null);
@@ -2373,6 +2390,10 @@ function App() {
   const [backendCapabilities, setBackendCapabilities] = useState<BackendCapabilities | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const originalAudioRef = useRef<HTMLAudioElement | null>(null);
+  const masteredAudioRef = useRef<HTMLAudioElement | null>(null);
+  const userScrollAtRef = useRef(0);
+  const viewOptionsRef = useRef<HTMLDivElement | null>(null);
   const paragraphRefs = useRef<Array<HTMLElement | null>>([]);
   const captionRefs = useRef<Array<HTMLElement | null>>([]);
   const suppressAutoSpeakerModeRef = useRef(false);
@@ -2448,12 +2469,12 @@ function App() {
             ),
             skipCuts: typeof saved.skipCuts === "boolean" ? saved.skipCuts : true,
             clickToPlay: typeof saved.clickToPlay === "boolean" ? saved.clickToPlay : true,
-            followPlayback: typeof saved.followPlayback === "boolean" ? saved.followPlayback : false,
+            followPlayback: typeof saved.followPlayback === "boolean" ? saved.followPlayback : true,
             showLineGuides: typeof saved.showLineGuides === "boolean" ? saved.showLineGuides : false,
             showTimingHighlights: typeof saved.showTimingHighlights === "boolean" ? saved.showTimingHighlights : true,
             viewMode: saved.viewMode === "transcript" ? "transcript" : "subtitles",
             sidePanelTab:
-              saved.sidePanelTab === "jargon" || saved.sidePanelTab === "qa" || saved.sidePanelTab === "guide" || saved.sidePanelTab === "master"
+              saved.sidePanelTab === "jargon" || saved.sidePanelTab === "qa" || saved.sidePanelTab === "guide" || saved.sidePanelTab === "master" || saved.sidePanelTab === "export"
                 ? saved.sidePanelTab
                 : "guide",
             isGuidePanelCollapsed: DEFAULT_GUIDE_PANEL_COLLAPSED,
@@ -2557,15 +2578,44 @@ function App() {
     };
   }, [acknowledgedLowConfidenceWordIds, activeWorkspace, clickToPlay, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, model, normalizeExportTimingTo30Fps, removeDisfluencies, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, speakerAssignmentMode, speakerCount, speakerInputs, viewMode]);
 
+  // Keep audioRef pointing at the active A/B element; only the active one is audible.
   useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio || !activeEditor) {
+    const original = originalAudioRef.current;
+    const mastered = masteredAudioRef.current;
+    const active = playbackSource === "processed" && mastered ? mastered : original;
+    if (!active) {
+      return;
+    }
+    audioRef.current = active;
+    active.muted = false;
+    const inactive = active === mastered ? original : mastered;
+    if (inactive) {
+      inactive.muted = true;
+    }
+  }, [playbackSource, processedAudio, audioUrl]);
+
+  useEffect(() => {
+    const elements = [originalAudioRef.current, masteredAudioRef.current].filter(
+      (element): element is HTMLAudioElement => element !== null,
+    );
+    if (!elements.length || !activeEditor) {
       return;
     }
 
-    const onTimeUpdate = () => {
+    const onTimeUpdate = (event: Event) => {
+      const audio = event.target as HTMLAudioElement;
+      if (audio !== audioRef.current) {
+        return;
+      }
       const time = audio.currentTime;
       setCurrentTime(time);
+      // Keep the muted co-playing peer within a frame of the active element.
+      if (processedAudio && !processedAudio.hasCutTimeline) {
+        const peer = audio === originalAudioRef.current ? masteredAudioRef.current : originalAudioRef.current;
+        if (peer && !peer.paused && Math.abs(peer.currentTime - time) > 0.25) {
+          peer.currentTime = time;
+        }
+      }
       if (!skipCuts) {
         return;
       }
@@ -2575,9 +2625,55 @@ function App() {
       }
     };
 
-    audio.addEventListener("timeupdate", onTimeUpdate);
-    return () => audio.removeEventListener("timeupdate", onTimeUpdate);
-  }, [activeEditor, skipCuts]);
+    for (const element of elements) {
+      element.addEventListener("timeupdate", onTimeUpdate);
+    }
+    return () => {
+      for (const element of elements) {
+        element.removeEventListener("timeupdate", onTimeUpdate);
+      }
+    };
+  }, [activeEditor, skipCuts, processedAudio, audioUrl, playbackSource]);
+
+  // While both timelines match, mirror play/pause/seek onto the muted peer so
+  // switching between Original and Mastered is a gapless mute swap.
+  useEffect(() => {
+    const original = originalAudioRef.current;
+    const mastered = masteredAudioRef.current;
+    if (!original || !mastered || !processedAudio || processedAudio.hasCutTimeline) {
+      return;
+    }
+
+    const mirror = (event: Event) => {
+      const source = event.target as HTMLAudioElement;
+      if (source !== audioRef.current) {
+        return;
+      }
+      const peer = source === original ? mastered : original;
+      if (event.type === "play") {
+        peer.currentTime = source.currentTime;
+        void peer.play().catch(() => undefined);
+      } else if (event.type === "pause") {
+        peer.pause();
+      } else if (event.type === "seeked") {
+        peer.currentTime = source.currentTime;
+      }
+    };
+
+    const events = ["play", "pause", "seeked"] as const;
+    for (const element of [original, mastered]) {
+      for (const type of events) {
+        element.addEventListener(type, mirror);
+      }
+    }
+    return () => {
+      for (const element of [original, mastered]) {
+        for (const type of events) {
+          element.removeEventListener(type, mirror);
+        }
+      }
+    };
+  }, [processedAudio, audioUrl]);
 
   const activeWords = activeWorkspace?.words ?? session?.words ?? [];
   const transcriptWords = useMemo(() => new Map(activeWords.map((word) => [word.id, word])), [activeWords]);
@@ -2618,11 +2714,17 @@ function App() {
               title: "Audio post production",
               detail: processedAudio ? "Master ready" : "Not processed",
             }
-          : {
-              eyebrow: "QA",
-              title: "Report",
-              detail: `${qaReport.summary.issueCount} issues`,
-            };
+          : sidePanelTab === "export"
+            ? {
+                eyebrow: "Export",
+                title: "Outputs",
+                detail: activeEditor ? `${activeEditor.captions.length} captions` : "No session",
+              }
+            : {
+                eyebrow: "QA",
+                title: "Report",
+                detail: `${qaReport.summary.issueCount} issues`,
+              };
   const collapsedPanelMetaDetail =
     sidePanelTab === "guide"
       ? skipCuts
@@ -2634,7 +2736,9 @@ function App() {
           ? processedAudio
             ? "Processed audio loaded"
             : "Local processing"
-          : `${qaReport.summary.flaggedCaptionCount} caption${qaReport.summary.flaggedCaptionCount === 1 ? "" : "s"}`;
+          : sidePanelTab === "export"
+            ? "SRT, transcript, edit guide"
+            : `${qaReport.summary.flaggedCaptionCount} caption${qaReport.summary.flaggedCaptionCount === 1 ? "" : "s"}`;
   const multiSpeaker = (activeEditor?.speakers.length ?? speakerInputs.length) > 1;
 
   const activeCaptionIndex = useMemo(() => {
@@ -2665,6 +2769,41 @@ function App() {
     [acknowledgedLowConfidenceWordIds],
   );
 
+  // Close the view-options popover on outside clicks.
+  useEffect(() => {
+    if (!viewOptionsOpen) {
+      return;
+    }
+    const onPointerDown = (event: MouseEvent) => {
+      if (viewOptionsRef.current && !viewOptionsRef.current.contains(event.target as Node)) {
+        setViewOptionsOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [viewOptionsOpen]);
+
+  // Collapse the transcription setup rail once a session exists.
+  const hasLoadedSession = Boolean(session || activeEditor);
+  useEffect(() => {
+    if (hasLoadedSession) {
+      setSetupOpen(false);
+    }
+  }, [hasLoadedSession]);
+
+  // Manual scrolling suspends follow-playback briefly so it never fights the user.
+  useEffect(() => {
+    const markUserScroll = () => {
+      userScrollAtRef.current = Date.now();
+    };
+    window.addEventListener("wheel", markUserScroll, { passive: true });
+    window.addEventListener("touchmove", markUserScroll, { passive: true });
+    return () => {
+      window.removeEventListener("wheel", markUserScroll);
+      window.removeEventListener("touchmove", markUserScroll);
+    };
+  }, []);
+
   useEffect(() => {
     if (!followPlayback || !activeEditor) {
       lastFollowedBlockRef.current = null;
@@ -2681,9 +2820,19 @@ function App() {
       return;
     }
 
+    if (Date.now() - userScrollAtRef.current < FOLLOW_SCROLL_SUSPEND_MS) {
+      return;
+    }
+
     lastFollowedBlockRef.current = key;
     const element = viewMode === "transcript" ? paragraphRefs.current[activeIndex] : captionRefs.current[activeIndex];
-    scrollIntoViewCentered(element);
+    if (element) {
+      const bounds = element.getBoundingClientRect();
+      const fullyVisible = bounds.top >= 0 && bounds.bottom <= window.innerHeight;
+      if (!fullyVisible) {
+        scrollIntoViewCentered(element);
+      }
+    }
   }, [activeCaptionIndex, activeEditor, activeParagraphIndex, followPlayback, viewMode]);
 
   function requestCaptionFocus(index: number, caret: number) {
@@ -2832,12 +2981,12 @@ function App() {
     setGlossaryText(restoredGlossaryText);
     setSkipCuts(typeof persisted.skipCuts === "boolean" ? persisted.skipCuts : true);
     setClickToPlay(typeof persisted.clickToPlay === "boolean" ? persisted.clickToPlay : true);
-    setFollowPlayback(Boolean(persisted.followPlayback));
+    setFollowPlayback(persisted.followPlayback !== false);
     setShowLineGuides(Boolean(persisted.showLineGuides));
     setShowTimingHighlights(Boolean(persisted.showTimingHighlights));
     setViewMode(persisted.viewMode === "transcript" ? "transcript" : "subtitles");
     setSidePanelTab(
-      persisted.sidePanelTab === "jargon" || persisted.sidePanelTab === "qa" || persisted.sidePanelTab === "guide" || persisted.sidePanelTab === "master"
+      persisted.sidePanelTab === "jargon" || persisted.sidePanelTab === "qa" || persisted.sidePanelTab === "guide" || persisted.sidePanelTab === "master" || persisted.sidePanelTab === "export"
         ? persisted.sidePanelTab
         : "guide",
     );
@@ -3015,21 +3164,84 @@ function App() {
     }
   }
 
+  function switchPlaybackSource(next: "original" | "processed") {
+    if (next === playbackSource) {
+      return;
+    }
+    const from = audioRef.current;
+    const to = next === "processed" ? masteredAudioRef.current : originalAudioRef.current;
+    if (!from || !to || !processedAudio) {
+      setPlaybackSource(next);
+      return;
+    }
+
+    const wasPlaying = !from.paused;
+    if (processedAudio.hasCutTimeline) {
+      // Timelines differ; map the position through the cut list.
+      const cuts = processedAudio.cutList;
+      const mapped = next === "processed" ? remapTime(from.currentTime, cuts) : unremapTime(from.currentTime, cuts);
+      from.pause();
+      to.currentTime = mapped;
+    } else if (to.paused || Math.abs(to.currentTime - from.currentTime) > 0.25) {
+      // Not co-playing yet (or drifted); align before the swap.
+      to.currentTime = from.currentTime;
+    }
+    to.muted = false;
+    from.muted = true;
+    if (wasPlaying) {
+      void to.play().catch(() => undefined);
+    }
+    setPlaybackSource(next);
+  }
+
   function handleMasteringProcessed(result: MasteringResult, url: string) {
     const previousTime = audioRef.current?.currentTime ?? 0;
+    const wasPlaying = audioRef.current ? !audioRef.current.paused : false;
     const hasCutTimeline = result.duration_after < result.duration_before - 0.01;
-    setProcessedAudio({ url, filename: result.output_filename, hasCutTimeline });
+    setProcessedAudio({ url, filename: result.output_filename, hasCutTimeline, cutList: result.cut_list });
     setPlaybackSource("processed");
+    // Once the new master is loaded, carry the listening position (mapped
+    // through the cuts when the timeline changed) and keep playing.
+    window.setTimeout(() => {
+      const mastered = masteredAudioRef.current;
+      if (!mastered) {
+        return;
+      }
+      mastered.currentTime = hasCutTimeline ? remapTime(previousTime, result.cut_list) : previousTime;
+      if (wasPlaying) {
+        void mastered.play().catch(() => undefined);
+      }
+    }, 200);
     if (!hasCutTimeline) {
-      // Same timeline, so keep the listening position and refresh the waveform.
-      window.setTimeout(() => {
-        if (audioRef.current) {
-          audioRef.current.currentTime = previousTime;
-        }
-      }, 150);
       void refreshWaveformFromMaster(result.token);
     }
     setStatusMessage("Mastering finished. Playback now uses the processed audio.");
+  }
+
+  async function handleResplitCaptions() {
+    if (!activeWorkspace?.words.length) {
+      return;
+    }
+    setResplitting(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/rebuild-captions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ words: activeWorkspace.words }),
+      });
+      if (!response.ok) {
+        throw new Error(`Re-split failed (${response.status}). Is the backend running?`);
+      }
+      const payload = (await response.json()) as { captions: Caption[] };
+      commit((draft) => {
+        draft.captions = payload.captions;
+      });
+      setStatusMessage("Captions re-split with the deterministic rules. Undo restores the previous state.");
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : "Re-split failed.");
+    } finally {
+      setResplitting(false);
+    }
   }
 
   function handleApplyCutsToSubtitles(result: MasteringResult) {
@@ -3959,6 +4171,17 @@ function App() {
 
         <section className="panel">
           <h2>Source</h2>
+          {!setupOpen ? (
+            <div className="rail-summary">
+              <p className="rail-summary-file">{selectedFile?.name ?? session?.audio_filename ?? "No file loaded"}</p>
+              <div className="chip-row">
+                <span className="metric-chip">{model}</span>
+                {speakerCount > 1 ? <span className="metric-chip">{speakerCount} speakers</span> : null}
+              </div>
+              <button onClick={() => setSetupOpen(true)}>New transcription…</button>
+            </div>
+          ) : null}
+          <div className={setupOpen ? undefined : "rail-hidden"}>
           <label
             className={`dropzone ${dragActive ? "is-dragging" : ""}`}
             onDragOver={(event) => {
@@ -4027,40 +4250,37 @@ function App() {
           <button className="primary-button" disabled={loading || retranscribing || !selectedFile} onClick={handleTranscribe}>
             {loading ? "Transcribing..." : "Transcribe"}
           </button>
-          <div className="panel-divider" />
-          <div className="panel-section-heading">
-            <p className="eyebrow">Resume</p>
-            <h3>Project file</h3>
           </div>
-          <p className="helper-text">Project files preserve the full editor state, guide blocks, timings, confidence data, and embedded audio for playback.</p>
-          <label>
-            Project file
-            <input type="file" accept=".json,.subtitle-workbench.json,application/json" onChange={(event) => setResumeProjectFile(event.target.files?.[0] ?? null)} />
-          </label>
-          <div className="inline-actions">
-            <button onClick={handleLoadProject}>Load project</button>
-            <button disabled={!activeEditor || !selectedFile} onClick={handleDownloadProject}>Save project</button>
-          </div>
-          <div className="panel-divider" />
-          <div className="panel-section-heading">
-          <p className="eyebrow">Legacy</p>
-          <h3>Audio + SRT</h3>
-          </div>
-          <p className="helper-text">Use this when you only have an audio file and an edited `.srt`. Default load preserves the original SRT timing and only rematches text to fresh WhisperX words.</p>
-          <p className="helper-text">`Load + retime to audio` is opt-in and rewrites caption timing from the audio. Larger WhisperX models usually rematch better; `tiny` is faster but more error-prone.</p>
-          <label>
-            Audio file
-            <input type="file" accept="audio/*,video/*" onChange={(event) => setResumeAudioFile(event.target.files?.[0] ?? null)} />
-          </label>
-          <label>
-            Subtitle file (.srt)
-            <input type="file" accept=".srt,text/plain" onChange={(event) => setResumeSubtitleFile(event.target.files?.[0] ?? null)} />
-          </label>
-          <div className="inline-actions">
-            <button onClick={() => void handleResumeSession()}>Load with SRT timing</button>
-            <button onClick={() => void handleResumeSession({ retimeCaptions: true })}>Load + retime to audio</button>
-            <button onClick={resetWorkspace}>Reset</button>
-          </div>
+          <details className="rail-details">
+            <summary>Project file (save / resume)</summary>
+            <p className="helper-text">Project files preserve the full editor state, guide blocks, timings, confidence data, and embedded audio for playback.</p>
+            <label>
+              Project file
+              <input type="file" accept=".json,.subtitle-workbench.json,application/json" onChange={(event) => setResumeProjectFile(event.target.files?.[0] ?? null)} />
+            </label>
+            <div className="inline-actions">
+              <button onClick={handleLoadProject}>Load project</button>
+              <button disabled={!activeEditor || !selectedFile} onClick={handleDownloadProject}>Save project</button>
+            </div>
+          </details>
+          <details className="rail-details">
+            <summary>Legacy: audio + SRT</summary>
+            <p className="helper-text">Use this when you only have an audio file and an edited `.srt`. Default load preserves the original SRT timing and only rematches text to fresh WhisperX words.</p>
+            <p className="helper-text">`Load + retime to audio` is opt-in and rewrites caption timing from the audio. Larger WhisperX models usually rematch better; `tiny` is faster but more error-prone.</p>
+            <label>
+              Audio file
+              <input type="file" accept="audio/*,video/*" onChange={(event) => setResumeAudioFile(event.target.files?.[0] ?? null)} />
+            </label>
+            <label>
+              Subtitle file (.srt)
+              <input type="file" accept=".srt,text/plain" onChange={(event) => setResumeSubtitleFile(event.target.files?.[0] ?? null)} />
+            </label>
+            <div className="inline-actions">
+              <button onClick={() => void handleResumeSession()}>Load with SRT timing</button>
+              <button onClick={() => void handleResumeSession({ retimeCaptions: true })}>Load + retime to audio</button>
+              <button onClick={resetWorkspace}>Reset</button>
+            </div>
+          </details>
           {statusMessage ? <p className="status-text">{statusMessage}</p> : null}
         </section>
       </aside>
@@ -4078,13 +4298,13 @@ function App() {
                 <div className="mode-toggle">
                   <button
                     className={playbackSource === "original" ? "is-active" : ""}
-                    onClick={() => setPlaybackSource("original")}
+                    onClick={() => switchPlaybackSource("original")}
                   >
                     Original
                   </button>
                   <button
                     className={playbackSource === "processed" ? "is-active" : ""}
-                    onClick={() => setPlaybackSource("processed")}
+                    onClick={() => switchPlaybackSource("processed")}
                   >
                     Mastered
                   </button>
@@ -4094,14 +4314,62 @@ function App() {
                 <button className={viewMode === "transcript" ? "is-active" : ""} onClick={() => setViewMode("transcript")}>Transcript</button>
                 <button className={viewMode === "subtitles" ? "is-active" : ""} onClick={() => setViewMode("subtitles")}>Subtitles</button>
               </div>
+              <button
+                disabled={viewMode === "transcript" ? !activeEditor?.paragraphs.length : !activeEditor?.captions.length}
+                onClick={viewMode === "transcript" ? jumpToCurrentTranscript : jumpToCurrentSubtitle}
+              >
+                Jump to current
+              </button>
+              <div className="view-options" ref={viewOptionsRef}>
+                <button
+                  type="button"
+                  className={viewOptionsOpen ? "is-active" : ""}
+                  title="View options"
+                  aria-label="View options"
+                  onClick={() => setViewOptionsOpen((open) => !open)}
+                >
+                  ⚙
+                </button>
+                {viewOptionsOpen ? (
+                  <div className="view-options-popover">
+                    <label className="toggle-row">
+                      <input type="checkbox" checked={clickToPlay} onChange={(event) => setClickToPlay(event.target.checked)} />
+                      Click text to play
+                    </label>
+                    <label className="toggle-row">
+                      <input type="checkbox" checked={followPlayback} onChange={(event) => setFollowPlayback(event.target.checked)} />
+                      Follow playback in editor
+                    </label>
+                    <label className="toggle-row">
+                      <input type="checkbox" checked={showLineGuides} onChange={(event) => setShowLineGuides(event.target.checked)} />
+                      Show line guides
+                    </label>
+                    <label className="toggle-row">
+                      <input type="checkbox" checked={showTimingHighlights} onChange={(event) => setShowTimingHighlights(event.target.checked)} />
+                      Show timing highlights
+                    </label>
+                    <p className="helper-text">Clicks always seek. `Ctrl+Space` play/pause. `Shift+Space` toggles click autoplay.</p>
+                  </div>
+                ) : null}
+              </div>
             </div>
           </div>
           <audio
-            ref={audioRef}
+            ref={originalAudioRef}
             controls
-            src={(playbackSource === "processed" && processedAudio ? processedAudio.url : audioUrl) ?? undefined}
-            preload="metadata"
+            className={playbackSource === "processed" && processedAudio ? "peer-audio-hidden" : undefined}
+            src={audioUrl ?? undefined}
+            preload="auto"
           />
+          {processedAudio ? (
+            <audio
+              ref={masteredAudioRef}
+              controls
+              className={playbackSource === "processed" ? undefined : "peer-audio-hidden"}
+              src={processedAudio.url}
+              preload="auto"
+            />
+          ) : null}
           <WaveformTimeline
             analysis={waveformAnalysis}
             captions={activeEditor?.captions ?? []}
@@ -4109,74 +4377,42 @@ function App() {
             currentTime={currentTime}
             onSeek={seekAudio}
           />
-          <div className="waveform-actions">
-            <div className="inline-actions">
-              <button disabled={!selectedFile || waveformLoading} onClick={() => void handleAnalyzeWaveform()}>
-                {waveformLoading ? "Analyzing..." : "Analyze waveform"}
-              </button>
-              <button disabled={!waveformAnalysis || !activeEditor?.captions.length} onClick={handleAlignCaptionsToWaveform}>
-                Snap subtitle edges
-              </button>
-            </div>
-            <div className="chip-row">
-              {waveformAnalysis ? (
-                <>
-                  <span className="metric-chip">{waveformAnalysis.speech_spans.length} speech regions</span>
-                  <span className="metric-chip">{waveformAnalysis.frames.length} waveform frames</span>
-                </>
-              ) : null}
-              {speakerTimelineEvents.length ? (
-                <span className="metric-chip">{speakerTimelineEvents.length} speaker markers</span>
-              ) : null}
-            </div>
-          </div>
-          {speakerTimelineEvents.length ? (
-            <div className="waveform-event-strip">
-              {speakerTimelineEvents.slice(0, 8).map((event) => (
-                <button
-                  key={event.id}
-                  className={`waveform-event-chip event-${event.kind}`}
-                  type="button"
-                  onClick={() => seekAudio(event.time, { play: false })}
-                >
-                  {formatClock(event.time)} {event.kind === "overlap" ? "Overlap" : event.kind === "tight_handoff" ? "Tight handoff" : "Switch"} | {event.label}
-                </button>
-              ))}
-            </div>
-          ) : null}
-          <div className="transport-note">
-            <label className="toggle-row">
-              <input type="checkbox" checked={clickToPlay} onChange={(event) => setClickToPlay(event.target.checked)} />
-              Click text to play
-            </label>
-            <label className="toggle-row">
-              <input type="checkbox" checked={followPlayback} onChange={(event) => setFollowPlayback(event.target.checked)} />
-              Follow playback in editor
-            </label>
-            <label className="toggle-row">
-              <input type="checkbox" checked={showLineGuides} onChange={(event) => setShowLineGuides(event.target.checked)} />
-              Show line guides
-            </label>
-            <label className="toggle-row">
-              <input type="checkbox" checked={showTimingHighlights} onChange={(event) => setShowTimingHighlights(event.target.checked)} />
-              Show timing highlights
-            </label>
-            <span>Clicks always seek. `Ctrl+Space` play/pause. `Shift+Space` toggles click autoplay.</span>
-          </div>
-          <div className="inline-actions">
-            <button
-              disabled={viewMode === "transcript" ? !activeEditor?.paragraphs.length : !activeEditor?.captions.length}
-              onClick={viewMode === "transcript" ? jumpToCurrentTranscript : jumpToCurrentSubtitle}
-            >
-              Jump to Current
+          <div className="waveform-strip">
+            <button disabled={!selectedFile || waveformLoading} onClick={() => void handleAnalyzeWaveform()}>
+              {waveformLoading ? "Analyzing..." : "Analyze waveform"}
             </button>
+            <button disabled={!waveformAnalysis || !activeEditor?.captions.length} onClick={handleAlignCaptionsToWaveform}>
+              Snap subtitle edges
+            </button>
+            {waveformAnalysis ? (
+              <span className="metric-chip">{waveformAnalysis.speech_spans.length} speech regions</span>
+            ) : null}
+            {speakerTimelineEvents.slice(0, 8).map((event) => (
+              <button
+                key={event.id}
+                className={`waveform-event-chip event-${event.kind}`}
+                type="button"
+                onClick={() => seekAudio(event.time, { play: false })}
+              >
+                {formatClock(event.time)} {event.kind === "overlap" ? "Overlap" : event.kind === "tight_handoff" ? "Tight handoff" : "Switch"} | {event.label}
+              </button>
+            ))}
           </div>
           {activeWarnings.length ? (
-            <div className="warning-stack">
-              {activeWarnings.map((warning) => (
-                <p key={warning.code + warning.message} className="warning-chip">{warning.message}</p>
-              ))}
-            </div>
+            <details className="warning-details">
+              <summary>
+                {activeWarnings.length === 1
+                  ? activeWarnings[0].message.length > 90
+                    ? `${activeWarnings[0].message.slice(0, 89)}…`
+                    : activeWarnings[0].message
+                  : `${activeWarnings.length} warnings`}
+              </summary>
+              <div className="warning-stack">
+                {activeWarnings.map((warning) => (
+                  <p key={warning.code + warning.message} className="warning-chip">{warning.message}</p>
+                ))}
+              </div>
+            </details>
           ) : null}
         </section>
 
@@ -4262,6 +4498,9 @@ function App() {
                         <button onClick={undo} disabled={!history.past.length}>Undo</button>
                         <button onClick={redo} disabled={!history.future.length}>Redo</button>
                         <button disabled={!activeEditor?.captions.length} onClick={reflowAllCaptions}>Reflow Lines</button>
+                        <button disabled={!activeWorkspace?.words.length || resplitting} onClick={() => void handleResplitCaptions()}>
+                          {resplitting ? "Re-splitting..." : "Re-split Captions"}
+                        </button>
                       </div>
                     </div>
                     <div className="subtitle-sheet">
@@ -4333,6 +4572,11 @@ function App() {
                                 if (event.key === "Enter" && !event.shiftKey) {
                                   event.preventDefault();
                                   splitCaption(index, selectionStart ?? 0, selectionEnd ?? 0);
+                                  return;
+                                }
+                                if (event.key === "Enter" && event.shiftKey && target.value.includes("\n")) {
+                                  // Captions are capped at two lines.
+                                  event.preventDefault();
                                   return;
                                 }
                                 if (
@@ -4429,90 +4673,6 @@ function App() {
               </div>
             )}
 
-            <section className="export-panel">
-              <div className="panel-section-heading">
-                <p className="eyebrow">Export</p>
-                <h3>Outputs</h3>
-              </div>
-              <p className="helper-text">Export from the current transcript and subtitle edits. Extending subtitles only changes the exported SRT. Speaker attribution settings here affect subtitle export only.</p>
-              <label className="toggle-row">
-                <input type="checkbox" checked={extendCaptionsOnExport} onChange={(event) => setExtendCaptionsOnExport(event.target.checked)} />
-                Extend subtitles to next on export
-              </label>
-              <label className="toggle-row">
-                <input
-                  type="checkbox"
-                  checked={normalizeExportTimingTo30Fps}
-                  onChange={(event) => setNormalizeExportTimingTo30Fps(event.target.checked)}
-                />
-                Normalize export timing to 30fps
-              </label>
-              <label className="toggle-row">
-                <input
-                  type="checkbox"
-                  checked={showSpeakerAttributionOptions}
-                  onChange={(event) => setShowSpeakerAttributionOptions(event.target.checked)}
-                />
-                Customize speaker attribution in subtitle export
-              </label>
-              {showSpeakerAttributionOptions && activeEditor?.speakers.length ? (
-                <div className="speaker-attribution-group">
-                  {activeEditor.speakers.map((speaker, index) => (
-                    <label key={speaker.id} className="toggle-row compact-toggle">
-                      <input
-                        type="checkbox"
-                        checked={speaker.show_attribution !== false}
-                        onChange={(event) => updateSpeakerAttribution(index, event.target.checked)}
-                      />
-                      {speaker.name || `Speaker ${index + 1}`}
-                    </label>
-                  ))}
-                </div>
-              ) : null}
-              <div className="inline-actions">
-                <button
-                  disabled={!activeEditor}
-                  onClick={() =>
-                    activeEditor &&
-                    downloadText(
-                      buildExportFilename(currentAudioFilename, activeEditor.speakers, "subtitles", "srt"),
-                      captionsToSrt(
-                        activeEditor.captions,
-                        activeEditor.speakers,
-                        extendCaptionsOnExport,
-                        normalizeExportTimingTo30Fps,
-                      ),
-                    )
-                  }
-                >
-                  Download subtitles (.srt)
-                </button>
-                <button
-                  disabled={!activeEditor}
-                  onClick={() =>
-                    activeEditor &&
-                    downloadText(
-                      buildExportFilename(currentAudioFilename, activeEditor.speakers, "transcript", "txt"),
-                      paragraphsToTranscriptText(activeEditor.paragraphs, activeEditor.speakers),
-                    )
-                  }
-                >
-                  Download transcript (.txt)
-                </button>
-                <button
-                  disabled={!activeEditor}
-                  onClick={() =>
-                    activeEditor &&
-                    downloadText(
-                      buildExportFilename(currentAudioFilename, activeEditor.speakers, "edit-guide", "srt"),
-                      guideToSrt(activeEditor.guideBlocks, normalizeExportTimingTo30Fps),
-                    )
-                  }
-                >
-                  Download edit guide (.srt)
-                </button>
-              </div>
-            </section>
           </section>
 
           <aside className={`guide-panel ${isGuidePanelCollapsed ? "is-collapsed" : ""}`}>
@@ -4698,6 +4858,93 @@ function App() {
                   />
                 ) : null}
 
+                {sidePanelTab === "export" ? (
+                  <section className="selection-panel">
+                    <div className="panel-section-heading">
+                      <p className="eyebrow">Export</p>
+                      <h3>Outputs</h3>
+                    </div>
+                    <p className="helper-text">Export from the current transcript and subtitle edits. Extending subtitles only changes the exported SRT. Speaker attribution settings here affect subtitle export only.</p>
+                    <label className="toggle-row">
+                      <input type="checkbox" checked={extendCaptionsOnExport} onChange={(event) => setExtendCaptionsOnExport(event.target.checked)} />
+                      Extend subtitles to next on export
+                    </label>
+                    <label className="toggle-row">
+                      <input
+                        type="checkbox"
+                        checked={normalizeExportTimingTo30Fps}
+                        onChange={(event) => setNormalizeExportTimingTo30Fps(event.target.checked)}
+                      />
+                      Normalize export timing to 30fps
+                    </label>
+                    <label className="toggle-row">
+                      <input
+                        type="checkbox"
+                        checked={showSpeakerAttributionOptions}
+                        onChange={(event) => setShowSpeakerAttributionOptions(event.target.checked)}
+                      />
+                      Customize speaker attribution in subtitle export
+                    </label>
+                    {showSpeakerAttributionOptions && activeEditor?.speakers.length ? (
+                      <div className="speaker-attribution-group">
+                        {activeEditor.speakers.map((speaker, index) => (
+                          <label key={speaker.id} className="toggle-row compact-toggle">
+                            <input
+                              type="checkbox"
+                              checked={speaker.show_attribution !== false}
+                              onChange={(event) => updateSpeakerAttribution(index, event.target.checked)}
+                            />
+                            {speaker.name || `Speaker ${index + 1}`}
+                          </label>
+                        ))}
+                      </div>
+                    ) : null}
+                    <div className="inline-actions">
+                      <button
+                        disabled={!activeEditor}
+                        onClick={() =>
+                          activeEditor &&
+                          downloadText(
+                            buildExportFilename(currentAudioFilename, activeEditor.speakers, "subtitles", "srt"),
+                            captionsToSrt(
+                              activeEditor.captions,
+                              activeEditor.speakers,
+                              extendCaptionsOnExport,
+                              normalizeExportTimingTo30Fps,
+                            ),
+                          )
+                        }
+                      >
+                        Download subtitles (.srt)
+                      </button>
+                      <button
+                        disabled={!activeEditor}
+                        onClick={() =>
+                          activeEditor &&
+                          downloadText(
+                            buildExportFilename(currentAudioFilename, activeEditor.speakers, "transcript", "txt"),
+                            paragraphsToTranscriptText(activeEditor.paragraphs, activeEditor.speakers),
+                          )
+                        }
+                      >
+                        Download transcript (.txt)
+                      </button>
+                      <button
+                        disabled={!activeEditor}
+                        onClick={() =>
+                          activeEditor &&
+                          downloadText(
+                            buildExportFilename(currentAudioFilename, activeEditor.speakers, "edit-guide", "srt"),
+                            guideToSrt(activeEditor.guideBlocks, normalizeExportTimingTo30Fps),
+                          )
+                        }
+                      >
+                        Download edit guide (.srt)
+                      </button>
+                    </div>
+                  </section>
+                ) : null}
+
                 {sidePanelTab === "qa" ? (
                   <section className="selection-panel">
                     <div className="panel-section-heading">
@@ -4743,7 +4990,7 @@ function App() {
               </>
             ) : (
               <div className="guide-collapsed-shell">
-                <p className="helper-text guide-collapsed-copy">Guide, glossary, and QA stay tucked away until you need them.</p>
+                <p className="helper-text guide-collapsed-copy">Guide, glossary, QA, mastering, and export stay tucked away until you need them.</p>
                 <div className="guide-collapsed-metrics">
                   <span className="metric-chip">{sidePanelMeta.detail}</span>
                   <span className="metric-chip">{collapsedPanelMetaDetail}</span>

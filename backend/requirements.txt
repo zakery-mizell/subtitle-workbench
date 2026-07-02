@@ -7,3 +7,4 @@ numpy>=2.0,<2.3
 scipy>=1.14
 soundfile>=0.12.1
 pyloudnorm==0.1.1
+httpx>=0.27  # FastAPI TestClient (tests)

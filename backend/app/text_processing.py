@@ -52,6 +52,20 @@ WEAK_LINE_STARTS = {
     "an",
     "the",
 }
+# Caption segmentation rules. All deterministic; tweak the numbers here.
+CAPTION_MAX_LINE_CHARS = 42  # max characters per subtitle line
+CAPTION_MAX_LINES = 2  # captions are one or two lines, never three
+CAPTION_MAX_CHARS = CAPTION_MAX_LINE_CHARS * CAPTION_MAX_LINES
+CAPTION_MIN_DURATION_S = 1.0  # short captions extend into the following gap
+CAPTION_SENTENCE_GAP_S = 1.4  # a pause this long forces a sentence boundary
+CAPTION_BLANK_AFTER_GAP_S = 2.5  # editor shows a blank spacer after gaps this long
+CAPTION_MERGE_SHORT_SENTENCES = True  # "Yeah. Exactly." may share one caption
+CAPTION_SHORT_SENTENCE_CHARS = 30  # each merged sentence must be at most this long
+CAPTION_SHORT_SENTENCE_GAP_S = 0.5  # and this close together
+CAPTION_MIN_CHUNK_CHARS = 12  # no orphan fragments when splitting long sentences
+
+INITIAL_RE = re.compile(r"^[A-Z]\.$")
+
 WEAK_LINE_ENDS = {
     "a",
     "an",
@@ -290,55 +304,165 @@ def build_paragraphs(words: list[WordToken]) -> list[Paragraph]:
     return paragraphs
 
 
+def _words_text(words: list[WordToken]) -> str:
+    return _normalize_spacing(" ".join(word.text for word in words))
+
+
+def _is_sentence_end(word: WordToken) -> bool:
+    text = word.text.strip()
+    if not SENTENCE_END_RE.search(text):
+        return False
+    # Abbreviations that end with a period are not sentence boundaries.
+    if HONORIFIC_RE.match(text):
+        return False
+    if INITIAL_RE.match(text):
+        return False
+    return True
+
+
+def _split_sentences(words: list[WordToken]) -> list[list[WordToken]]:
+    """Group words into sentences. Speaker changes and long pauses also
+    force a boundary so a sentence never spans speakers or dead air."""
+    sentences: list[list[WordToken]] = []
+    current: list[WordToken] = []
+    for word in words:
+        if current:
+            prev = current[-1]
+            if word.speaker_id != prev.speaker_id or word.start - prev.end > CAPTION_SENTENCE_GAP_S:
+                sentences.append(current)
+                current = []
+        current.append(word)
+        if _is_sentence_end(word):
+            sentences.append(current)
+            current = []
+    if current:
+        sentences.append(current)
+    return sentences
+
+
+def _sentence_chunk_score(left_words: list[WordToken], right_words: list[WordToken]) -> float:
+    """Rank a mid-sentence split point. Lower is better."""
+    left_text = _words_text(left_words)
+    right_text = _words_text(right_words)
+    score = 0.0
+
+    last_token = left_words[-1].text.strip()
+    first_normalized = normalize_word(right_words[0].text)
+    last_normalized = normalize_word(last_token)
+
+    if CLAUSE_END_RE.search(last_token):
+        score -= 40.0
+    if last_normalized in WEAK_LINE_ENDS:
+        score += 22.0
+    if first_normalized in WEAK_LINE_STARTS:
+        score -= 6.0  # starting the next caption on "and"/"that" reads fine
+
+    # Prefer to break where the speaker actually paused.
+    gap = right_words[0].start - left_words[-1].end
+    score -= min(gap, 1.0) * 30.0
+
+    # Prefer full captions (fewer, calmer captions) and balanced remainders.
+    score += max(0, CAPTION_MAX_CHARS - len(left_text)) * 0.4
+    if len(right_text) < CAPTION_MIN_CHUNK_CHARS:
+        score += 60.0
+    if len(left_text) < CAPTION_MIN_CHUNK_CHARS:
+        score += 60.0
+
+    return score
+
+
+def _split_long_sentence(sentence: list[WordToken]) -> list[list[WordToken]]:
+    """Split one over-long sentence into caption-sized chunks at the best
+    clause boundaries. Chunks belong to this sentence only."""
+    chunks: list[list[WordToken]] = []
+    remaining = sentence
+    while len(_words_text(remaining)) > CAPTION_MAX_CHARS and len(remaining) > 1:
+        best_index: int | None = None
+        best_score = 0.0
+        for index in range(1, len(remaining)):
+            left = remaining[:index]
+            if len(_words_text(left)) > CAPTION_MAX_CHARS:
+                break
+            score = _sentence_chunk_score(left, remaining[index:])
+            if best_index is None or score < best_score:
+                best_index = index
+                best_score = score
+        if best_index is None:
+            # First word alone exceeds the cap; emit it and move on.
+            best_index = 1
+        chunks.append(remaining[:best_index])
+        remaining = remaining[best_index:]
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 def build_captions(words: list[WordToken]) -> list[Caption]:
-    captions: list[Caption] = []
+    """Deterministic caption segmentation.
+
+    Sentence-first: a caption never contains a sentence boundary mid-text, so
+    the tail of one sentence is never glued to the head of the next. Whole
+    short sentences may share a caption; long sentences split at clause
+    boundaries into caption-sized fragments of that sentence only.
+    """
     if not words:
-        return captions
+        return []
 
-    bucket: list[WordToken] = []
+    class _Group:
+        __slots__ = ("words", "complete")
 
-    def flush(blank_after: bool = False):
-        nonlocal bucket
-        if not bucket:
-            return
-        text = _normalize_spacing(" ".join(word.text for word in bucket))
-        lines = split_caption_lines(text)
+        def __init__(self, group_words: list[WordToken], complete: bool) -> None:
+            self.words = group_words
+            self.complete = complete
+
+    groups: list[_Group] = []
+    for sentence in _split_sentences(words):
+        text = _words_text(sentence)
+        if len(text) > CAPTION_MAX_CHARS:
+            for chunk in _split_long_sentence(sentence):
+                groups.append(_Group(chunk, complete=False))
+            continue
+
+        if CAPTION_MERGE_SHORT_SENTENCES and groups:
+            previous = groups[-1]
+            combined = _words_text(previous.words + sentence)
+            # The merged caption as a whole must stay interjection-sized, so
+            # "Yeah. Exactly." shares a caption but real sentences never chain.
+            if (
+                previous.complete
+                and len(combined) <= CAPTION_SHORT_SENTENCE_CHARS
+                and sentence[0].speaker_id == previous.words[-1].speaker_id
+                and sentence[0].start - previous.words[-1].end <= CAPTION_SHORT_SENTENCE_GAP_S
+            ):
+                previous.words = previous.words + sentence
+                continue
+
+        groups.append(_Group(sentence, complete=True))
+
+    captions: list[Caption] = []
+    for index, group in enumerate(groups):
+        bucket = group.words
+        start = bucket[0].start
+        end = bucket[-1].end
+        next_start = groups[index + 1].words[0].start if index + 1 < len(groups) else None
+        # Give very short captions time to read, without touching the next one.
+        if end - start < CAPTION_MIN_DURATION_S:
+            extended = start + CAPTION_MIN_DURATION_S
+            end = min(extended, next_start) if next_start is not None else extended
+            end = max(end, bucket[-1].end)
+        blank_after = next_start is not None and next_start - bucket[-1].end > CAPTION_BLANK_AFTER_GAP_S
         captions.append(
             Caption(
                 id=f"c-{len(captions)}",
-                start=bucket[0].start,
-                end=bucket[-1].end,
+                start=start,
+                end=end,
                 speaker_id=bucket[0].speaker_id,
                 speaker_name=bucket[0].speaker_name,
-                lines=lines,
+                lines=split_caption_lines(_words_text(bucket)),
                 word_ids=[word.id for word in bucket],
                 blank_after=blank_after,
             )
         )
-        bucket = []
-
-    for word in words:
-        if not bucket:
-            bucket.append(word)
-            continue
-
-        candidate = _normalize_spacing(" ".join(item.text for item in [*bucket, word]))
-        prev = bucket[-1]
-        sentence_break = re.search(r"[.!?][\"')\]]?$", prev.text) is not None
-        long_pause = word.start - prev.end > 1.4
-        speaker_change = word.speaker_id != prev.speaker_id
-        sentence_overflow = sentence_break and len(candidate) > 64
-        clause_overflow = len(candidate) > 104
-
-        if speaker_change or long_pause or sentence_overflow:
-            flush(blank_after=word.start - prev.end > 2.5)
-
-        elif clause_overflow:
-            flush()
-
-        bucket.append(word)
-
-    flush()
     return captions
 
 
@@ -433,7 +557,13 @@ def merge_windows(
     return merged
 
 
-def split_caption_lines(text: str, target_line_length: int = 64) -> list[str]:
+def split_caption_lines(text: str, target_line_length: int = CAPTION_MAX_LINE_CHARS) -> list[str]:
+    """Break caption text into one or two lines, never more.
+
+    Fits on one line when possible; otherwise splits once, preferring a
+    sentence boundary (only present when short sentences were merged into one
+    caption), then the best-scoring word boundary.
+    """
     normalized = _normalize_spacing(text)
     if not normalized:
         return [""]
@@ -445,19 +575,22 @@ def split_caption_lines(text: str, target_line_length: int = 64) -> list[str]:
     if len(tokens) < 2:
         return [normalized]
 
+    hard_cap = target_line_length + 14
+
+    # A sentence boundary inside a caption is the ideal line break.
+    sentence_indexes = [
+        index
+        for index in range(1, len(tokens))
+        if SENTENCE_END_RE.search(tokens[index - 1])
+        and not HONORIFIC_RE.match(tokens[index - 1])
+        and not INITIAL_RE.match(tokens[index - 1])
+        and len(" ".join(tokens[:index])) <= hard_cap
+        and len(" ".join(tokens[index:])) <= hard_cap
+    ]
+    candidate_indexes = sentence_indexes or list(range(1, len(tokens)))
+
     best_lines = [normalized]
     best_score: float | None = None
-    hard_cap = max(target_line_length + 28, 92)
-    preferred_indexes = (
-        [index for index in range(1, len(tokens)) if CLAUSE_END_RE.search(tokens[index - 1])]
-        if len(normalized) <= hard_cap
-        else []
-    )
-    candidate_indexes = preferred_indexes or (list(range(1, len(tokens))) if len(normalized) > hard_cap else [])
-
-    if not candidate_indexes:
-        return [normalized]
-
     for index in candidate_indexes:
         left = " ".join(tokens[:index]).strip()
         right = " ".join(tokens[index:]).strip()

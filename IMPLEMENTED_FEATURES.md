@@ -231,3 +231,12 @@ Local Auphonic-style post production implemented in `backend/app/mastering/` and
 - Before/after loudness report: integrated LUFS, loudness range, true peak, noise floor, plus per-stage details.
 - Processed master playback via Original/Mastered A/B toggle, waveform refresh from the processed file, and encoded download (wav, flac, mp3, aac, opus).
 - Unit tests for loudness math, limiter, hum removal, leveler, classifier, cutting/remap, job registry, and endpoint contracts.
+
+## 12. Caption Rules, A/B Playback, and Streamlined UI
+
+- Deterministic sentence-first caption segmentation (`backend/app/text_processing.py`): captions never contain a mid-text sentence boundary; whole short sentences ("Yeah. Exactly.") may share one caption; long sentences split at clause boundaries; max 2 lines at 42 chars/line with abbreviation guards (Dr., initials). Constants at the top of the module control every rule.
+- `POST /api/rebuild-captions` re-runs the rules on the current words; "Re-split Captions" button in the subtitles toolbar commits the result through undo history.
+- Caption editor enforces the 2-line cap (Shift+Enter blocked past 2 lines; pasted extra lines fold into line 2).
+- Instant A/B: original and mastered audio render as two persistent elements that co-play in lockstep; the Original/Mastered toggle is a gapless mute swap with drift correction, falling back to cut-list time mapping when the master has a shortened timeline.
+- Follow playback is on by default; the caption/transcript list auto-scrolls to the active block and suspends for 3 s after manual scrolling.
+- Streamlined layout: one-row transport bar (clock, A/B, view mode, jump, gear popover with view toggles), consolidated waveform strip, sticky player panel, collapsible source/setup rail with summary card, warnings as a collapsible strip, and Export moved into the side panel as its own tab.

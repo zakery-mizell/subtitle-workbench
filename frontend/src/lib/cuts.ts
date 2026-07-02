@@ -19,6 +19,22 @@ export function remapTime(t: number, cuts: CutRegion[]): number {
   return Math.max(0, t - removed);
 }
 
+/**
+ * Inverse of remapTime: map a timestamp on the cut (processed) timeline back
+ * onto the original timeline.
+ */
+export function unremapTime(t: number, cuts: CutRegion[]): number {
+  let removed = 0;
+  for (const cut of sortCuts(cuts)) {
+    if (t >= cut.start - removed) {
+      removed += cut.end - cut.start;
+    } else {
+      break;
+    }
+  }
+  return t + removed;
+}
+
 function sortCuts(cuts: CutRegion[]): CutRegion[] {
   return [...cuts].sort((a, b) => a.start - b.start);
 }

@@ -35,6 +35,9 @@ Local web app for:
 - playback skip toggle for guide blocks
 - waveform timeline analysis that draws speech regions and subtitle blocks
 - waveform snapping for subtitle start/end edges near detected speech onsets and offsets
+- deterministic sentence-aware caption splitting (max 2 lines, 42 chars/line, no sentence carryover) with a "Re-split Captions" action
+- instant Original/Mastered A/B playback (both versions stay loaded and in sync; switching is gapless)
+- captions auto-scroll with playback (suspends briefly while you scroll manually)
 - speaker handoff / possible overlap markers on the waveform timeline
 - project file export/import for full-session resume, including guide blocks, timing metadata, confidence data, and embedded audio
 - export for:

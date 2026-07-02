@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from fastapi.responses import FileResponse, PlainTextResponse
 
@@ -21,7 +21,7 @@ from .jobs import registry as job_registry
 from .mastering.cutting import CutRegion, export_audacity_labels
 from .mastering.pipeline import find_master_artifact, run_mastering
 from .mastering.schemas import JobStatusResponse, MasterJobResponse, MasteringParams
-from .schemas import CapabilitiesResponse, RetranscribeRangeResponse, SpeakerAssignmentMode, SpeakerInput, TranscriptResponse, WarningItem, WaveformAnalysisResponse, WordToken
+from .schemas import CapabilitiesResponse, Caption, Paragraph, RetranscribeRangeResponse, SpeakerAssignmentMode, SpeakerInput, TranscriptResponse, WarningItem, WaveformAnalysisResponse, WordToken
 from .text_processing import build_captions, build_guide_blocks, build_paragraphs, build_words, remove_disfluencies
 from .waveform_analysis import analyze_waveform
 from .whisperx_transcription import transcribe_with_whisperx
@@ -447,6 +447,24 @@ def parse_words_json(words_json: str | None) -> list[dict[str, Any]] | None:
         return [dict(item) for item in payload if isinstance(item, dict)]
     except (json.JSONDecodeError, TypeError) as exc:
         raise HTTPException(status_code=422, detail="words_json must be a JSON array of word objects.") from exc
+
+
+class RebuildCaptionsRequest(BaseModel):
+    words: list[WordToken]
+
+
+class RebuildCaptionsResponse(BaseModel):
+    captions: list[Caption]
+    paragraphs: list[Paragraph]
+
+
+@app.post("/api/rebuild-captions", response_model=RebuildCaptionsResponse)
+def rebuild_captions(payload: RebuildCaptionsRequest) -> RebuildCaptionsResponse:
+    """Re-run the deterministic caption/paragraph rules on the given words."""
+    return RebuildCaptionsResponse(
+        captions=build_captions(payload.words),
+        paragraphs=build_paragraphs(payload.words),
+    )
 
 
 @app.post("/api/master", response_model=MasterJobResponse)
