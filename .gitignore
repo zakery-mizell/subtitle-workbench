@@ -33,3 +33,4 @@ torch/
 *.bin
 *.safetensors
 checkpoints/
+.DS_Store

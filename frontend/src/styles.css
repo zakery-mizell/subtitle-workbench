@@ -27,7 +27,9 @@
   --wave-speech: rgba(15, 118, 110, 0.12);
   --wave-caption-fill: rgba(37, 99, 235, 0.2);
   --wave-caption-stroke: rgba(37, 99, 235, 0.55);
-  --playhead: #ef4444;
+  --playhead: #d85a30;
+  --wave-played: #1d9e75;
+  --wave-rest: #c4c9d4;
   --radius: 8px;
   --radius-sm: 6px;
   --rail-width: 348px;
@@ -363,17 +365,14 @@ label {
 .waveform-timeline {
   width: 100%;
   margin-top: 0.72rem;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface);
   overflow: hidden;
 }
 
 .waveform-canvas {
   display: block;
   width: 100%;
-  height: 132px;
-  cursor: crosshair;
+  height: 72px;
+  cursor: pointer;
 }
 
 .waveform-actions {
@@ -1191,8 +1190,10 @@ button.caption-time:hover {
 /* Compact, pinned transport + waveform block */
 .player-panel {
   position: sticky;
-  top: 0.5rem;
+  top: 0;
   z-index: 30;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
 }
 
 .waveform-strip {
@@ -1579,7 +1580,9 @@ button.toast-dismiss {
   --wave-speech: rgba(45, 212, 191, 0.14);
   --wave-caption-fill: rgba(91, 141, 239, 0.24);
   --wave-caption-stroke: rgba(91, 141, 239, 0.6);
-  --playhead: #f87171;
+  --playhead: #e8825f;
+  --wave-played: #2fbd8f;
+  --wave-rest: #39445a;
 }
 
 :root[data-theme="dark"] body {

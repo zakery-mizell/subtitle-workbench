@@ -8,8 +8,6 @@ import {
   Pause,
   Play,
   Redo2,
-  Rewind,
-  FastForward,
   Scissors,
   Settings2,
   SlidersHorizontal,
@@ -2014,99 +2012,58 @@ function drawWaveformTimeline(
   canvas.style.height = `${height}px`;
   context.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-  const { analysis, captions, speakerEvents, currentTime } = props;
+  const { analysis, captions, currentTime } = props;
   const duration = Math.max(
     analysis?.duration ?? 0,
     captions[captions.length - 1]?.end ?? 0,
     currentTime,
     1,
   );
-  const xForTime = (time: number) => clampNumber((time / duration) * width, 0, width);
 
   context.clearRect(0, 0, width, height);
-  context.fillStyle = themeColor("--wave-bg", "#ffffff");
-  context.fillRect(0, 0, width, height);
 
-  const gridStep =
-    duration > 3600 ? 600 : duration > 1200 ? 300 : duration > 420 ? 60 : duration > 120 ? 20 : 5;
-  context.strokeStyle = themeColor("--wave-grid", "#e2e8f0");
-  context.lineWidth = 1;
-  context.fillStyle = themeColor("--muted", "#647184");
-  context.font = "11px Inter, sans-serif";
-  for (let time = 0; time <= duration; time += gridStep) {
-    const x = xForTime(time);
-    context.beginPath();
-    context.moveTo(x, 0);
-    context.lineTo(x, height);
-    context.stroke();
-    if (time > 0) {
-      context.fillText(formatClock(time), x + 4, 12);
+  if (!analysis?.frames.length) {
+    context.fillStyle = themeColor("--muted", "#647184");
+    context.font = "12px Inter, sans-serif";
+    context.fillText("Waveform appears after loading audio", 12, height / 2 + 4);
+    return;
+  }
+
+  // Amplitude bars, split into played and unplayed at the playhead.
+  const barWidth = 3;
+  const barGap = 2;
+  const step = barWidth + barGap;
+  const barCount = Math.max(1, Math.floor(width / step));
+  const centerY = height / 2;
+  const maxBar = height * 0.86;
+  const playedColor = themeColor("--wave-played", "#1d9e75");
+  const restColor = themeColor("--wave-rest", "#b4b2a9");
+  const playheadX = clampNumber((currentTime / duration) * width, 0, width);
+
+  // One pass over the frames: bucket each into its bar and keep the peak.
+  const peaks = new Float32Array(barCount);
+  for (const frame of analysis.frames) {
+    const barIndex = Math.min(barCount - 1, Math.floor((frame.time / duration) * barCount));
+    const amplitude = Math.max(Math.abs(frame.max), Math.abs(frame.min));
+    if (amplitude > peaks[barIndex]) {
+      peaks[barIndex] = amplitude;
     }
   }
 
-  if (analysis) {
-    context.fillStyle = themeColor("--wave-speech", "rgba(15, 118, 110, 0.12)");
-    analysis.speech_spans.forEach((span) => {
-      const x = xForTime(span.start);
-      context.fillRect(x, 20, Math.max(1, xForTime(span.end) - x), height - 42);
-    });
+  for (let barIndex = 0; barIndex < barCount; barIndex += 1) {
+    const x = barIndex * step;
+    const barHeight = Math.max(3, peaks[barIndex] * maxBar);
+    context.fillStyle = x + barWidth / 2 <= playheadX ? playedColor : restColor;
+    context.beginPath();
+    context.roundRect(x, centerY - barHeight / 2, barWidth, barHeight, 1.5);
+    context.fill();
   }
 
-  context.fillStyle = themeColor("--wave-caption-fill", "rgba(37, 99, 235, 0.2)");
-  context.strokeStyle = themeColor("--wave-caption-stroke", "rgba(37, 99, 235, 0.55)");
-  captions.forEach((caption) => {
-    const x = xForTime(caption.start);
-    const w = Math.max(1, xForTime(caption.end) - x);
-    context.fillRect(x, 18, w, 14);
-    context.strokeRect(x, 18, w, 14);
-  });
-
-  const centerY = height * 0.62;
-  const waveScale = height * 0.31;
-  context.strokeStyle = themeColor("--wave-axis", "#b8c3d4");
-  context.lineWidth = 1;
-  context.beginPath();
-  context.moveTo(0, centerY);
-  context.lineTo(width, centerY);
-  context.stroke();
-
-  if (analysis?.frames.length) {
-    context.strokeStyle = themeColor("--wave-ink", "#334155");
-    context.beginPath();
-    analysis.frames.forEach((frame) => {
-      const x = xForTime(frame.time);
-      const yTop = centerY - frame.max * waveScale;
-      const yBottom = centerY - frame.min * waveScale;
-      context.moveTo(x, yTop);
-      context.lineTo(x, yBottom);
-    });
-    context.stroke();
-  } else {
-    context.fillStyle = themeColor("--muted", "#647184");
-    context.fillText("Waveform appears after loading audio", 12, centerY - 10);
-  }
-
-  speakerEvents.forEach((event) => {
-    const x = xForTime(event.time);
-    context.strokeStyle =
-      event.kind === "overlap"
-        ? themeColor("--danger", "#c2410c")
-        : event.kind === "tight_handoff"
-          ? themeColor("--warning", "#b7791f")
-          : themeColor("--repeat", "#7c3aed");
-    context.lineWidth = event.kind === "overlap" ? 2 : 1.5;
-    context.beginPath();
-    context.moveTo(x, 10);
-    context.lineTo(x, height - 8);
-    context.stroke();
-  });
-
-  const playheadX = xForTime(currentTime);
-  context.strokeStyle = themeColor("--playhead", "#ef4444");
+  context.strokeStyle = themeColor("--playhead", "#d85a30");
   context.lineWidth = 2;
   context.beginPath();
-  context.moveTo(playheadX, 0);
-  context.lineTo(playheadX, height);
+  context.moveTo(playheadX, 2);
+  context.lineTo(playheadX, height - 2);
   context.stroke();
 }
 
@@ -2125,7 +2082,7 @@ const WaveformTimeline = memo(function WaveformTimeline(props: WaveformTimelineP
       const rect = wrapper.getBoundingClientRect();
       setSize({
         width: Math.max(320, Math.floor(rect.width)),
-        height: 132,
+        height: 72,
       });
     };
 
@@ -3088,6 +3045,19 @@ function App() {
       if (isRedoShortcut && !isEditableTarget(event.target)) {
         event.preventDefault();
         redo();
+        return;
+      }
+
+      if (
+        (event.key === "ArrowLeft" || event.key === "ArrowRight") &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !event.metaKey &&
+        !event.shiftKey &&
+        !isEditableTarget(event.target)
+      ) {
+        event.preventDefault();
+        skipBy(event.key === "ArrowLeft" ? -3 : 3);
         return;
       }
 
@@ -4506,14 +4476,8 @@ function App() {
         <section className="player-panel">
           <div className="transport-bar">
             <div className="transport-cluster">
-              <button className="icon-button" onClick={() => skipBy(-3)} disabled={!audioUrl} title="Back 3 seconds" aria-label="Back 3 seconds">
-                <Rewind size={16} />
-              </button>
               <button className="icon-button transport-play" onClick={togglePlayback} disabled={!audioUrl} aria-label={isPlaying ? "Pause" : "Play"}>
                 {isPlaying ? <Pause size={18} /> : <Play size={18} />}
-              </button>
-              <button className="icon-button" onClick={() => skipBy(3)} disabled={!audioUrl} title="Forward 3 seconds" aria-label="Forward 3 seconds">
-                <FastForward size={16} />
               </button>
               <button
                 className="icon-button"
@@ -4613,7 +4577,7 @@ function App() {
                       <input type="checkbox" checked={themeDark} onChange={(event) => setThemeDark(event.target.checked)} />
                       Dark theme
                     </label>
-                    <p className="helper-text">Clicks always seek. `Ctrl+Space` play/pause. `Shift+Space` toggles click autoplay.</p>
+                    <p className="helper-text">Clicks always seek. `Ctrl+Space` play/pause. `←`/`→` skip 3s. `Shift+Space` toggles click autoplay.</p>
                   </div>
                 ) : null}
               </div>
