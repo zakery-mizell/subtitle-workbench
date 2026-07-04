@@ -6,6 +6,7 @@ import os
 import subprocess
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from uuid import uuid4
 from typing import Any
 
 from fastapi import FastAPI, File, Form, UploadFile
@@ -30,9 +31,10 @@ if os.name != "nt":
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 app = FastAPI(title=settings.app_name)
+BACKEND_INSTANCE_ID = uuid4().hex
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.cors_origin, "http://127.0.0.1:5173"],
+    allow_origins=[settings.cors_origin, "http://127.0.0.1:5173", "http://localhost:5199", "http://127.0.0.1:5199"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -45,7 +47,10 @@ def health() -> dict[str, str]:
 
 @app.get("/api/capabilities", response_model=CapabilitiesResponse)
 def capabilities() -> CapabilitiesResponse:
-    return CapabilitiesResponse(diarization_configured=bool(settings.diarization_auth_token))
+    return CapabilitiesResponse(
+        diarization_configured=bool(settings.diarization_auth_token),
+        instance_id=BACKEND_INSTANCE_ID,
+    )
 
 
 @app.post("/api/analyze-waveform", response_model=WaveformAnalysisResponse)

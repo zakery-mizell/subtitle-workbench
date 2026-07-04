@@ -419,6 +419,36 @@ label {
   color: var(--danger);
 }
 
+/* Caption gutter: timecode with speaker-event badges stacked below it. */
+.caption-gutter {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+button.caption-event-badge {
+  min-height: 0;
+  padding: 0.14rem 0.3rem;
+  font-size: 0.62rem;
+  line-height: 1;
+}
+
+.speaker-events-list {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.3rem;
+  max-height: 14rem;
+  overflow-y: auto;
+}
+
+.speaker-events-list .waveform-event-chip {
+  white-space: normal;
+  text-align: left;
+}
+
 .transport-note,
 .player-meta,
 .guide-header {
@@ -505,12 +535,19 @@ label {
 .panel-tabbar {
   width: 100%;
   display: grid;
+  /* Five tabs; explicit row flow keeps them on a 3+2 grid instead of
+     spilling into unsized implicit columns (which overlapped the labels). */
+  grid-auto-flow: row;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   margin-bottom: 0.82rem;
 }
 
 .panel-tabbar button {
   justify-content: center;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .editor-grid {
@@ -692,7 +729,35 @@ label {
 }
 
 .caption-card {
+  position: relative;
   border-left: 4px solid transparent;
+}
+
+/* Speaker pill as an inline reassignment control. */
+select.speaker-pill-select {
+  border: none;
+  cursor: pointer;
+  min-height: 0;
+}
+
+/* Non-boundary rows: the speaker control floats over the row's top-right and
+   only appears on hover, focus, or the active caption, so the compact
+   boundary-only layout is preserved. */
+.caption-topline-ghost {
+  position: absolute;
+  top: 0.1rem;
+  right: 0.45rem;
+  margin-bottom: 0;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.caption-card:hover .caption-topline-ghost,
+.caption-card:focus-within .caption-topline-ghost,
+.caption-card.is-active .caption-topline-ghost {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .caption-card.is-multiline {

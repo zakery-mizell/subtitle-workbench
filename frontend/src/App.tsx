@@ -1,5 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import {
+  AlertTriangle,
+  ArrowLeftRight,
   BookOpen,
   ClipboardCheck,
   Download,
@@ -193,6 +195,7 @@ function timeInIntervals(time: number, intervals: SoloInterval[]): boolean {
 const FOLLOW_SCROLL_SUSPEND_MS = 3000;
 const THEME_STORAGE_KEY = "subtitle-workbench:theme";
 const AUTOSAVE_STORAGE_KEY = "subtitle-workbench:autosave";
+const BACKEND_INSTANCE_STORAGE_KEY = "subtitle-workbench:backend-instance";
 const AUTOSAVE_STORAGE_VERSION = 5;
 const PROJECT_FILE_VERSION = 1;
 const TEXT_EDIT_CHECKPOINT_MS = 800;
@@ -360,6 +363,26 @@ interface TimedTextEditorProps {
   onUndo?: () => void;
   onRedo?: () => void;
   onKeyDown?: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
+}
+
+function requestCompletionNotificationPermission() {
+  if ("Notification" in window && Notification.permission === "default") {
+    void Notification.requestPermission();
+  }
+}
+
+// System-level notification for long jobs, shown only when the tab is hidden —
+// if the user is already looking at the app, the status line is enough.
+function notifyWorkFinished(title: string, body: string) {
+  if (!("Notification" in window) || Notification.permission !== "granted" || !document.hidden) {
+    return;
+  }
+  try {
+    new Notification(title, { body });
+  } catch {
+    // Notification constructors can throw on platforms that only allow
+    // service-worker notifications; the in-app status line still updates.
+  }
 }
 
 function buildDefaultSpeakers(): Speaker[] {
@@ -2424,7 +2447,7 @@ function App() {
   const [glossaryText, setGlossaryText] = useState("");
   const [findText, setFindText] = useState("");
   const [replaceText, setReplaceText] = useState("");
-  const [skipCuts, setSkipCuts] = useState(true);
+  const [skipCuts, setSkipCuts] = useState(false);
   const [clickToPlay, setClickToPlay] = useState(true);
   const [followPlayback, setFollowPlayback] = useState(true);
   const [showLineGuides, setShowLineGuides] = useState(false);
@@ -2508,6 +2531,16 @@ function App() {
         const payload = (await response.json()) as BackendCapabilities;
         if (!cancelled) {
           setBackendCapabilities(payload);
+          // A new backend process means a new working session: drop the
+          // autosaved workspace so the editor starts clean after a restart.
+          if (payload.instance_id) {
+            const stored = window.localStorage.getItem(BACKEND_INSTANCE_STORAGE_KEY);
+            if (stored && stored !== payload.instance_id) {
+              window.localStorage.removeItem(AUTOSAVE_STORAGE_KEY);
+              resetWorkspace();
+            }
+            window.localStorage.setItem(BACKEND_INSTANCE_STORAGE_KEY, payload.instance_id);
+          }
         }
       } catch {
         // Leave capability-driven hints hidden if the backend is unavailable.
@@ -2559,7 +2592,7 @@ function App() {
               typeof saved.glossaryText === "string" ? saved.glossaryText : "",
               typeof saved.hotwords === "string" ? saved.hotwords : "",
             ),
-            skipCuts: typeof saved.skipCuts === "boolean" ? saved.skipCuts : true,
+            skipCuts: typeof saved.skipCuts === "boolean" ? saved.skipCuts : false,
             clickToPlay: typeof saved.clickToPlay === "boolean" ? saved.clickToPlay : true,
             followPlayback: typeof saved.followPlayback === "boolean" ? saved.followPlayback : true,
             showLineGuides: typeof saved.showLineGuides === "boolean" ? saved.showLineGuides : false,
@@ -2890,7 +2923,14 @@ function App() {
   }, [soloSpeakerId, applyPlaybackVolume]);
 
   const transcriptWords = useMemo(() => new Map(activeWords.map((word) => [word.id, word])), [activeWords]);
-  const transcriptionVocabulary = useMemo(() => mergeVocabularyTexts(glossaryText).replace(/\n/g, ", "), [glossaryText]);
+  // Custom speaker names join the vocabulary sent to WhisperX so unusual or
+  // foreign names transcribe correctly; default "Speaker N" names are noise.
+  const transcriptionVocabulary = useMemo(() => {
+    const customSpeakerNames = speakerInputs
+      .map((speaker) => speaker.name.trim())
+      .filter((name) => name && !/^speaker \d+$/i.test(name));
+    return mergeVocabularyTexts(glossaryText, customSpeakerNames.join("\n")).replace(/\n/g, ", ");
+  }, [glossaryText, speakerInputs]);
   const glossaryTerms = useMemo(() => parseGlossaryTerms(glossaryText), [glossaryText]);
   const glossaryMatches = useMemo(
     () => (activeEditor ? findCaptionGlossaryMatches(activeEditor.captions, glossaryText) : []),
@@ -2975,6 +3015,33 @@ function App() {
     () => detectSpeakerTimelineEvents(activeEditor?.captions ?? [], activeWords, waveformAnalysis?.speech_spans ?? []),
     [activeEditor, activeWords, waveformAnalysis],
   );
+  // Tight handoffs and overlaps, keyed by the caption they fall inside, so the
+  // caption list can flag them in the gutter. Plain switches are normal
+  // conversation and would flag every alternation.
+  const reviewableSpeakerEvents = useMemo(
+    () => speakerTimelineEvents.filter((event) => event.kind !== "switch"),
+    [speakerTimelineEvents],
+  );
+  const captionEventsByIndex = useMemo(() => {
+    const map = new Map<number, SpeakerTimelineEvent[]>();
+    const captions = activeEditor?.captions ?? [];
+    for (const event of speakerTimelineEvents) {
+      if (event.kind === "switch") {
+        continue;
+      }
+      let index = event.captionIndex ?? -1;
+      if (index < 0 || index >= captions.length) {
+        index = captions.findIndex((caption) => event.time >= caption.start && event.time <= caption.end);
+      }
+      if (index < 0) {
+        continue;
+      }
+      const list = map.get(index) ?? [];
+      list.push(event);
+      map.set(index, list);
+    }
+    return map;
+  }, [activeEditor, speakerTimelineEvents]);
   const focusTokenRef = useRef(0);
   const lastFollowedBlockRef = useRef<string | null>(null);
   const acknowledgedWordIdSet = useMemo(
@@ -3262,7 +3329,7 @@ function App() {
     setModel(typeof persisted.model === "string" ? persisted.model : "large-v3");
     setSpeakerAssignmentMode(persisted.speakerAssignmentMode === "segment" ? "segment" : "word");
     setGlossaryText(restoredGlossaryText);
-    setSkipCuts(typeof persisted.skipCuts === "boolean" ? persisted.skipCuts : true);
+    setSkipCuts(typeof persisted.skipCuts === "boolean" ? persisted.skipCuts : false);
     setClickToPlay(typeof persisted.clickToPlay === "boolean" ? persisted.clickToPlay : true);
     setFollowPlayback(persisted.followPlayback !== false);
     setShowLineGuides(Boolean(persisted.showLineGuides));
@@ -3627,6 +3694,7 @@ function App() {
     setFindText("");
     setReplaceText("");
     setFollowPlayback(false);
+    setSkipCuts(false);
     setShowLineGuides(false);
     setShowTimingHighlights(true);
     setSidePanelTab("guide");
@@ -3770,6 +3838,7 @@ function App() {
 
     setLoading(true);
     setStatusMessage("Running WhisperX. Large models on long files will take time even on GPU.");
+    requestCompletionNotificationPermission();
     try {
       const payload = await requestTranscription(selectedFile);
       const normalizedPayload = {
@@ -3788,9 +3857,11 @@ function App() {
       setStatusMessage(
         `Transcribed with ${normalizedPayload.model}${normalizedPayload.gpu_enabled ? " on GPU" : " on CPU"} using ${normalizedPayload.speaker_assignment_mode}-level speaker assignment.`,
       );
+      notifyWorkFinished("Transcription finished", selectedFile.name);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
       setStatusMessage(message);
+      notifyWorkFinished("Transcription failed", message);
     } finally {
       setLoading(false);
     }
@@ -3815,6 +3886,7 @@ function App() {
         ? "Running WhisperX on the uploaded audio and retiming the imported captions."
         : "Running WhisperX on the uploaded audio while preserving the imported SRT timing.",
     );
+    requestCompletionNotificationPermission();
     try {
       const payload = await requestTranscription(resumeAudioFile);
       const importedSession = buildRealignedImportedSession(resumeAudioFile.name, captions, payload, options);
@@ -3856,6 +3928,7 @@ function App() {
         },
       );
       setStatusMessage(`Loaded ${captions.length} captions from ${resumeSubtitleFile.name} and rebuilt timing from the audio.`);
+      notifyWorkFinished("Transcription finished", resumeAudioFile.name);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
       setStatusMessage(message);
@@ -3880,8 +3953,10 @@ function App() {
 
   function updateSpeakerName(index: number, name: string) {
     const targetSpeakerId = activeEditor?.speakers[index]?.id ?? speakerInputs[index]?.id ?? index;
+    // No normalizeSpeakers here: it would snap a cleared field back to
+    // "Speaker N" on every keystroke. Blanks are resolved on blur instead.
     setSpeakerInputs((current) =>
-      normalizeSpeakers(current.map((speaker, itemIndex) => (itemIndex === index ? { ...speaker, name } : speaker))),
+      current.map((speaker, itemIndex) => (itemIndex === index ? { ...speaker, name } : speaker)),
     );
     setSession((current) => {
       if (!current) {
@@ -3889,7 +3964,7 @@ function App() {
       }
       return {
         ...current,
-        speakers: normalizeSpeakers(current.speakers.map((speaker) => (speaker.id === targetSpeakerId ? { ...speaker, name } : speaker))),
+        speakers: current.speakers.map((speaker) => (speaker.id === targetSpeakerId ? { ...speaker, name } : speaker)),
       };
     });
     commit((draft) => {
@@ -4140,6 +4215,41 @@ function App() {
             : word,
         ),
     });
+  }
+
+  function reassignCaptionSpeaker(index: number, speakerId: number) {
+    if (!activeEditor) {
+      return;
+    }
+    const selected = activeEditor.captions[index];
+    const nextSpeaker = activeEditor.speakers.find((speaker) => speaker.id === speakerId);
+    if (!selected || !nextSpeaker || selected.speaker_id === nextSpeaker.id) {
+      return;
+    }
+    const wordIds = new Set(selected.word_ids);
+    commit((draft) => {
+      draft.captions[index].speaker_id = nextSpeaker.id;
+      draft.captions[index].speaker_name = nextSpeaker.name;
+    }, {
+      transformWords: (words) =>
+        words.map((word) =>
+          wordIds.has(word.id)
+            ? { ...word, speaker_id: nextSpeaker.id, speaker_name: nextSpeaker.name }
+            : word,
+        ),
+    });
+  }
+
+  function focusSpeakerEvent(event: SpeakerTimelineEvent) {
+    seekAudio(Math.max(0, event.start - 1), { play: false });
+    const captions = activeEditor?.captions ?? [];
+    let index = event.captionIndex ?? -1;
+    if (index < 0 || index >= captions.length) {
+      index = captions.findIndex((caption) => event.time >= caption.start && event.time <= caption.end);
+    }
+    if (index >= 0 && viewMode === "subtitles") {
+      captionRefs.current[index]?.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
   }
 
   function addGuideBlock(start: number, end: number, label: GuideLabel, reason: string) {
@@ -4505,7 +4615,16 @@ function App() {
             {speakerInputs.map((speaker, index) => (
               <label key={speaker.id}>
                 Speaker {index + 1}
-                <input value={speaker.name} onChange={(event) => updateSpeakerName(index, event.target.value)} />
+                <input
+                  value={speaker.name}
+                  onChange={(event) => updateSpeakerName(index, event.target.value)}
+                  onBlur={(event) => {
+                    const trimmed = event.target.value.trim();
+                    if (trimmed !== event.target.value || !trimmed) {
+                      updateSpeakerName(index, trimmed || `Speaker ${index + 1}`);
+                    }
+                  }}
+                />
               </label>
             ))}
           </div>
@@ -4733,16 +4852,20 @@ function App() {
             {waveformAnalysis ? (
               <span className="metric-chip">{waveformAnalysis.speech_spans.length} speech regions</span>
             ) : null}
-            {speakerTimelineEvents.slice(0, 8).map((event) => (
+            {reviewableSpeakerEvents.length ? (
               <button
-                key={event.id}
-                className={`waveform-event-chip event-${event.kind}`}
                 type="button"
-                onClick={() => seekAudio(event.time, { play: false })}
+                className="waveform-event-chip event-tight_handoff"
+                title="Open the speaker events list in the Guide panel"
+                onClick={() => {
+                  setSidePanelTab("guide");
+                  setIsGuidePanelCollapsed(false);
+                }}
               >
-                {formatClock(event.time)} {event.kind === "overlap" ? "Overlap" : event.kind === "tight_handoff" ? "Tight handoff" : "Switch"} | {event.label}
+                <AlertTriangle size={12} aria-hidden />
+                &nbsp;{reviewableSpeakerEvents.length} speaker {reviewableSpeakerEvents.length === 1 ? "event" : "events"} to review
               </button>
-            ))}
+            ) : null}
           </div>
           {activeWarnings.length ? (
             <details className="warning-details">
@@ -4864,20 +4987,46 @@ function App() {
                             className={`caption-card ${caption.lines.length > 1 ? "is-multiline" : ""} ${index === activeCaptionIndex ? "is-active" : ""} ${caption.blank_after ? "has-gap" : ""}`}
                             key={caption.id}
                           >
-                            {showSpeakerBoundary ? (
-                              <div className="caption-topline compact-topline">
-                                <span className="speaker-pill">{caption.speaker_name ?? "Speaker"}</span>
+                            {multiSpeaker ? (
+                              <div className={`caption-topline compact-topline ${showSpeakerBoundary ? "" : "caption-topline-ghost"}`}>
+                                <select
+                                  className="speaker-pill speaker-pill-select"
+                                  value={caption.speaker_id === null ? "" : String(caption.speaker_id)}
+                                  title="Change this caption's speaker"
+                                  aria-label="Change this caption's speaker"
+                                  onChange={(event) => reassignCaptionSpeaker(index, Number(event.target.value))}
+                                >
+                                  {caption.speaker_id === null ? (
+                                    <option value="" disabled>{caption.speaker_name ?? "Speaker"}</option>
+                                  ) : null}
+                                  {activeEditor.speakers.map((speaker) => (
+                                    <option key={speaker.id} value={speaker.id}>{speaker.name}</option>
+                                  ))}
+                                </select>
                               </div>
                             ) : null}
                             <div className="caption-row">
-                            <button
-                              type="button"
-                              className="caption-time"
-                              title="Seek to this caption"
-                              onClick={() => seekAudio(caption.start, { play: clickToPlay })}
-                            >
-                              {formatGutterClock(caption.start)}
-                            </button>
+                            <div className="caption-gutter">
+                              <button
+                                type="button"
+                                className="caption-time"
+                                title="Seek to this caption"
+                                onClick={() => seekAudio(caption.start, { play: clickToPlay })}
+                              >
+                                {formatGutterClock(caption.start)}
+                              </button>
+                              {(captionEventsByIndex.get(index) ?? []).slice(0, 2).map((event) => (
+                                <button
+                                  key={event.id}
+                                  type="button"
+                                  className={`waveform-event-chip caption-event-badge event-${event.kind}`}
+                                  title={`${formatClock(event.time)} ${event.kind === "overlap" ? "Possible overlap" : "Tight handoff"} | ${event.label} — click to listen; fix with the speaker pill`}
+                                  onClick={() => seekAudio(Math.max(0, event.start - 1), { play: true })}
+                                >
+                                  {event.kind === "overlap" ? <AlertTriangle size={11} aria-hidden /> : <ArrowLeftRight size={11} aria-hidden />}
+                                </button>
+                              ))}
+                            </div>
                             <TimedTextEditor
                               className="subtitle-editor"
                               minHeight={1}
@@ -5109,6 +5258,31 @@ function App() {
                         <button disabled={!selection} onClick={() => setSelection(null)}>Clear selection</button>
                       </div>
                     </section>
+
+                    {reviewableSpeakerEvents.length ? (
+                      <section className="selection-panel">
+                        <div className="panel-section-heading">
+                          <p className="eyebrow">Speaker events</p>
+                          <h3>{reviewableSpeakerEvents.length} to review</h3>
+                        </div>
+                        <div className="speaker-events-list">
+                          {reviewableSpeakerEvents.map((event) => (
+                            <button
+                              key={event.id}
+                              type="button"
+                              className={`waveform-event-chip event-${event.kind}`}
+                              onClick={() => focusSpeakerEvent(event)}
+                            >
+                              {formatClock(event.time)} {event.kind === "overlap" ? "Overlap" : "Tight handoff"} | {event.label}
+                            </button>
+                          ))}
+                        </div>
+                        <p className="helper-text">
+                          Tight handoffs and overlaps are where diarization mislabels speakers most often. Click one to
+                          jump there, listen, and fix mistakes with the speaker pill on the caption.
+                        </p>
+                      </section>
+                    ) : null}
 
                     <section className="selection-panel">
                       <div className="panel-section-heading">

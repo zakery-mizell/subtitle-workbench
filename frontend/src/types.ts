@@ -69,6 +69,7 @@ export interface SpeechSpan {
 
 export interface BackendCapabilities {
   diarization_configured: boolean;
+  instance_id?: string;
 }
 
 export interface WaveformAnalysisResponse {

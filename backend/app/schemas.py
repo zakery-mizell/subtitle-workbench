@@ -75,6 +75,9 @@ class SpeechSpan(BaseModel):
 
 class CapabilitiesResponse(BaseModel):
     diarization_configured: bool
+    # Changes every time the backend process starts; the frontend uses it to
+    # discard stale autosaved sessions after a server restart.
+    instance_id: str
 
 
 class WaveformAnalysisResponse(BaseModel):

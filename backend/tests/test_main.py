@@ -76,11 +76,24 @@ class MainApiTests(unittest.TestCase):
             speaker_diarization = FakeAnnotation([(0.0, 2.0, "SPEAKER_00"), (1.0, 2.0, "SPEAKER_01")])
 
         turns = _extract_turns(FakeOutput())
-        self.assertEqual(turns, [SpeakerTurn(start=0.0, end=1.5, label="SPEAKER_00")])
+        self.assertEqual(turns, [SpeakerTurn(start=0.0, end=1.5, label="0")])
 
         # Legacy pipelines return a bare annotation instead of a DiarizeOutput.
         legacy = _extract_turns(FakeAnnotation([(0.5, 1.0, "SPEAKER_01")]))
-        self.assertEqual(legacy, [SpeakerTurn(start=0.5, end=1.0, label="SPEAKER_01")])
+        self.assertEqual(legacy, [SpeakerTurn(start=0.5, end=1.0, label="0")])
+
+        # Cluster labels are arbitrary: whoever speaks first becomes speaker 0.
+        reordered = _extract_turns(
+            FakeAnnotation([(0.0, 1.0, "SPEAKER_01"), (1.0, 2.0, "SPEAKER_00"), (2.0, 3.0, "SPEAKER_01")])
+        )
+        self.assertEqual(
+            reordered,
+            [
+                SpeakerTurn(start=0.0, end=1.0, label="0"),
+                SpeakerTurn(start=1.0, end=2.0, label="1"),
+                SpeakerTurn(start=2.0, end=3.0, label="0"),
+            ],
+        )
 
     def test_resolve_requested_language_allows_auto_detection(self) -> None:
         self.assertIsNone(resolve_requested_language(None, None))

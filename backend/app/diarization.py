@@ -78,7 +78,26 @@ def _extract_turns(output: Any) -> list[SpeakerTurn]:
                 label=str(label),
             )
         )
-    return turns
+    return _order_speakers_by_appearance(turns)
+
+
+def _order_speakers_by_appearance(turns: list[SpeakerTurn]) -> list[SpeakerTurn]:
+    """Relabel diarization clusters so speaker 0 is the first voice heard.
+
+    pyannote's cluster labels (SPEAKER_00, SPEAKER_01, ...) are arbitrary and
+    do not follow speaking order, which made "Speaker 1" land on the wrong
+    person. Requested speaker names are matched by index, so index = order of
+    first appearance is the intuitive mapping.
+    """
+    ordered = sorted(turns, key=lambda turn: (turn.start, turn.end))
+    appearance_rank: dict[str, int] = {}
+    for turn in ordered:
+        if turn.label not in appearance_rank:
+            appearance_rank[turn.label] = len(appearance_rank)
+    return [
+        SpeakerTurn(start=turn.start, end=turn.end, label=str(appearance_rank[turn.label]))
+        for turn in ordered
+    ]
 
 
 def run_diarization(
