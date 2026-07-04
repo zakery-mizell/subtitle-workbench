@@ -1349,6 +1349,11 @@ select.transport-speed {
   font-size: 0.8rem;
 }
 
+select.transport-solo {
+  max-width: 11rem;
+  text-overflow: ellipsis;
+}
+
 /* Side panel icon tabs */
 .panel-tab-label {
   display: inline-flex;

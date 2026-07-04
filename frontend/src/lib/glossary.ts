@@ -24,20 +24,40 @@ export interface CaptionGlossaryMatch {
 }
 
 const TOKEN_RE = /[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g;
+const SENTENCE_END_RE = /[.!?]["'’)\]]?$/;
 const COMMON_WORDS = new Set([
-  "a", "about", "after", "again", "against", "all", "almost", "also", "am", "an", "and", "any", "are",
-  "around", "as", "at", "back", "be", "because", "been", "before", "being", "between", "both", "but", "by",
-  "can", "come", "could", "day", "did", "do", "does", "doing", "done", "down", "during", "each", "even",
-  "every", "few", "find", "first", "for", "from", "get", "give", "go", "going", "good", "got", "had", "has",
-  "have", "he", "her", "here", "him", "his", "how", "i", "if", "in", "into", "is", "it", "its", "itself",
-  "just", "kind", "know", "like", "little", "long", "look", "lot", "made", "make", "many", "may", "me",
-  "mean", "might", "more", "most", "much", "my", "need", "never", "new", "no", "not", "now", "of", "off",
-  "often", "okay", "on", "once", "one", "only", "or", "other", "our", "out", "over", "people", "really",
-  "right", "said", "same", "say", "see", "seem", "she", "should", "so", "some", "something", "still", "such",
-  "take", "than", "that", "the", "their", "them", "then", "there", "these", "they", "thing", "think", "this",
-  "those", "through", "time", "to", "too", "two", "up", "us", "use", "very", "want", "was", "way", "we",
-  "well", "were", "what", "when", "where", "which", "while", "who", "why", "will", "with", "would", "yeah",
-  "yes", "you", "your",
+  "a", "about", "above", "actually", "after", "again", "against", "all", "almost", "already", "also",
+  "although", "always", "am", "an", "and", "another", "any", "anyone", "anything", "are", "around", "as",
+  "ask", "asked", "at", "away", "back", "bad", "be", "because", "become", "been", "before", "began", "begin",
+  "behind", "being", "below", "best", "better", "between", "big", "both", "bring", "but", "by", "call",
+  "called", "came", "can", "cannot", "case", "certain", "change", "come", "comes", "coming", "could",
+  "couple", "course", "day", "days", "did", "different", "do", "does", "doing", "done", "down", "during",
+  "each", "early", "either", "else", "end", "enough", "even", "ever", "every", "everyone", "everything",
+  "exactly", "example", "far", "fact", "feel", "felt", "few", "find", "fine", "first", "for", "found", "from",
+  "full", "get", "gets", "getting", "give", "given", "go", "goes", "going", "gone", "good", "got", "gotten",
+  "great", "guess", "had", "half", "happen", "happened", "hard", "has", "have", "having", "he", "hear",
+  "heard", "help", "her", "here", "hey", "high", "him", "himself", "his", "hold", "home", "how", "however",
+  "huge", "idea", "if", "important", "in", "into", "is", "it", "its", "itself", "just", "keep", "kind",
+  "knew", "know", "known", "large", "last", "late", "later", "least", "leave", "left", "less", "let", "life",
+  "like", "little", "live", "long", "look", "looked", "looking", "looks", "lot", "made", "make", "makes",
+  "making", "man", "many", "matter", "may", "maybe", "me", "mean", "means", "meant", "might", "mind", "more",
+  "morning", "most", "move", "much", "must", "my", "myself", "name", "need", "needs", "never", "new", "next",
+  "nice", "night", "no", "nobody", "none", "nor", "not", "nothing", "now", "number", "of", "off", "often",
+  "oh", "okay", "old", "on", "once", "one", "only", "onto", "open", "or", "order", "other", "others", "our",
+  "out", "over", "own", "part", "people", "perhaps", "person", "place", "point", "possible", "pretty",
+  "probably", "problem", "put", "question", "quite", "rather", "reach", "read", "real", "really", "reason",
+  "remember", "right", "run", "said", "same", "saw", "say", "saying", "says", "second", "see", "seem",
+  "seemed", "seems", "seen", "sense", "set", "several", "she", "should", "show", "side", "similar", "since",
+  "small", "so", "some", "someone", "something", "sometimes", "somewhere", "sort", "sound", "sounds", "start",
+  "started", "still", "stuff", "such", "sure", "take", "taken", "takes", "talk", "talked", "talking", "tell",
+  "than", "that", "the", "their", "them", "themselves", "then", "there", "these", "they", "thing", "things",
+  "think", "thinking", "third", "this", "those", "though", "thought", "three", "through", "time", "times",
+  "to", "today", "together", "told", "too", "took", "toward", "true", "try", "trying", "turn", "two",
+  "under", "understand", "until", "up", "upon", "us", "use", "used", "using", "usually", "very", "wait",
+  "want", "wanted", "wants", "was", "way", "ways", "we", "week", "well", "went", "were", "what", "whatever",
+  "when", "where", "whether", "which", "while", "who", "whole", "whom", "why", "will", "wish", "with",
+  "within", "without", "won", "word", "words", "work", "working", "world", "would", "wrong", "yeah", "year",
+  "years", "yes", "yet", "you", "your", "yours", "yourself",
 ]);
 
 function tokenize(text: string): string[] {
@@ -135,6 +155,10 @@ function similarToken(left: string, right: string): boolean {
   return editDistance(left, right) <= maxDistance;
 }
 
+function stripEdgePunctuation(text: string): string {
+  return text.replace(/^[^A-Za-z0-9]+/, "").replace(/[^A-Za-z0-9]+$/, "");
+}
+
 function pickDisplay(forms: Map<string, number>): string {
   const ranked = [...forms.entries()].sort((left, right) => {
     if (right[1] !== left[1]) {
@@ -145,7 +169,7 @@ function pickDisplay(forms: Map<string, number>): string {
     }
     return right[0].length - left[0].length;
   });
-  return ranked[0]?.[0] ?? "";
+  return stripEdgePunctuation(ranked[0]?.[0] ?? "");
 }
 
 export function parseGlossaryTerms(text: string): ParsedGlossaryTerm[] {
@@ -165,6 +189,8 @@ export function mergeVocabularyTexts(...texts: string[]): string {
 export function appendGlossaryTerms(currentText: string, terms: string[]): string {
   return mergeUniqueEntries([...splitEntries(currentText), ...terms]).join("\n");
 }
+
+const MAX_JARGON_CANDIDATES = 25;
 
 export function detectJargonCandidates(
   words: WordToken[],
@@ -187,17 +213,26 @@ export function detectJargonCandidates(
       count: number;
       lowConfidenceCount: number;
       confidenceTotal: number;
-      titlecaseCount: number;
+      midSentenceCount: number;
+      midSentenceTitlecaseCount: number;
       uppercaseCount: number;
+      mixedCaseCount: number;
       hyphenated: boolean;
+      hasDigit: boolean;
       forms: Map<string, number>;
       captionIndexes: Set<number>;
     }
   >();
 
+  // Words arrive in reading order, so we can tell whether a capital letter is
+  // just the start of a sentence or a genuine proper noun mid-sentence.
+  let atSentenceStart = true;
   for (const word of words) {
+    const isSentenceStart = atSentenceStart;
+    atSentenceStart = SENTENCE_END_RE.test(word.text.trim());
+
     const normalized = normalizeGlossaryToken(word.text);
-    if (!normalized || normalized.length < 4) {
+    if (!normalized || normalized.length < 2) {
       continue;
     }
 
@@ -207,9 +242,12 @@ export function detectJargonCandidates(
         count: 0,
         lowConfidenceCount: 0,
         confidenceTotal: 0,
-        titlecaseCount: 0,
+        midSentenceCount: 0,
+        midSentenceTitlecaseCount: 0,
         uppercaseCount: 0,
+        mixedCaseCount: 0,
         hyphenated: false,
+        hasDigit: false,
         forms: new Map<string, number>(),
         captionIndexes: new Set<number>(),
       };
@@ -217,9 +255,15 @@ export function detectJargonCandidates(
     current.count += 1;
     current.confidenceTotal += word.confidence;
     current.lowConfidenceCount += word.low_confidence ? 1 : 0;
-    current.titlecaseCount += /^[A-Z][a-z]/.test(word.text) ? 1 : 0;
-    current.uppercaseCount += /^[A-Z0-9-]{2,}$/.test(word.text) ? 1 : 0;
-    current.hyphenated ||= /-/.test(word.text);
+    if (!isSentenceStart) {
+      current.midSentenceCount += 1;
+      current.midSentenceTitlecaseCount += /^[A-Z][a-z]/.test(word.text) ? 1 : 0;
+    }
+    current.uppercaseCount += /^[A-Z0-9][A-Z0-9-]*[A-Z][A-Z0-9-]*$/.test(word.text) ? 1 : 0;
+    // Internal capital (WhisperX, PyTorch, iPhone) that is not a plain acronym.
+    current.mixedCaseCount += /[a-z][A-Z]/.test(word.text) ? 1 : 0;
+    current.hyphenated ||= /[a-z]-[a-z]/i.test(word.text);
+    current.hasDigit ||= /\d/.test(word.text) && /[a-z]/i.test(word.text);
     current.forms.set(word.text, (current.forms.get(word.text) ?? 0) + 1);
     for (const captionIndex of captionIndexesByWordId.get(word.id) ?? []) {
       current.captionIndexes.add(captionIndex);
@@ -234,43 +278,55 @@ export function detectJargonCandidates(
     }
 
     const uncommon = !COMMON_WORDS.has(normalized);
-    const score =
-      (current.hyphenated ? 5 : 0) +
-      (current.uppercaseCount > 0 ? 4 : 0) +
-      (current.titlecaseCount > 0 ? 3 : 0) +
-      (current.lowConfidenceCount > 0 ? 3 : 0) +
-      (current.count >= 3 ? 3 : current.count >= 2 ? 2 : 0) +
-      (normalized.length >= 10 ? 2 : normalized.length >= 7 ? 1 : 0) +
-      (uncommon ? 1 : 0);
+    // A name reads as capitalized in most of its mid-sentence appearances;
+    // a word that is only ever capitalized at sentence starts does not qualify.
+    const consistentlyCapitalized =
+      current.midSentenceTitlecaseCount > 0 &&
+      current.midSentenceTitlecaseCount >= Math.ceil(current.midSentenceCount * 0.6);
+    const isAcronym = current.uppercaseCount > 0;
+    const isMixedCase = current.mixedCaseCount > 0;
 
+    // Every candidate must carry a concrete "this is special vocabulary"
+    // signal — being merely uncommon or repeated is not enough.
     const shouldKeep =
-      score >= 5 ||
       current.hyphenated ||
-      current.uppercaseCount > 0 ||
-      (current.lowConfidenceCount > 0 && uncommon) ||
-      (current.count >= 2 && uncommon && normalized.length >= 6);
+      current.hasDigit ||
+      isAcronym ||
+      isMixedCase ||
+      consistentlyCapitalized ||
+      (current.lowConfidenceCount > 0 && uncommon && normalized.length >= 6);
 
     if (!shouldKeep) {
       continue;
     }
 
+    const score =
+      (current.hyphenated ? 4 : 0) +
+      (current.hasDigit ? 4 : 0) +
+      (isAcronym ? 4 : 0) +
+      (isMixedCase ? 4 : 0) +
+      (consistentlyCapitalized ? 3 : 0) +
+      (current.lowConfidenceCount > 0 ? 2 : 0) +
+      (current.count >= 3 ? 2 : current.count >= 2 ? 1 : 0) +
+      (normalized.length >= 10 ? 2 : normalized.length >= 7 ? 1 : 0) +
+      (uncommon ? 1 : 0);
+
     const reasons: string[] = [];
+    if (isAcronym) {
+      reasons.push("acronym");
+    } else if (isMixedCase) {
+      reasons.push("mixed case");
+    } else if (consistentlyCapitalized) {
+      reasons.push("name / proper noun");
+    }
     if (current.hyphenated) {
       reasons.push("hyphenated");
     }
-    if (current.uppercaseCount > 0) {
-      reasons.push("acronym / uppercase");
-    } else if (current.titlecaseCount > 0) {
-      reasons.push("proper noun");
+    if (current.hasDigit) {
+      reasons.push("has a number");
     }
     if (current.lowConfidenceCount > 0) {
       reasons.push("low confidence");
-    }
-    if (current.count >= 2) {
-      reasons.push("repeated");
-    }
-    if (uncommon) {
-      reasons.push("uncommon");
     }
 
     candidates.push({
@@ -285,7 +341,7 @@ export function detectJargonCandidates(
     });
   }
 
-  return candidates.sort((left, right) => {
+  candidates.sort((left, right) => {
     if (right.score !== left.score) {
       return right.score - left.score;
     }
@@ -297,6 +353,8 @@ export function detectJargonCandidates(
     }
     return left.display.localeCompare(right.display);
   });
+
+  return candidates.slice(0, MAX_JARGON_CANDIDATES);
 }
 
 function termMatch(tokens: string[], term: ParsedGlossaryTerm): { exact: boolean; fuzzy: boolean } {

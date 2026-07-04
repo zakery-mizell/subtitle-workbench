@@ -245,7 +245,7 @@ async def transcribe(
     model: str = Form("large-v3"),
     speaker_count: int = Form(1, ge=1, le=12),
     speakers_json: str = Form("[{\"id\":0,\"name\":\"Speaker 1\"}]"),
-    speaker_assignment_mode: SpeakerAssignmentMode = Form("segment"),
+    speaker_assignment_mode: SpeakerAssignmentMode = Form("word"),
     language: str | None = Form(None),
     hotwords: str | None = Form(None),
     remove_disfluencies_enabled: bool = Form(False, alias="remove_disfluencies"),

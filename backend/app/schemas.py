@@ -97,7 +97,7 @@ class TranscriptResponse(BaseModel):
     guide_blocks: list[GuideBlock]
     warnings: list[WarningItem] = Field(default_factory=list)
     model: str
-    speaker_assignment_mode: SpeakerAssignmentMode = "segment"
+    speaker_assignment_mode: SpeakerAssignmentMode = "word"
     language: str | None = None
     gpu_enabled: bool
 

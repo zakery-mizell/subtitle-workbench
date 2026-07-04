@@ -51,18 +51,28 @@ Local web app for:
 
 ## Important setup note about multiple speakers
 
-Whisper does not do speaker diarization by itself. The backend uses `pyannote.audio` for diarization when:
+Whisper does not do speaker diarization by itself. The backend uses `pyannote.audio` 4.x with the
+`pyannote/speaker-diarization-community-1` model when:
 
 - `speaker_count > 1`
 - `DIARIZATION_AUTH_TOKEN` is set in `.env`
 
 Without that token, the app still runs, but it falls back to a single-speaker assignment and returns a warning in the UI. That is why speaker names/count alone are not enough to make speakers work.
 
-For `pyannote/speaker-diarization-3.1`, the account also needs gated access to:
+The token's Hugging Face account needs gated access to:
 
-- `https://hf.co/pyannote/segmentation-3.0`
+- `https://hf.co/pyannote/speaker-diarization-community-1`
 
 The first multi-speaker run also needs internet access to download the gated pyannote models. After those assets are cached locally, later runs can work offline.
+
+Diarization uses community-1's exclusive mode (a single most-likely speaker at any moment), which
+keeps word-level speaker assignment stable through overlaps and backchannels. Multi-speaker runs
+default to the "Word (tighter switches)" speaker timing mode so captions split exactly where the
+speaker changes; "Segment (stable)" is still available in the setup drawer.
+
+When a transcript has multiple speakers, the transport bar gains a speaker selector ("All speakers"
+/ "Only <name>") that mutes playback outside the chosen speaker's words, so you can audit one voice
+at a time. It affects playback only, never exports.
 For very long files, the backend skips diarization by default and returns a single-speaker transcript with a warning. This avoids a second long GPU-heavy pass after Whisper finishes.
 
 ## Audio mastering ("Master" tab)

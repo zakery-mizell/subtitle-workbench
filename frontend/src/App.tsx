@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import {
   BookOpen,
   ClipboardCheck,
@@ -145,6 +145,51 @@ const SPEAKER_ASSIGNMENT_OPTIONS: Array<{ value: SpeakerAssignmentMode; label: s
   { value: "segment", label: "Segment (stable)" },
   { value: "word", label: "Word (tighter switches)" },
 ];
+
+// Solo-speaker playback: audio outside the soloed speaker's word spans is
+// muted. Spans get edge padding so word onsets are not clipped, and nearby
+// spans merge so playback does not stutter between words.
+const SOLO_SPAN_PADDING_S = 0.15;
+const SOLO_SPAN_MERGE_GAP_S = 0.6;
+
+interface SoloInterval {
+  start: number;
+  end: number;
+}
+
+function buildSpeakerIntervals(words: WordToken[], speakerId: number): SoloInterval[] {
+  const spans = words
+    .filter((word) => word.speaker_id === speakerId)
+    .map((word) => ({ start: Math.max(0, word.start - SOLO_SPAN_PADDING_S), end: word.end + SOLO_SPAN_PADDING_S }))
+    .sort((a, b) => a.start - b.start);
+
+  const merged: SoloInterval[] = [];
+  for (const span of spans) {
+    const previous = merged[merged.length - 1];
+    if (previous && span.start - previous.end <= SOLO_SPAN_MERGE_GAP_S) {
+      previous.end = Math.max(previous.end, span.end);
+    } else {
+      merged.push({ ...span });
+    }
+  }
+  return merged;
+}
+
+function timeInIntervals(time: number, intervals: SoloInterval[]): boolean {
+  let low = 0;
+  let high = intervals.length - 1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (time < intervals[mid].start) {
+      high = mid - 1;
+    } else if (time > intervals[mid].end) {
+      low = mid + 1;
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
 const FOLLOW_SCROLL_SUSPEND_MS = 3000;
 const THEME_STORAGE_KEY = "subtitle-workbench:theme";
 const AUTOSAVE_STORAGE_KEY = "subtitle-workbench:autosave";
@@ -154,7 +199,7 @@ const TEXT_EDIT_CHECKPOINT_MS = 800;
 const AUTOSAVE_DELAY_MS = 700;
 const SIDE_PANEL_TABS = [
   { id: "guide", label: "Guide" },
-  { id: "jargon", label: "Jargon" },
+  { id: "jargon", label: "Vocab" },
   { id: "qa", label: "QA" },
   { id: "master", label: "Master" },
   { id: "export", label: "Export" },
@@ -2375,7 +2420,7 @@ function App() {
   const [speakerCount, setSpeakerCount] = useState(1);
   const [speakerInputs, setSpeakerInputs] = useState<Speaker[]>(() => buildDefaultSpeakers());
   const [model, setModel] = useState("large-v3");
-  const [speakerAssignmentMode, setSpeakerAssignmentMode] = useState<SpeakerAssignmentMode>("segment");
+  const [speakerAssignmentMode, setSpeakerAssignmentMode] = useState<SpeakerAssignmentMode>("word");
   const [glossaryText, setGlossaryText] = useState("");
   const [findText, setFindText] = useState("");
   const [replaceText, setReplaceText] = useState("");
@@ -2426,6 +2471,7 @@ function App() {
   const [audioDuration, setAudioDuration] = useState(0);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [userMuted, setUserMuted] = useState(false);
+  const [soloSpeakerId, setSoloSpeakerId] = useState<number | null>(null);
   const [themeDark, setThemeDark] = useState(() => window.localStorage.getItem(THEME_STORAGE_KEY) === "dark");
   const [resumeProjectFile, setResumeProjectFile] = useState<File | null>(null);
   const [resumeAudioFile, setResumeAudioFile] = useState<File | null>(null);
@@ -2508,7 +2554,7 @@ function App() {
             model: typeof saved.model === "string" ? saved.model : model,
             speakerCount: Math.max(1, saved.speakerCount ?? restoredSpeakers.length),
             speakerInputs: normalizeSpeakers(restoredSpeakers),
-            speakerAssignmentMode: saved.speakerAssignmentMode === "word" ? "word" : "segment",
+            speakerAssignmentMode: saved.speakerAssignmentMode === "segment" ? "segment" : "word",
             glossaryText: mergeVocabularyTexts(
               typeof saved.glossaryText === "string" ? saved.glossaryText : "",
               typeof saved.hotwords === "string" ? saved.hotwords : "",
@@ -2684,10 +2730,9 @@ function App() {
     for (const element of [originalAudioRef.current, masteredAudioRef.current]) {
       if (element) {
         element.playbackRate = playbackRate;
-        element.volume = userMuted ? 0 : 1;
       }
     }
-  }, [playbackRate, userMuted, audioUrl, processedAudio]);
+  }, [playbackRate, audioUrl, processedAudio]);
 
   function skipBy(seconds: number) {
     const audio = audioRef.current;
@@ -2779,6 +2824,71 @@ function App() {
   }, [processedAudio, audioUrl]);
 
   const activeWords = activeWorkspace?.words ?? session?.words ?? [];
+
+  // Solo-speaker playback: which speakers can be soloed, and when the soloed one is audible.
+  const soloableSpeakers = useMemo(() => {
+    if (!session || session.speakers.length < 2) {
+      return [];
+    }
+    const spokenIds = new Set(activeWords.map((word) => word.speaker_id));
+    return session.speakers.filter((speaker) => spokenIds.has(speaker.id));
+  }, [session, activeWords]);
+  const soloIntervals = useMemo(
+    () => (soloSpeakerId === null ? [] : buildSpeakerIntervals(activeWords, soloSpeakerId)),
+    [activeWords, soloSpeakerId],
+  );
+
+  useEffect(() => {
+    if (soloSpeakerId !== null && !soloableSpeakers.some((speaker) => speaker.id === soloSpeakerId)) {
+      setSoloSpeakerId(null);
+    }
+  }, [soloSpeakerId, soloableSpeakers]);
+
+  const applyPlaybackVolume = useCallback(() => {
+    const gateActive = soloSpeakerId !== null && soloIntervals.length > 0;
+    const time = audioRef.current?.currentTime ?? 0;
+    const audible = !userMuted && (!gateActive || timeInIntervals(time, soloIntervals));
+    for (const element of [originalAudioRef.current, masteredAudioRef.current]) {
+      if (element) {
+        element.volume = audible ? 1 : 0;
+      }
+    }
+  }, [userMuted, soloSpeakerId, soloIntervals]);
+
+  useEffect(() => {
+    applyPlaybackVolume();
+    const elements = [originalAudioRef.current, masteredAudioRef.current].filter(
+      (element): element is HTMLAudioElement => element !== null,
+    );
+    const reapply = () => applyPlaybackVolume();
+    for (const element of elements) {
+      element.addEventListener("timeupdate", reapply);
+      element.addEventListener("seeked", reapply);
+    }
+    return () => {
+      for (const element of elements) {
+        element.removeEventListener("timeupdate", reapply);
+        element.removeEventListener("seeked", reapply);
+      }
+    };
+  }, [applyPlaybackVolume, audioUrl, processedAudio, playbackSource]);
+
+  // While a speaker is soloed, also re-evaluate audibility every frame so the
+  // mute gate tracks playback more tightly than timeupdate's ~4 Hz. This loop
+  // pauses in hidden tabs, where the timeupdate listener above keeps gating.
+  useEffect(() => {
+    if (soloSpeakerId === null) {
+      return;
+    }
+    let frame = 0;
+    const tick = () => {
+      applyPlaybackVolume();
+      frame = window.requestAnimationFrame(tick);
+    };
+    frame = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(frame);
+  }, [soloSpeakerId, applyPlaybackVolume]);
+
   const transcriptWords = useMemo(() => new Map(activeWords.map((word) => [word.id, word])), [activeWords]);
   const transcriptionVocabulary = useMemo(() => mergeVocabularyTexts(glossaryText).replace(/\n/g, ", "), [glossaryText]);
   const glossaryTerms = useMemo(() => parseGlossaryTerms(glossaryText), [glossaryText]);
@@ -2807,9 +2917,9 @@ function App() {
         }
       : sidePanelTab === "jargon"
         ? {
-            eyebrow: "Jargon",
-            title: "Glossary",
-            detail: `${jargonCandidates.length} candidates`,
+            eyebrow: "Vocabulary",
+            title: "Words that transcribe wrong",
+            detail: `${glossaryTerms.length} term${glossaryTerms.length === 1 ? "" : "s"}, ${jargonCandidates.length} suggested`,
           }
         : sidePanelTab === "master"
           ? {
@@ -3150,7 +3260,7 @@ function App() {
     setSpeakerInputs(restoredSpeakerInputs);
     setSpeakerCount(Math.max(1, persisted.speakerCount ?? restoredSpeakerInputs.length));
     setModel(typeof persisted.model === "string" ? persisted.model : "large-v3");
-    setSpeakerAssignmentMode(persisted.speakerAssignmentMode === "word" ? "word" : "segment");
+    setSpeakerAssignmentMode(persisted.speakerAssignmentMode === "segment" ? "segment" : "word");
     setGlossaryText(restoredGlossaryText);
     setSkipCuts(typeof persisted.skipCuts === "boolean" ? persisted.skipCuts : true);
     setClickToPlay(typeof persisted.clickToPlay === "boolean" ? persisted.clickToPlay : true);
@@ -3511,7 +3621,8 @@ function App() {
     setResumeSubtitleFile(null);
     setSpeakerCount(1);
     setSpeakerInputs(buildDefaultSpeakers());
-    setSpeakerAssignmentMode("segment");
+    setSpeakerAssignmentMode("word");
+    setSoloSpeakerId(null);
     setGlossaryText("");
     setFindText("");
     setReplaceText("");
@@ -4404,7 +4515,7 @@ function App() {
             Remove filler words / simple stutters
           </label>
 
-          <p className="helper-text">`Word` mode switches speakers using each word timestamp, which is usually tighter around handoffs. The glossary lives in the Jargon tab and acts as the single project vocabulary list for transcription biasing, QA checks, and jargon-only retranscribe.</p>
+          <p className="helper-text">`Word` mode switches speakers using each word timestamp, which is usually tighter around handoffs. The project vocabulary lives in the Vocab tab and biases transcription toward names and technical terms Whisper tends to mishear.</p>
           {showPyannoteSetupHint ? (
             <p className="helper-text">Multiple speakers need Hugging Face access for `pyannote/speaker-diarization-3.1`. Put `DIARIZATION_AUTH_TOKEN=hf_...` in `.env`.</p>
           ) : null}
@@ -4488,6 +4599,21 @@ function App() {
               >
                 {userMuted ? <VolumeX size={16} /> : <Volume2 size={16} />}
               </button>
+              {soloableSpeakers.length ? (
+                <select
+                  className="transport-speed transport-solo"
+                  value={soloSpeakerId ?? "all"}
+                  onChange={(event) => setSoloSpeakerId(event.target.value === "all" ? null : Number(event.target.value))}
+                  disabled={!audioUrl}
+                  title="Listen to one speaker"
+                  aria-label="Listen to one speaker"
+                >
+                  <option value="all">All speakers</option>
+                  {soloableSpeakers.map((speaker) => (
+                    <option key={speaker.id} value={speaker.id}>Only {speaker.name}</option>
+                  ))}
+                </select>
+              ) : null}
               <select
                 className="transport-speed"
                 value={playbackRate}
@@ -5034,55 +5160,61 @@ function App() {
                 {sidePanelTab === "jargon" ? (
                   <section className="selection-panel">
                     <div className="panel-section-heading">
-                      <p className="eyebrow">Glossary</p>
-                      <h3>Project dictionary</h3>
+                      <p className="eyebrow">Vocabulary</p>
+                      <h3>
+                        Words that transcribe wrong
+                        <InfoTip text="A persistent list of names, technical terms, and acronyms Whisper tends to mishear or misspell (e.g. a name spelled 'Zakery'). It biases the next transcription toward these spellings, flags near-miss captions in QA, and seeds jargon-only retranscribe. It carries across every file, so add a term once and future recordings come out right." />
+                      </h3>
                     </div>
                     <label>
-                      Glossary / jargon dictionary
+                      Project vocabulary
                       <textarea
                         rows={6}
-                        placeholder="One term per line. These terms are used for transcription biasing, QA, and jargon-only retranscribe."
+                        placeholder={"One term per line, e.g.\nZakery\nWhisperX\nKubernetes"}
                         value={glossaryText}
                         onChange={(event) => setGlossaryText(event.target.value)}
                       />
                     </label>
                     <p className="helper-text">
                       {glossaryTerms.length
-                        ? `${glossaryTerms.length} glossary term${glossaryTerms.length === 1 ? "" : "s"} active. ${glossaryMatchedCaptionCount} caption${glossaryMatchedCaptionCount === 1 ? "" : "s"} currently match the glossary.`
-                        : "The app scans for likely jargon candidates. Add the useful ones to the glossary and they will be used during transcription, QA, and jargon-only retranscribe."}
+                        ? `${glossaryTerms.length} term${glossaryTerms.length === 1 ? "" : "s"} active. ${glossaryMatchedCaptionCount} caption${glossaryMatchedCaptionCount === 1 ? "" : "s"} currently match.`
+                        : "Add names and technical terms before transcribing so they come out right the first time. The list below suggests unusual words found in this transcript."}
                     </p>
                     <div className="inline-actions">
                       <button disabled={!jargonCandidates.length} onClick={() => addTermsToGlossary(jargonCandidates.slice(0, 12).map((candidate) => candidate.display))}>
-                        Add top candidates
+                        Add top suggestions
                       </button>
                       <button
                         disabled={!selectedFile || retranscribing || !glossaryTerms.length || !glossaryMatchedCaptionCount}
                         onClick={() => void handleRetranscribeGlossaryMatches()}
                       >
-                        {retranscribing ? "Retranscribing..." : "Retranscribe Glossary Matches"}
+                        {retranscribing ? "Retranscribing..." : "Retranscribe Vocabulary Matches"}
                       </button>
                     </div>
                     {jargonCandidates.length ? (
-                      <div className="qa-list">
-                        {jargonCandidates.slice(0, 10).map((candidate) => (
-                          <div key={candidate.normalized} className="qa-row">
-                            <div className="qa-copy">
-                              <strong>{candidate.display}</strong>
-                              <div className="chip-row">
-                                <span className="metric-chip">{candidate.count}x</span>
-                                {candidate.lowConfidenceCount ? <span className="metric-chip">{candidate.lowConfidenceCount} low-conf</span> : null}
-                                <span className="metric-chip">{candidate.reasons.join(", ")}</span>
+                      <>
+                        <p className="helper-text">Suggested from this transcript — add the ones that are real vocabulary:</p>
+                        <div className="qa-list">
+                          {jargonCandidates.map((candidate) => (
+                            <div key={candidate.normalized} className="qa-row">
+                              <div className="qa-copy">
+                                <strong>{candidate.display}</strong>
+                                <div className="chip-row">
+                                  <span className="metric-chip">{candidate.count}x</span>
+                                  {candidate.lowConfidenceCount ? <span className="metric-chip">{candidate.lowConfidenceCount} low-conf</span> : null}
+                                  <span className="metric-chip">{candidate.reasons.join(", ")}</span>
+                                </div>
+                              </div>
+                              <div className="qa-actions">
+                                <button onClick={() => addTermsToGlossary([candidate.display])}>Add</button>
+                                <button disabled={!candidate.captionIndexes.length} onClick={() => jumpToCaption(candidate.captionIndexes[0])}>Jump</button>
                               </div>
                             </div>
-                            <div className="qa-actions">
-                              <button onClick={() => addTermsToGlossary([candidate.display])}>Add</button>
-                              <button disabled={!candidate.captionIndexes.length} onClick={() => jumpToCaption(candidate.captionIndexes[0])}>Jump</button>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
+                          ))}
+                        </div>
+                      </>
                     ) : (
-                      <p className="helper-text">No likely jargon candidates detected yet.</p>
+                      <p className="helper-text">No unusual words detected in this transcript. Add names and terms manually above.</p>
                     )}
                   </section>
                 ) : null}

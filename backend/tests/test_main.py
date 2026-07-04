@@ -2,7 +2,7 @@ import unittest
 
 from fastapi import HTTPException
 
-from backend.app.diarization import SpeakerTurn, assign_speaker_id
+from backend.app.diarization import SpeakerTurn, _extract_turns, assign_speaker_id
 from backend.app.main import parse_speakers_json, resolve_requested_language, shift_segment_times, validate_speaker_request
 
 
@@ -56,6 +56,31 @@ class MainApiTests(unittest.TestCase):
 
         self.assertEqual(speaker_id, 20)
         self.assertEqual(speaker_name, "Bob")
+
+    def test_extract_turns_prefers_exclusive_diarization(self) -> None:
+        class FakeSegment:
+            def __init__(self, start: float, end: float) -> None:
+                self.start = start
+                self.end = end
+
+        class FakeAnnotation:
+            def __init__(self, tracks: list[tuple[float, float, str]]) -> None:
+                self._tracks = tracks
+
+            def itertracks(self, yield_label: bool = False):
+                for start, end, label in self._tracks:
+                    yield FakeSegment(start, end), None, label
+
+        class FakeOutput:
+            exclusive_speaker_diarization = FakeAnnotation([(0.0, 1.5, "SPEAKER_00")])
+            speaker_diarization = FakeAnnotation([(0.0, 2.0, "SPEAKER_00"), (1.0, 2.0, "SPEAKER_01")])
+
+        turns = _extract_turns(FakeOutput())
+        self.assertEqual(turns, [SpeakerTurn(start=0.0, end=1.5, label="SPEAKER_00")])
+
+        # Legacy pipelines return a bare annotation instead of a DiarizeOutput.
+        legacy = _extract_turns(FakeAnnotation([(0.5, 1.0, "SPEAKER_01")]))
+        self.assertEqual(legacy, [SpeakerTurn(start=0.5, end=1.0, label="SPEAKER_01")])
 
     def test_resolve_requested_language_allows_auto_detection(self) -> None:
         self.assertIsNone(resolve_requested_language(None, None))
