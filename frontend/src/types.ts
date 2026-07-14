@@ -82,6 +82,18 @@ export interface WaveformAnalysisResponse {
   warnings: WarningItem[];
 }
 
+export interface SpeakerTurn {
+  start: number;
+  end: number;
+  speaker_index: number;
+}
+
+export interface OverlapRegion {
+  start: number;
+  end: number;
+  speaker_indices: number[];
+}
+
 export interface TranscriptResponse {
   audio_filename: string;
   duration: number | null;
@@ -95,6 +107,9 @@ export interface TranscriptResponse {
   speaker_assignment_mode: SpeakerAssignmentMode;
   language: string | null;
   gpu_enabled: boolean;
+  // Optional: absent in sessions saved before overlap separation existed.
+  speaker_turns?: SpeakerTurn[];
+  overlap_regions?: OverlapRegion[];
 }
 
 export interface RetranscribeRangeResponse {

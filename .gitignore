@@ -34,3 +34,4 @@ torch/
 *.safetensors
 checkpoints/
 .DS_Store
+vendor/unified-audio/

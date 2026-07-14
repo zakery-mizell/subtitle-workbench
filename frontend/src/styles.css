@@ -30,6 +30,7 @@
   --playhead: #d85a30;
   --wave-played: #1d9e75;
   --wave-rest: #c4c9d4;
+  --overlap-band: rgba(216, 90, 48, 0.16);
   --radius: 8px;
   --radius-sm: 6px;
   --rail-width: 348px;
@@ -1202,6 +1203,56 @@ button.caption-time:hover {
   transition: width 400ms ease;
 }
 
+.overlap-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.55rem 0.65rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  background: var(--surface-soft);
+}
+
+.overlap-card.is-enabled {
+  border-color: var(--accent);
+}
+
+.overlap-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.overlap-card-header .mastering-toggle {
+  min-width: 0;
+}
+
+.overlap-jump {
+  flex-shrink: 0;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.8rem;
+}
+
+.overlap-speakers {
+  margin: 0;
+}
+
+.overlap-report {
+  border-top: 1px dashed var(--border);
+  padding-top: 0.45rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.overlap-stem-words {
+  margin: 0;
+  font-size: 0.85rem;
+  font-style: italic;
+  color: var(--muted-strong);
+}
+
 .mastering-stats {
   width: 100%;
   border-collapse: collapse;
@@ -1677,6 +1728,7 @@ button.toast-dismiss {
   --playhead: #e8825f;
   --wave-played: #2fbd8f;
   --wave-rest: #39445a;
+  --overlap-band: rgba(232, 130, 95, 0.2);
 }
 
 :root[data-theme="dark"] body {

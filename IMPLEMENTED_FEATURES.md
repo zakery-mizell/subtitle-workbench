@@ -240,3 +240,15 @@ Local Auphonic-style post production implemented in `backend/app/mastering/` and
 - Instant A/B: original and mastered audio render as two persistent elements that co-play in lockstep; the Original/Mastered toggle is a gapless mute swap with drift correction, falling back to cut-list time mapping when the master has a shortened timeline.
 - Follow playback is on by default; the caption/transcript list auto-scrolls to the active block and suspends for 3 s after manual scrolling.
 - Streamlined layout: one-row transport bar (clock, A/B, view mode, jump, gear popover with view toggles), consolidated waveform strip, sticky player panel, collapsible source/setup rail with summary card, warnings as a collapsible strip, and Export moved into the side panel as its own tab.
+
+## 13. Overlap Separation (Overlaps tab, UniSE)
+
+- Diarization now surfaces the raw (non-exclusive) pyannote annotation alongside the exclusive one; `/api/transcribe` returns `speaker_turns` and `overlap_regions` (spans where 2+ speakers talk at once, ≥0.4 s, merged across ≤0.4 s gaps).
+- Overlap regions render as translucent bands on the waveform plus an "N overlaps to untangle" chip that opens the Overlaps side-panel tab.
+- Per-region controls: Spotlight one voice (duck the original mix ~11 dB and overlay the AI-separated voice) or Mute one voice (replace the region with the everyone-but-X reconstruction), with a speaker picker per region.
+- Separation engine: vendored Alibaba QuarkAudio-UniSE (decoder-only AR-LM over BiCodec speech tokens, WavLM features, 16 kHz, 5 s windows) in `backend/app/separation/`; task modes `se`/`tse`/`rtse`; enrollment audio picked automatically from the target speaker's nearest clean solo span (≥1.5 s, ideally 5 s); MPS→CPU fallback; `transformers_compat.py` bridges the vendored code onto transformers ≥4.5x.
+- `POST /api/separate` job (shared job registry/polling with mastering) blends stems back into the full-length original at its native sample rate with equal-power crossfades, RMS matching, and a region peak limiter; artifacts under `tmp/separation/` with audio/waveform/delete endpoints.
+- Optional per-region WhisperX transcription of the spotlighted stem returns recovered words; one click adds them to the transcript as a new caption for that speaker (words in overlaps are otherwise usually lost — the mixed audio transcribes only the dominant voice).
+- Result playback goes through the existing instant A/B toggle, relabeled Original/Separated; download button for the processed file.
+- Install via `scripts/install-unise.sh` / `.ps1` (clones vendor repo, installs `backend/requirements-separation.txt`, downloads ~2.8 GB of checkpoints into `checkpoints/unise/`); `backend/tools/demo_unise.py` builds a synthetic two-voice overlap clip and verifies separation end to end.
+- Unit tests for overlap/solo-span math, enrollment picking, and blend rendering (`backend/tests/test_separation.py`).

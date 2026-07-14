@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProper
 import {
   AlertTriangle,
   ArrowLeftRight,
+  AudioLines,
   BookOpen,
   ClipboardCheck,
   Download,
@@ -35,16 +36,20 @@ import type { CutRegion, MasteringResult } from "./lib/mastering";
 import { parseSrt } from "./lib/srt";
 import { formatClock, formatGutterClock } from "./lib/time";
 import MasteringPanel from "./MasteringPanel";
+import OverlapsPanel from "./OverlapsPanel";
+import type { RegionReport, SeparationResult } from "./lib/separation";
 import type {
   BackendCapabilities,
   Caption,
   GuideBlock,
   GuideLabel,
+  OverlapRegion,
   Paragraph,
   RetranscribeRangeResponse,
   SpeechSpan,
   Speaker,
   SpeakerAssignmentMode,
+  SpeakerTurn,
   TranscriptResponse,
   WaveformAnalysisResponse,
   WarningItem,
@@ -205,6 +210,7 @@ const SIDE_PANEL_TABS = [
   { id: "guide", label: "Guide" },
   { id: "jargon", label: "Vocab" },
   { id: "qa", label: "QA" },
+  { id: "overlaps", label: "Overlaps" },
   { id: "master", label: "Master" },
   { id: "export", label: "Export" },
 ] as const;
@@ -212,6 +218,7 @@ const SIDE_PANEL_TAB_ICONS = {
   guide: Scissors,
   jargon: BookOpen,
   qa: ClipboardCheck,
+  overlaps: AudioLines,
   master: Wand2,
   export: Download,
 } as const;
@@ -2052,6 +2059,7 @@ interface WaveformTimelineProps {
   analysis: WaveformAnalysisResponse | null;
   captions: Caption[];
   speakerEvents: SpeakerTimelineEvent[];
+  overlapRegions: OverlapRegion[];
   currentTime: number;
   theme: "light" | "dark";
   onSeek: (time: number, options?: { play?: boolean }) => void;
@@ -2095,6 +2103,18 @@ function drawWaveformTimeline(
     context.font = "12px Inter, sans-serif";
     context.fillText("Waveform appears after loading audio", 12, height / 2 + 4);
     return;
+  }
+
+  // Overlap regions sit behind the bars as translucent bands.
+  if (props.overlapRegions.length) {
+    context.fillStyle = themeColor("--overlap-band", "rgba(216, 90, 48, 0.16)");
+    for (const region of props.overlapRegions) {
+      const left = clampNumber((region.start / duration) * width, 0, width);
+      const right = clampNumber((region.end / duration) * width, 0, width);
+      if (right - left > 0.5) {
+        context.fillRect(left, 1, right - left, height - 2);
+      }
+    }
   }
 
   // Amplitude bars, split into played and unplayed at the playhead.
@@ -2486,6 +2506,7 @@ function App() {
   const [processedAudio, setProcessedAudio] = useState<{
     url: string;
     filename: string;
+    label: "Mastered" | "Separated";
     hasCutTimeline: boolean;
     cutList: CutRegion[];
   } | null>(null);
@@ -2603,7 +2624,7 @@ function App() {
             showTimingHighlights: typeof saved.showTimingHighlights === "boolean" ? saved.showTimingHighlights : true,
             viewMode: saved.viewMode === "transcript" ? "transcript" : "subtitles",
             sidePanelTab:
-              saved.sidePanelTab === "jargon" || saved.sidePanelTab === "qa" || saved.sidePanelTab === "guide" || saved.sidePanelTab === "master" || saved.sidePanelTab === "export"
+              saved.sidePanelTab === "jargon" || saved.sidePanelTab === "qa" || saved.sidePanelTab === "guide" || saved.sidePanelTab === "overlaps" || saved.sidePanelTab === "master" || saved.sidePanelTab === "export"
                 ? saved.sidePanelTab
                 : "guide",
             isGuidePanelCollapsed: DEFAULT_GUIDE_PANEL_COLLAPSED,
@@ -2956,6 +2977,8 @@ function App() {
     () => buildQaReport(activeEditor?.captions ?? [], activeWords, glossaryMatches, lowConfidenceThreshold),
     [activeEditor, activeWords, glossaryMatches, lowConfidenceThreshold],
   );
+  const overlapRegions = useMemo<OverlapRegion[]>(() => session?.overlap_regions ?? [], [session]);
+  const speakerTurns = useMemo<SpeakerTurn[]>(() => session?.speaker_turns ?? [], [session]);
   const sidePanelMeta =
     sidePanelTab === "guide"
       ? {
@@ -2969,23 +2992,29 @@ function App() {
             title: "Words that transcribe wrong",
             detail: `${glossaryTerms.length} term${glossaryTerms.length === 1 ? "" : "s"}, ${jargonCandidates.length} suggested`,
           }
-        : sidePanelTab === "master"
+        : sidePanelTab === "overlaps"
           ? {
-              eyebrow: "Master",
-              title: "Audio post production",
-              detail: processedAudio ? "Master ready" : "Not processed",
+              eyebrow: "Overlaps",
+              title: "Untangle simultaneous speech",
+              detail: `${overlapRegions.length} overlap${overlapRegions.length === 1 ? "" : "s"} found`,
             }
-          : sidePanelTab === "export"
+          : sidePanelTab === "master"
             ? {
-                eyebrow: "Export",
-                title: "Outputs",
-                detail: activeEditor ? `${activeEditor.captions.length} captions` : "No session",
+                eyebrow: "Master",
+                title: "Audio post production",
+                detail: processedAudio ? "Master ready" : "Not processed",
               }
-            : {
-                eyebrow: "QA",
-                title: "Report",
-                detail: `${qaReport.summary.issueCount} issues`,
-              };
+            : sidePanelTab === "export"
+              ? {
+                  eyebrow: "Export",
+                  title: "Outputs",
+                  detail: activeEditor ? `${activeEditor.captions.length} captions` : "No session",
+                }
+              : {
+                  eyebrow: "QA",
+                  title: "Report",
+                  detail: `${qaReport.summary.issueCount} issues`,
+                };
   const collapsedPanelMetaDetail =
     sidePanelTab === "guide"
       ? skipCuts
@@ -2993,13 +3022,15 @@ function App() {
         : "Playback skip off"
       : sidePanelTab === "jargon"
         ? `${glossaryTerms.length} term${glossaryTerms.length === 1 ? "" : "s"}`
-        : sidePanelTab === "master"
-          ? processedAudio
-            ? "Processed audio loaded"
-            : "Local processing"
-          : sidePanelTab === "export"
-            ? "SRT, transcript, edit guide"
-            : `${qaReport.summary.flaggedCaptionCount} caption${qaReport.summary.flaggedCaptionCount === 1 ? "" : "s"}`;
+        : sidePanelTab === "overlaps"
+          ? `${overlapRegions.length} overlap${overlapRegions.length === 1 ? "" : "s"}`
+          : sidePanelTab === "master"
+            ? processedAudio
+              ? "Processed audio loaded"
+              : "Local processing"
+            : sidePanelTab === "export"
+              ? "SRT, transcript, edit guide"
+              : `${qaReport.summary.flaggedCaptionCount} caption${qaReport.summary.flaggedCaptionCount === 1 ? "" : "s"}`;
   const multiSpeaker = (activeEditor?.speakers.length ?? speakerInputs.length) > 1;
 
   const activeCaptionIndex = useMemo(() => {
@@ -3356,7 +3387,7 @@ function App() {
     setShowTimingHighlights(Boolean(persisted.showTimingHighlights));
     setViewMode(persisted.viewMode === "transcript" ? "transcript" : "subtitles");
     setSidePanelTab(
-      persisted.sidePanelTab === "jargon" || persisted.sidePanelTab === "qa" || persisted.sidePanelTab === "guide" || persisted.sidePanelTab === "master" || persisted.sidePanelTab === "export"
+      persisted.sidePanelTab === "jargon" || persisted.sidePanelTab === "qa" || persisted.sidePanelTab === "guide" || persisted.sidePanelTab === "overlaps" || persisted.sidePanelTab === "master" || persisted.sidePanelTab === "export"
         ? persisted.sidePanelTab
         : "guide",
     );
@@ -3577,7 +3608,7 @@ function App() {
     const previousTime = audioRef.current?.currentTime ?? 0;
     const wasPlaying = audioRef.current ? !audioRef.current.paused : false;
     const hasCutTimeline = result.duration_after < result.duration_before - 0.01;
-    setProcessedAudio({ url, filename: result.output_filename, hasCutTimeline, cutList: result.cut_list });
+    setProcessedAudio({ url, filename: result.output_filename, label: "Mastered", hasCutTimeline, cutList: result.cut_list });
     setPlaybackSource("processed");
     // Once the new master is loaded, carry the listening position (mapped
     // through the cuts when the timeline changed) and keep playing.
@@ -3595,6 +3626,80 @@ function App() {
       void refreshWaveformFromMaster(result.token);
     }
     setStatusMessage("Mastering finished. Playback now uses the processed audio.");
+  }
+
+  function handleSeparationProcessed(result: SeparationResult, url: string) {
+    const previousTime = audioRef.current?.currentTime ?? 0;
+    const wasPlaying = audioRef.current ? !audioRef.current.paused : false;
+    // Separation never changes the timeline, so the A/B swap stays instant.
+    setProcessedAudio({ url, filename: result.output_filename, label: "Separated", hasCutTimeline: false, cutList: [] });
+    setPlaybackSource("processed");
+    window.setTimeout(() => {
+      const processed = masteredAudioRef.current;
+      if (!processed) {
+        return;
+      }
+      processed.currentTime = previousTime;
+      if (wasPlaying) {
+        void processed.play().catch(() => undefined);
+      }
+    }, 200);
+    const applied = result.regions.filter((region) => region.applied).length;
+    setStatusMessage(
+      `Separation finished on ${result.device_used.toUpperCase()}: ${applied} overlap${applied === 1 ? "" : "s"} processed. Playback now uses the processed audio.`,
+    );
+  }
+
+  function applySeparatedWords(report: RegionReport) {
+    const stemWords = report.words ?? [];
+    if (!stemWords.length) {
+      return;
+    }
+    const speaker = activeEditor?.speakers[report.target_speaker_index] ?? speakerInputs[report.target_speaker_index] ?? null;
+    const idPrefix = `sep-${Date.now()}-${Math.round(report.start * 1000)}`;
+    const words: WordToken[] = stemWords.map((word, index) => ({
+      id: `${idPrefix}-w-${index}`,
+      text: word.text,
+      start: word.start,
+      end: word.end,
+      confidence: 1,
+      low_confidence: false,
+      speaker_id: speaker?.id ?? null,
+      speaker_name: speaker?.name ?? null,
+    }));
+
+    // The recovered voice coexists with what is already transcribed in the
+    // overlap, so the words are added as a new caption instead of replacing
+    // the other speaker's text.
+    const captionText = stemWords.map((word) => word.text).join(" ");
+    const caption: Caption = {
+      id: `${idPrefix}-c-0`,
+      start: words[0].start,
+      end: words[words.length - 1].end,
+      speaker_id: speaker?.id ?? null,
+      speaker_name: speaker?.name ?? null,
+      lines: normalizeCaptionEditorLines(captionText),
+      word_ids: words.map((word) => word.id),
+      blank_after: false,
+    };
+
+    setHistory((current) => {
+      if (!current.present) {
+        return current;
+      }
+      const nextWords = [...current.present.words, ...words].sort((left, right) => left.start - right.start);
+      const nextEditor = cloneEditorState(current.present.editor);
+      nextEditor.captions = [...nextEditor.captions, caption].sort((left, right) => left.start - right.start);
+      nextEditor.paragraphs = buildParagraphsFromCaptions(nextEditor.captions);
+      return {
+        past: [...current.past, cloneWorkspaceState(current.present)].slice(-120),
+        present: { ...current.present, editor: nextEditor, words: nextWords },
+        future: [],
+      };
+    });
+    setStatusMessage(
+      `Added ${words.length} recovered word${words.length === 1 ? "" : "s"} for ${speaker?.name ?? "the spotlighted speaker"} at ${formatClock(report.start)}.`,
+    );
   }
 
   async function handleResplitCaptions() {
@@ -4792,7 +4897,7 @@ function App() {
                     className={playbackSource === "processed" ? "is-active" : ""}
                     onClick={() => switchPlaybackSource("processed")}
                   >
-                    Mastered
+                    {processedAudio.label}
                   </button>
                 </div>
               ) : null}
@@ -4878,6 +4983,7 @@ function App() {
             analysis={waveformAnalysis}
             captions={activeEditor?.captions ?? []}
             speakerEvents={speakerTimelineEvents}
+            overlapRegions={overlapRegions}
             currentTime={currentTime}
             theme={themeDark ? "dark" : "light"}
             onSeek={seekAudio}
@@ -4906,6 +5012,20 @@ function App() {
               >
                 <AlertTriangle size={12} aria-hidden />
                 &nbsp;{reviewableSpeakerEvents.length} speaker {reviewableSpeakerEvents.length === 1 ? "event" : "events"} to review
+              </button>
+            ) : null}
+            {overlapRegions.length ? (
+              <button
+                type="button"
+                className="waveform-event-chip event-overlap"
+                title="Open the Overlaps panel to spotlight or mute a voice"
+                onClick={() => {
+                  setSidePanelTab("overlaps");
+                  setIsGuidePanelCollapsed(false);
+                }}
+              >
+                <AudioLines size={12} aria-hidden />
+                &nbsp;{overlapRegions.length} overlap{overlapRegions.length === 1 ? "" : "s"} to untangle
               </button>
             ) : null}
           </div>
@@ -5435,6 +5555,20 @@ function App() {
                       <p className="helper-text">No unusual words detected in this transcript. Add names and terms manually above.</p>
                     )}
                   </section>
+                ) : null}
+
+                {sidePanelTab === "overlaps" ? (
+                  <OverlapsPanel
+                    apiBaseUrl={API_BASE_URL}
+                    audioFile={selectedFile}
+                    regions={overlapRegions}
+                    turns={speakerTurns}
+                    speakers={activeEditor?.speakers ?? speakerInputs}
+                    language={activeWorkspace?.language ?? session?.language ?? null}
+                    onProcessed={handleSeparationProcessed}
+                    onApplyWords={applySeparatedWords}
+                    onSeek={seekAudio}
+                  />
                 ) : null}
 
                 {sidePanelTab === "master" ? (
