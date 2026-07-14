@@ -750,7 +750,8 @@ select.speaker-pill-select {
   margin-bottom: 0;
   opacity: 0;
   pointer-events: none;
-  z-index: 2;
+  /* Above .timed-editor-input (z-index: 2), which otherwise swallows clicks. */
+  z-index: 3;
 }
 
 .caption-card:hover .caption-topline-ghost,
@@ -1292,6 +1293,29 @@ button.caption-time:hover {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: 0 12px 28px rgba(15, 23, 42, 0.16);
+}
+
+.slider-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--border);
+  color: var(--muted-strong);
+  font-weight: 600;
+}
+
+.slider-row input[type="range"] {
+  width: 100%;
+  min-height: 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+.slider-row-meta {
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--muted);
 }
 
 .warning-details {

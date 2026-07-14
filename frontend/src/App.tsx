@@ -29,6 +29,7 @@ import {
   parseGlossaryTerms,
 } from "./lib/glossary";
 import { buildQaReport, formatQaReport } from "./lib/qa";
+import { DEFAULT_LOW_CONFIDENCE_THRESHOLD, isLowConfidenceWord } from "./lib/confidence";
 import { remapCaptions, remapGuideBlocks, remapTime, remapWords, unremapTime } from "./lib/cuts";
 import type { CutRegion, MasteringResult } from "./lib/mastering";
 import { parseSrt } from "./lib/srt";
@@ -282,6 +283,7 @@ interface PersistedWorkspace {
   showSpeakerAttributionOptions: boolean;
   removeDisfluencies: boolean;
   acknowledgedLowConfidenceWordIds: string[];
+  lowConfidenceThreshold: number;
 }
 
 interface ProjectAudioPayload {
@@ -346,6 +348,7 @@ interface TimedTextEditorProps {
   lookup: Map<string, WordToken>;
   currentTime: number;
   showTimingHighlights?: boolean;
+  lowConfidenceThreshold?: number;
   className?: string;
   commitMode?: "immediate" | "blur";
   minHeight?: number;
@@ -1431,11 +1434,8 @@ function buildParagraphsFromCaptions(captions: Caption[]): Paragraph[] {
     }
 
     const previous = bucket[bucket.length - 1];
-    const textSoFar = normalizeEditableText(bucket.map((item) => plainCaptionText(item)).join(" "));
-    const shouldBreak =
-      previous.speaker_id !== caption.speaker_id ||
-      caption.start - previous.end > 1.8 ||
-      (textSoFar.length > 380 && SENTENCE_END_RE.test(plainCaptionText(previous)));
+    // One box per speaker turn: the same speaker never spans consecutive boxes.
+    const shouldBreak = previous.speaker_id !== caption.speaker_id;
     if (shouldBreak) {
       flush();
     }
@@ -2227,6 +2227,7 @@ const TimedTextEditor = memo(function TimedTextEditor({
   lookup,
   currentTime,
   showTimingHighlights = true,
+  lowConfidenceThreshold = DEFAULT_LOW_CONFIDENCE_THRESHOLD,
   className,
   commitMode = "immediate",
   minHeight = 92,
@@ -2337,7 +2338,8 @@ const TimedTextEditor = memo(function TimedTextEditor({
         {fragments.map((fragment) => {
           const classes = ["text-fragment"];
           if (
-            fragment.word?.low_confidence &&
+            fragment.word &&
+            isLowConfidenceWord(fragment.word, lowConfidenceThreshold) &&
             !acknowledgedWordIds?.has(fragment.word.id) &&
             !selectionSuppressesLowConfidence(fragment)
           ) {
@@ -2421,6 +2423,7 @@ const TimedTextEditor = memo(function TimedTextEditor({
     previous.lookup === next.lookup &&
     previous.currentTime === next.currentTime &&
     previous.showTimingHighlights === next.showTimingHighlights &&
+    previous.lowConfidenceThreshold === next.lowConfidenceThreshold &&
     previous.className === next.className &&
     previous.commitMode === next.commitMode &&
     previous.minHeight === next.minHeight &&
@@ -2452,6 +2455,7 @@ function App() {
   const [followPlayback, setFollowPlayback] = useState(true);
   const [showLineGuides, setShowLineGuides] = useState(false);
   const [showTimingHighlights, setShowTimingHighlights] = useState(true);
+  const [lowConfidenceThreshold, setLowConfidenceThreshold] = useState(DEFAULT_LOW_CONFIDENCE_THRESHOLD);
   const [sidePanelTab, setSidePanelTab] = useState<SidePanelTab>("guide");
   const [isGuidePanelCollapsed, setIsGuidePanelCollapsed] = useState(DEFAULT_GUIDE_PANEL_COLLAPSED);
   const [extendCaptionsOnExport, setExtendCaptionsOnExport] = useState(false);
@@ -2612,6 +2616,10 @@ function App() {
             acknowledgedLowConfidenceWordIds: Array.isArray(saved.acknowledgedLowConfidenceWordIds)
               ? saved.acknowledgedLowConfidenceWordIds.filter((item): item is string => typeof item === "string")
               : [],
+            lowConfidenceThreshold:
+              typeof saved.lowConfidenceThreshold === "number" && Number.isFinite(saved.lowConfidenceThreshold)
+                ? saved.lowConfidenceThreshold
+                : DEFAULT_LOW_CONFIDENCE_THRESHOLD,
           },
           {
             statusMessage: "Restored the last autosaved workspace. Reattach the audio file if you need playback.",
@@ -2701,7 +2709,7 @@ function App() {
         autosaveTimerRef.current = null;
       }
     };
-  }, [acknowledgedLowConfidenceWordIds, activeWorkspace, clickToPlay, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, model, normalizeExportTimingTo30Fps, removeDisfluencies, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, speakerAssignmentMode, speakerCount, speakerInputs, viewMode]);
+  }, [acknowledgedLowConfidenceWordIds, activeWorkspace, clickToPlay, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, lowConfidenceThreshold, model, normalizeExportTimingTo30Fps, removeDisfluencies, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, speakerAssignmentMode, speakerCount, speakerInputs, viewMode]);
 
   // Keep audioRef pointing at the active A/B element; only the active one is audible.
   useEffect(() => {
@@ -2941,12 +2949,12 @@ function App() {
     [glossaryMatches],
   );
   const jargonCandidates = useMemo(
-    () => (activeEditor ? detectJargonCandidates(activeWords, activeEditor.captions, glossaryText) : []),
-    [activeEditor, activeWords, glossaryText],
+    () => (activeEditor ? detectJargonCandidates(activeWords, activeEditor.captions, glossaryText, lowConfidenceThreshold) : []),
+    [activeEditor, activeWords, glossaryText, lowConfidenceThreshold],
   );
   const qaReport = useMemo(
-    () => buildQaReport(activeEditor?.captions ?? [], activeWords, glossaryMatches),
-    [activeEditor, activeWords, glossaryMatches],
+    () => buildQaReport(activeEditor?.captions ?? [], activeWords, glossaryMatches, lowConfidenceThreshold),
+    [activeEditor, activeWords, glossaryMatches, lowConfidenceThreshold],
   );
   const sidePanelMeta =
     sidePanelTab === "guide"
@@ -3047,6 +3055,17 @@ function App() {
   const acknowledgedWordIdSet = useMemo(
     () => new Set(acknowledgedLowConfidenceWordIds),
     [acknowledgedLowConfidenceWordIds],
+  );
+  // Live count shown next to the sensitivity dial so the user can see how many
+  // words each threshold flags before committing to it.
+  const flaggedLowConfidenceCount = useMemo(
+    () =>
+      activeWords.reduce(
+        (count, word) =>
+          count + (isLowConfidenceWord(word, lowConfidenceThreshold) && !acknowledgedWordIdSet.has(word.id) ? 1 : 0),
+        0,
+      ),
+    [activeWords, lowConfidenceThreshold, acknowledgedWordIdSet],
   );
 
   useEffect(() => {
@@ -3285,6 +3304,7 @@ function App() {
       showSpeakerAttributionOptions,
       removeDisfluencies,
       acknowledgedLowConfidenceWordIds,
+      lowConfidenceThreshold,
     };
   }
 
@@ -3349,6 +3369,11 @@ function App() {
       Array.isArray(persisted.acknowledgedLowConfidenceWordIds)
         ? persisted.acknowledgedLowConfidenceWordIds.filter((item): item is string => typeof item === "string")
         : [],
+    );
+    setLowConfidenceThreshold(
+      typeof persisted.lowConfidenceThreshold === "number" && Number.isFinite(persisted.lowConfidenceThreshold)
+        ? Math.min(1, Math.max(0, persisted.lowConfidenceThreshold))
+        : DEFAULT_LOW_CONFIDENCE_THRESHOLD,
     );
     setSelection(null);
     setCurrentTime(0);
@@ -3704,6 +3729,7 @@ function App() {
     setShowSpeakerAttributionOptions(false);
     setRemoveDisfluencies(false);
     setAcknowledgedLowConfidenceWordIds([]);
+    setLowConfidenceThreshold(DEFAULT_LOW_CONFIDENCE_THRESHOLD);
     setCurrentTime(0);
     setStatusMessage("Workspace reset.");
     setSelection(null);
@@ -4822,6 +4848,22 @@ function App() {
                       <input type="checkbox" checked={themeDark} onChange={(event) => setThemeDark(event.target.checked)} />
                       Dark theme
                     </label>
+                    <label className="slider-row">
+                      Low-confidence sensitivity
+                      <input
+                        type="range"
+                        min={0}
+                        max={0.95}
+                        step={0.05}
+                        value={lowConfidenceThreshold}
+                        onChange={(event) => setLowConfidenceThreshold(Number(event.target.value))}
+                      />
+                      <span className="slider-row-meta">
+                        {lowConfidenceThreshold <= 0
+                          ? "Off — nothing flagged"
+                          : `Below ${Math.round(lowConfidenceThreshold * 100)}% — flags ${flaggedLowConfidenceCount} word${flaggedLowConfidenceCount === 1 ? "" : "s"}`}
+                      </span>
+                    </label>
                     <p className="helper-text">Clicks always seek. `Ctrl+Space` play/pause. `←`/`→` skip 3s. `Shift+Space` toggles click autoplay.</p>
                   </div>
                 ) : null}
@@ -4922,6 +4964,7 @@ function App() {
                         lookup={transcriptWords}
                         currentTime={currentTime}
                         showTimingHighlights={showTimingHighlights}
+                        lowConfidenceThreshold={lowConfidenceThreshold}
                         fallbackTime={paragraph.start}
                         autoPlayOnSeek={clickToPlay}
                         acknowledgedWordIds={acknowledgedWordIdSet}
@@ -5035,6 +5078,7 @@ function App() {
                               lookup={transcriptWords}
                               currentTime={currentTime}
                               showTimingHighlights={showTimingHighlights}
+                              lowConfidenceThreshold={lowConfidenceThreshold}
                               fallbackTime={caption.start}
                               showLineGuides={showLineGuides}
                               autoPlayOnSeek={clickToPlay}

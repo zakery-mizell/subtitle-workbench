@@ -1,4 +1,5 @@
 import type { Caption, WordToken } from "../types";
+import { DEFAULT_LOW_CONFIDENCE_THRESHOLD, isLowConfidenceWord } from "./confidence";
 
 export interface ParsedGlossaryTerm {
   term: string;
@@ -196,6 +197,7 @@ export function detectJargonCandidates(
   words: WordToken[],
   captions: Caption[],
   glossaryText: string,
+  lowConfidenceThreshold: number = DEFAULT_LOW_CONFIDENCE_THRESHOLD,
 ): JargonCandidate[] {
   const glossaryKeys = new Set(parseGlossaryTerms(glossaryText).map((term) => term.normalized));
   const captionIndexesByWordId = new Map<string, number[]>();
@@ -254,7 +256,7 @@ export function detectJargonCandidates(
 
     current.count += 1;
     current.confidenceTotal += word.confidence;
-    current.lowConfidenceCount += word.low_confidence ? 1 : 0;
+    current.lowConfidenceCount += isLowConfidenceWord(word, lowConfidenceThreshold) ? 1 : 0;
     if (!isSentenceStart) {
       current.midSentenceCount += 1;
       current.midSentenceTitlecaseCount += /^[A-Z][a-z]/.test(word.text) ? 1 : 0;

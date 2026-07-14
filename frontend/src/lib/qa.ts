@@ -1,4 +1,5 @@
 import type { Caption, WordToken } from "../types";
+import { DEFAULT_LOW_CONFIDENCE_THRESHOLD, isLowConfidenceWord } from "./confidence";
 import type { CaptionGlossaryMatch } from "./glossary";
 
 export type QaSeverity = "error" | "warning" | "info";
@@ -51,6 +52,7 @@ export function buildQaReport(
   captions: Caption[],
   words: WordToken[],
   glossaryMatches: CaptionGlossaryMatch[],
+  lowConfidenceThreshold: number = DEFAULT_LOW_CONFIDENCE_THRESHOLD,
 ): QaReport {
   const issues: QaIssue[] = [];
   const wordById = new Map(words.map((word) => [word.id, word]));
@@ -60,10 +62,10 @@ export function buildQaReport(
     const duration = Math.max(0.001, caption.end - caption.start);
     const maxLineLength = Math.max(...caption.lines.map((line) => line.length), 0);
     const cps = text.length / duration;
-    const lowConfidenceCount = caption.word_ids.reduce(
-      (count, wordId) => count + (wordById.get(wordId)?.low_confidence ? 1 : 0),
-      0,
-    );
+    const lowConfidenceCount = caption.word_ids.reduce((count, wordId) => {
+      const word = wordById.get(wordId);
+      return count + (word && isLowConfidenceWord(word, lowConfidenceThreshold) ? 1 : 0);
+    }, 0);
     const glossaryMatch = glossaryMatches[captionIndex];
 
     if (caption.lines.length > 2) {

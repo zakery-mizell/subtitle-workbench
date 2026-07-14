@@ -288,12 +288,9 @@ def build_paragraphs(words: list[WordToken]) -> list[Paragraph]:
             continue
 
         prev = current[-1]
-        text_so_far = _normalize_spacing(" ".join(item.text for item in current))
-        should_break = (
-            word.speaker_id != prev.speaker_id
-            or word.start - prev.end > 1.8
-            or (len(text_so_far) > 380 and re.search(r"[.!?][\"')\]]?$", prev.text))
-        )
+        # One paragraph per speaker turn: the same speaker never spans
+        # consecutive paragraphs.
+        should_break = word.speaker_id != prev.speaker_id
 
         if should_break:
             flush()
