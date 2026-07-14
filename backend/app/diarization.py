@@ -62,13 +62,7 @@ def _resolve_device(torch: Any) -> Any:
     return torch.device("cpu")
 
 
-def _extract_turns(output: Any) -> list[SpeakerTurn]:
-    annotation = getattr(output, "exclusive_speaker_diarization", None)
-    if annotation is None:
-        annotation = getattr(output, "speaker_diarization", None)
-    if annotation is None:
-        annotation = output
-
+def _annotation_turns(annotation: Any) -> list[SpeakerTurn]:
     turns: list[SpeakerTurn] = []
     for segment, _, label in annotation.itertracks(yield_label=True):
         turns.append(
@@ -78,11 +72,34 @@ def _extract_turns(output: Any) -> list[SpeakerTurn]:
                 label=str(label),
             )
         )
-    return _order_speakers_by_appearance(turns)
+    return turns
 
 
-def _order_speakers_by_appearance(turns: list[SpeakerTurn]) -> list[SpeakerTurn]:
-    """Relabel diarization clusters so speaker 0 is the first voice heard.
+def _extract_turns(output: Any) -> tuple[list[SpeakerTurn], list[SpeakerTurn]]:
+    """Return (exclusive_turns, raw_turns), both relabeled by appearance order.
+
+    The exclusive annotation assigns one speaker per moment (best for caption
+    attribution); the raw annotation keeps overlapping turns (needed to find
+    overlap regions and per-speaker solo spans). Labels are relabeled with one
+    shared mapping so indices agree between the two lists.
+    """
+    exclusive = getattr(output, "exclusive_speaker_diarization", None)
+    raw = getattr(output, "speaker_diarization", None)
+    if exclusive is None and raw is None:
+        exclusive = raw = output
+    elif exclusive is None:
+        exclusive = raw
+    elif raw is None:
+        raw = exclusive
+
+    exclusive_turns = _annotation_turns(exclusive)
+    raw_turns = _annotation_turns(raw)
+    rank = _appearance_rank(exclusive_turns + raw_turns)
+    return _relabel(exclusive_turns, rank), _relabel(raw_turns, rank)
+
+
+def _appearance_rank(turns: list[SpeakerTurn]) -> dict[str, int]:
+    """Map cluster labels to speaking order, so speaker 0 is the first voice heard.
 
     pyannote's cluster labels (SPEAKER_00, SPEAKER_01, ...) are arbitrary and
     do not follow speaking order, which made "Speaker 1" land on the wrong
@@ -94,8 +111,13 @@ def _order_speakers_by_appearance(turns: list[SpeakerTurn]) -> list[SpeakerTurn]
     for turn in ordered:
         if turn.label not in appearance_rank:
             appearance_rank[turn.label] = len(appearance_rank)
+    return appearance_rank
+
+
+def _relabel(turns: list[SpeakerTurn], rank: dict[str, int]) -> list[SpeakerTurn]:
+    ordered = sorted(turns, key=lambda turn: (turn.start, turn.end))
     return [
-        SpeakerTurn(start=turn.start, end=turn.end, label=str(appearance_rank[turn.label]))
+        SpeakerTurn(start=turn.start, end=turn.end, label=str(rank[turn.label]))
         for turn in ordered
     ]
 
@@ -105,9 +127,14 @@ def run_diarization(
     num_speakers: int,
     auth_token: str | None,
     cache_dir: str | None = None,
-) -> list[SpeakerTurn]:
+) -> tuple[list[SpeakerTurn], list[SpeakerTurn]]:
+    """Diarize and return (exclusive_turns, raw_turns).
+
+    Exclusive turns never overlap and drive caption speaker attribution; raw
+    turns keep genuine overlaps and drive overlap detection/separation.
+    """
     if num_speakers <= 1 or not auth_token:
-        return []
+        return [], []
 
     try:
         with suppress_known_audio_stack_warnings():

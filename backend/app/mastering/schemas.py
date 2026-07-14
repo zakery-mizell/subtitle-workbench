@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from ..schemas import WarningItem
+from ..separation.schemas import SeparationResult
 
 LevelerStrength = Literal["tight", "moderate", "soft"]
 CutApplyMode = Literal["apply", "silence", "list_only"]
@@ -153,4 +154,5 @@ class JobStatusResponse(BaseModel):
     progress: float
     message: str | None = None
     error: str | None = None
-    result: MasteringResult | None = None
+    # Mastering and separation jobs share the registry and this status shape.
+    result: "MasteringResult | SeparationResult | None" = None

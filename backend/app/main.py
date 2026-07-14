@@ -22,7 +22,10 @@ from .jobs import registry as job_registry
 from .mastering.cutting import CutRegion, export_audacity_labels
 from .mastering.pipeline import find_master_artifact, run_mastering
 from .mastering.schemas import JobStatusResponse, MasterJobResponse, MasteringParams
-from .schemas import CapabilitiesResponse, Caption, Paragraph, RetranscribeRangeResponse, SpeakerAssignmentMode, SpeakerInput, TranscriptResponse, WarningItem, WaveformAnalysisResponse, WordToken
+from .schemas import CapabilitiesResponse, Caption, OverlapRegionOut, Paragraph, RetranscribeRangeResponse, SpeakerAssignmentMode, SpeakerInput, SpeakerTurnOut, TranscriptResponse, WarningItem, WaveformAnalysisResponse, WordToken
+from .separation.overlap import find_overlap_regions
+from .separation.schemas import SeparationParams, SeparationResult
+from .separation.service import find_separation_artifact, run_separation
 from .text_processing import build_captions, build_guide_blocks, build_paragraphs, build_words, remove_disfluencies
 from .waveform_analysis import analyze_waveform
 from .whisperx_transcription import transcribe_with_whisperx
@@ -275,6 +278,7 @@ async def transcribe(
         duration = coerce_timestamp(segments[-1].get("end"), 0.0) if segments else None
 
         diarization_turns = []
+        raw_diarization_turns = []
         if speaker_count > 1:
             diarization_cutoff = settings.diarization_max_duration_seconds
             if duration and diarization_cutoff > 0 and duration > diarization_cutoff:
@@ -299,7 +303,7 @@ async def transcribe(
             else:
                 try:
                     diarization_audio_path = prepare_diarization_audio(temp_path)
-                    diarization_turns = run_diarization(
+                    diarization_turns, raw_diarization_turns = run_diarization(
                         diarization_audio_path,
                         num_speakers=speaker_count,
                         auth_token=settings.diarization_auth_token,
@@ -358,6 +362,22 @@ async def transcribe(
             speaker_assignment_mode=speaker_assignment_mode,
             language=result.get("language"),
             gpu_enabled=gpu_enabled,
+            speaker_turns=[
+                SpeakerTurnOut(
+                    start=round(turn.start, 3),
+                    end=round(turn.end, 3),
+                    speaker_index=int(turn.label),
+                )
+                for turn in raw_diarization_turns
+            ],
+            overlap_regions=[
+                OverlapRegionOut(
+                    start=round(region.start, 3),
+                    end=round(region.end, 3),
+                    speaker_indices=region.speaker_indices,
+                )
+                for region in find_overlap_regions(raw_diarization_turns)
+            ],
         )
     finally:
         if diarization_audio_path and diarization_audio_path != temp_path:
@@ -496,6 +516,69 @@ async def master_audio(
         return result
 
     return MasterJobResponse(job_id=job_registry.submit(run))
+
+
+def parse_separation_params(params_json: str) -> SeparationParams:
+    try:
+        return SeparationParams.model_validate_json(params_json)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"params_json is not a valid separation configuration. Details: {exc.error_count()} invalid field(s).") from exc
+
+
+@app.post("/api/separate", response_model=MasterJobResponse)
+async def separate_audio(
+    audio: UploadFile = File(...),
+    params_json: str = Form(...),
+) -> MasterJobResponse:
+    params = parse_separation_params(params_json)
+    source_filename = audio.filename or "audio"
+    temp_path = await save_upload_to_temp(audio)
+
+    job_registry.purge_expired(settings.mastering_job_ttl_seconds, delete_artifact=delete_file_quietly)
+
+    def run(job, reporter) -> SeparationResult:
+        try:
+            result = run_separation(temp_path, source_filename, params, reporter)
+        finally:
+            delete_file_quietly(temp_path)
+        artifact = find_separation_artifact(result.token)
+        if artifact:
+            job.artifacts.append(str(artifact))
+        return result
+
+    return MasterJobResponse(job_id=job_registry.submit(run))
+
+
+def resolve_separation_artifact(token: str) -> Path:
+    artifact = find_separation_artifact(token)
+    if artifact is None or not artifact.is_file():
+        raise HTTPException(status_code=404, detail="No separated audio was found for this token. It may have expired.")
+    return artifact
+
+
+@app.get("/api/separate/{token}/audio")
+def separated_audio_file(token: str) -> FileResponse:
+    artifact = resolve_separation_artifact(token)
+    media_type = MASTER_MEDIA_TYPES.get(artifact.suffix.lower(), "application/octet-stream")
+    download_name = artifact.name.split("__", 1)[-1]
+    return FileResponse(str(artifact), media_type=media_type, filename=download_name)
+
+
+@app.get("/api/separate/{token}/waveform", response_model=WaveformAnalysisResponse)
+def separated_waveform(token: str) -> WaveformAnalysisResponse:
+    artifact = resolve_separation_artifact(token)
+    try:
+        return analyze_waveform(str(artifact))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.delete("/api/separate/{token}")
+def delete_separated(token: str) -> dict[str, str]:
+    artifact = find_separation_artifact(token)
+    if artifact:
+        delete_file_quietly(str(artifact))
+    return {"status": "deleted"}
 
 
 @app.get("/api/jobs/{job_id}", response_model=JobStatusResponse)

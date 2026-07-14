@@ -90,6 +90,20 @@ class WaveformAnalysisResponse(BaseModel):
     warnings: list[WarningItem] = Field(default_factory=list)
 
 
+class SpeakerTurnOut(BaseModel):
+    """One raw diarization turn; turns of different speakers may overlap."""
+
+    start: float
+    end: float
+    speaker_index: int
+
+
+class OverlapRegionOut(BaseModel):
+    start: float
+    end: float
+    speaker_indices: list[int]
+
+
 class TranscriptResponse(BaseModel):
     audio_filename: str
     duration: float | None = None
@@ -103,6 +117,8 @@ class TranscriptResponse(BaseModel):
     speaker_assignment_mode: SpeakerAssignmentMode = "word"
     language: str | None = None
     gpu_enabled: bool
+    speaker_turns: list[SpeakerTurnOut] = Field(default_factory=list)
+    overlap_regions: list[OverlapRegionOut] = Field(default_factory=list)
 
 
 class RetranscribeRangeResponse(BaseModel):

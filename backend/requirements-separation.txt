@@ -1,0 +1,9 @@
+# Runtime dependencies for the UniSE overlap-separation engine
+# (vendor/unified-audio/QuarkAudio-UniSE). The vendored requirements.txt is a
+# full training-environment dump; inference only needs these on top of the
+# base + denoise requirements (torch/torchaudio/transformers/pytorch-lightning
+# already arrive via whisperx, einops via requirements-denoise.txt).
+x-transformers==2.3.1
+einx
+soxr
+safetensors
