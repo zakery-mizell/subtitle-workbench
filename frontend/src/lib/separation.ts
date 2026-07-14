@@ -101,6 +101,69 @@ export function separatedAudioUrl(apiBaseUrl: string, token: string): string {
   return `${apiBaseUrl}/api/separate/${token}/audio`;
 }
 
+export interface SoloTrackOut {
+  speaker_index: number;
+  token: string;
+  output_filename: string;
+}
+
+export interface SoloRegionReport {
+  start: number;
+  end: number;
+  speaker_index: number;
+  applied: boolean;
+  detail: string | null;
+}
+
+export interface SoloTracksResult {
+  tracks: SoloTrackOut[];
+  regions: SoloRegionReport[];
+  output_format: string;
+  device_used: string;
+  warnings: WarningItem[];
+}
+
+export interface SoloTracksJobStatus {
+  id: string;
+  status: "queued" | "running" | "done" | "error";
+  stage: string;
+  progress: number;
+  message: string | null;
+  error: string | null;
+  result: SoloTracksResult | null;
+}
+
+export async function startSoloTracksJob(
+  apiBaseUrl: string,
+  audioFile: File,
+  regions: OverlapRegion[],
+  turns: SpeakerTurn[],
+): Promise<string> {
+  const params = {
+    regions,
+    turns: turns.map((turn) => ({ start: turn.start, end: turn.end, speaker_index: turn.speaker_index })),
+    output: { format: "wav", bitrate_kbps: null },
+  };
+  const formData = new FormData();
+  formData.append("audio", audioFile);
+  formData.append("params_json", JSON.stringify(params));
+  const response = await fetch(`${apiBaseUrl}/api/separate-solo`, { method: "POST", body: formData });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => null);
+    throw new Error(detail?.detail ?? `Solo track request failed (${response.status}).`);
+  }
+  const payload = (await response.json()) as { job_id: string };
+  return payload.job_id;
+}
+
+export async function fetchSoloTracksJob(apiBaseUrl: string, jobId: string): Promise<SoloTracksJobStatus> {
+  const response = await fetch(`${apiBaseUrl}/api/jobs/${jobId}`);
+  if (!response.ok) {
+    throw new Error(`Could not read solo track job status (${response.status}).`);
+  }
+  return (await response.json()) as SoloTracksJobStatus;
+}
+
 export function describeOverlapSpeakers(region: OverlapRegion, names: Map<number, string>): string {
   return region.speaker_indices.map((index) => names.get(index) ?? `Speaker ${index + 1}`).join(" + ");
 }

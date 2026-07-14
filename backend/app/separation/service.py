@@ -16,11 +16,20 @@ import numpy as np
 from ..config import settings
 from ..diarization import SpeakerTurn
 from ..jobs import ProgressReporter
-from ..mastering.audio_io import decode_master, encode_master
+from ..mastering.audio_io import MasterAudio, decode_master, encode_master
 from ..schemas import WarningItem
 from . import blend
 from .overlap import pick_enrollment_span
-from .schemas import RegionReport, SeparationParams, SeparationResult, StemWord
+from .schemas import (
+    RegionReport,
+    SeparationParams,
+    SeparationResult,
+    SoloRegionReport,
+    SoloTrackOut,
+    SoloTracksParams,
+    SoloTracksResult,
+    StemWord,
+)
 from .unise_engine import UNISE_SAMPLE_RATE, SeparationUnavailable, load_engine
 
 REGION_PAD_SECONDS = 0.35
@@ -39,12 +48,12 @@ def find_separation_artifact(token: str) -> Path | None:
     return matches[0] if matches else None
 
 
-def _output_paths(source_filename: str, fmt: str) -> tuple[str, Path]:
+def _output_paths(source_filename: str, fmt: str, suffix: str = "separated") -> tuple[str, Path]:
     token = f"s_{uuid.uuid4().hex[:12]}"
     stem = Path(source_filename or "audio").stem or "audio"
     output_dir = separation_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
-    return token, output_dir / f"{token}__{stem}.separated.{fmt}"
+    return token, output_dir / f"{token}__{stem}.{suffix}.{fmt}"
 
 
 def decode_mono_16k(source_path: str) -> np.ndarray:
@@ -114,6 +123,154 @@ def _transcribe_stem(
                 continue
             words.append(StemWord(text=text, start=round(start, 3), end=round(end, 3)))
     return words
+
+
+def run_solo_tracks(
+    source_path: str,
+    source_filename: str,
+    params: SoloTracksParams,
+    reporter: ProgressReporter,
+) -> SoloTracksResult:
+    """Render one playback track per speaker involved in any overlap.
+
+    Each track is the untouched original except inside overlap regions, where
+    the mixture is replaced by that speaker's isolated voice (UniSE tse). The
+    frontend's solo selector gates the rest, so "Only X" plays X's original
+    solo speech plus X alone through the overlaps.
+    """
+    warnings: list[WarningItem] = []
+
+    reporter.stage("decode", 0.0, 0.06, "Decoding audio")
+    original = decode_master(source_path)
+    mix16 = decode_mono_16k(source_path)
+    duration16 = mix16.size / UNISE_SAMPLE_RATE
+
+    reporter.stage("load_model", 0.06, 0.16, "Loading UniSE separation model")
+    try:
+        engine = load_engine()
+    except SeparationUnavailable as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    turns = [
+        SpeakerTurn(start=turn.start, end=turn.end, label=str(turn.speaker_index))
+        for turn in params.turns
+    ]
+    speaker_indices = sorted({index for region in params.regions for index in region.speaker_indices})
+
+    work_items = [
+        (speaker, region)
+        for speaker in speaker_indices
+        for region in params.regions
+        if speaker in region.speaker_indices
+    ]
+    tracks: list[SoloTrackOut] = []
+    reports: list[SoloRegionReport] = []
+    span_start, span_end = 0.16, 0.90
+    done = 0
+
+    for speaker in speaker_indices:
+        samples = original.samples.copy()
+        applied_any = False
+
+        regions = [region for region in params.regions if speaker in region.speaker_indices]
+        enrollment_span = pick_enrollment_span(turns, speaker, near=regions[0].start)
+        enroll_audio = _seconds_slice(mix16, *enrollment_span) if enrollment_span else None
+
+        for region in regions:
+            stage_lo = span_start + (span_end - span_start) * done / len(work_items)
+            stage_hi = span_start + (span_end - span_start) * (done + 1) / len(work_items)
+            done += 1
+            reporter.stage(
+                "separate",
+                stage_lo,
+                stage_hi,
+                f"Isolating speaker {speaker + 1} in overlap at {region.start:.1f}s",
+            )
+            report = SoloRegionReport(
+                start=region.start, end=region.end, speaker_index=speaker, applied=False
+            )
+            reports.append(report)
+
+            if enroll_audio is None:
+                report.detail = "No clean solo speech was found for this speaker."
+                continue
+            if region.end - region.start < MIN_REGION_SECONDS or region.start >= duration16:
+                report.detail = "Region is too short to process."
+                continue
+
+            window_start = max(0.0, region.start - REGION_PAD_SECONDS)
+            window_end = min(duration16, region.end + REGION_PAD_SECONDS)
+            window_audio = _seconds_slice(mix16, window_start, window_end)
+
+            try:
+                stem = engine.run_task("tse", window_audio, enroll_audio, progress=reporter.tick)
+            except Exception:
+                if engine.device == "cpu":
+                    raise
+                warnings.append(
+                    WarningItem(
+                        code="separation_cpu_fallback",
+                        message="Separation failed on the GPU and was retried on the CPU, which is slower.",
+                    )
+                )
+                engine = load_engine("cpu")
+                stem = engine.run_task("tse", window_audio, enroll_audio, progress=reporter.tick)
+
+            blend.apply_replace(
+                samples,
+                original.sample_rate,
+                blend.RegionRender(
+                    start=window_start, stem=stem, region_start=region.start, region_end=region.end
+                ),
+                UNISE_SAMPLE_RATE,
+            )
+            report.applied = True
+            applied_any = True
+
+        if enrollment_span is None:
+            warnings.append(
+                WarningItem(
+                    code="separation_no_enrollment",
+                    message=(
+                        f"Speaker {speaker + 1} never speaks alone, so their solo track "
+                        "could not isolate the overlaps."
+                    ),
+                )
+            )
+        if not applied_any:
+            continue
+
+        token, output_path = _output_paths(source_filename, params.output.format, suffix=f"solo{speaker}")
+        encode_master(
+            MasterAudio(samples=samples, sample_rate=original.sample_rate),
+            str(output_path),
+            params.output.format,
+            params.output.bitrate_kbps,
+        )
+        tracks.append(
+            SoloTrackOut(
+                speaker_index=speaker,
+                token=token,
+                output_filename=output_path.name.split("__", 1)[1],
+            )
+        )
+
+    reporter.stage("encode", 0.90, 1.0, "Finishing solo tracks")
+    if not tracks:
+        warnings.append(
+            WarningItem(
+                code="separation_nothing_applied",
+                message="No solo tracks could be prepared for this recording.",
+            )
+        )
+
+    return SoloTracksResult(
+        tracks=tracks,
+        regions=reports,
+        output_format=params.output.format,
+        device_used=engine.device,
+        warnings=warnings,
+    )
 
 
 def run_separation(

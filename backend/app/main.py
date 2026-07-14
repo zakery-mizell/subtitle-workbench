@@ -24,8 +24,8 @@ from .mastering.pipeline import find_master_artifact, run_mastering
 from .mastering.schemas import JobStatusResponse, MasterJobResponse, MasteringParams
 from .schemas import CapabilitiesResponse, Caption, OverlapRegionOut, Paragraph, RetranscribeRangeResponse, SpeakerAssignmentMode, SpeakerInput, SpeakerTurnOut, TranscriptResponse, WarningItem, WaveformAnalysisResponse, WordToken
 from .separation.overlap import find_overlap_regions
-from .separation.schemas import SeparationParams, SeparationResult
-from .separation.service import find_separation_artifact, run_separation
+from .separation.schemas import SeparationParams, SeparationResult, SoloTracksParams, SoloTracksResult
+from .separation.service import find_separation_artifact, run_separation, run_solo_tracks
 from .text_processing import build_captions, build_guide_blocks, build_paragraphs, build_words, remove_disfluencies
 from .waveform_analysis import analyze_waveform
 from .whisperx_transcription import transcribe_with_whisperx
@@ -544,6 +544,34 @@ async def separate_audio(
         artifact = find_separation_artifact(result.token)
         if artifact:
             job.artifacts.append(str(artifact))
+        return result
+
+    return MasterJobResponse(job_id=job_registry.submit(run))
+
+
+@app.post("/api/separate-solo", response_model=MasterJobResponse)
+async def separate_solo_tracks(
+    audio: UploadFile = File(...),
+    params_json: str = Form(...),
+) -> MasterJobResponse:
+    try:
+        params = SoloTracksParams.model_validate_json(params_json)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"params_json is not a valid solo-tracks configuration. Details: {exc.error_count()} invalid field(s).") from exc
+    source_filename = audio.filename or "audio"
+    temp_path = await save_upload_to_temp(audio)
+
+    job_registry.purge_expired(settings.mastering_job_ttl_seconds, delete_artifact=delete_file_quietly)
+
+    def run(job, reporter) -> SoloTracksResult:
+        try:
+            result = run_solo_tracks(temp_path, source_filename, params, reporter)
+        finally:
+            delete_file_quietly(temp_path)
+        for track in result.tracks:
+            artifact = find_separation_artifact(track.token)
+            if artifact:
+                job.artifacts.append(str(artifact))
         return result
 
     return MasterJobResponse(job_id=job_registry.submit(run))

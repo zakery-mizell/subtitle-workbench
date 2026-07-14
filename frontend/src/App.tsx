@@ -38,6 +38,7 @@ import { formatClock, formatGutterClock } from "./lib/time";
 import MasteringPanel from "./MasteringPanel";
 import OverlapsPanel from "./OverlapsPanel";
 import type { RegionReport, SeparationResult } from "./lib/separation";
+import { fetchSoloTracksJob, separatedAudioUrl, startSoloTracksJob } from "./lib/separation";
 import type {
   BackendCapabilities,
   Caption,
@@ -171,6 +172,20 @@ function buildSpeakerIntervals(words: WordToken[], speakerId: number): SoloInter
     .map((word) => ({ start: Math.max(0, word.start - SOLO_SPAN_PADDING_S), end: word.end + SOLO_SPAN_PADDING_S }))
     .sort((a, b) => a.start - b.start);
 
+  const merged: SoloInterval[] = [];
+  for (const span of spans) {
+    const previous = merged[merged.length - 1];
+    if (previous && span.start - previous.end <= SOLO_SPAN_MERGE_GAP_S) {
+      previous.end = Math.max(previous.end, span.end);
+    } else {
+      merged.push({ ...span });
+    }
+  }
+  return merged;
+}
+
+function mergeIntervalLists(...lists: SoloInterval[][]): SoloInterval[] {
+  const spans = lists.flat().sort((a, b) => a.start - b.start);
   const merged: SoloInterval[] = [];
   for (const span of spans) {
     const previous = merged[merged.length - 1];
@@ -2520,6 +2535,12 @@ function App() {
   const [playbackRate, setPlaybackRate] = useState(1);
   const [userMuted, setUserMuted] = useState(false);
   const [soloSpeakerId, setSoloSpeakerId] = useState<number | null>(null);
+  // Auto-prepared per-speaker tracks whose overlap sections contain only that
+  // speaker's separated voice; keyed by speaker index (appearance order).
+  const [soloTracks, setSoloTracks] = useState<{
+    status: "idle" | "running" | "done" | "error";
+    tracks: Record<number, { url: string; token: string }>;
+  }>({ status: "idle", tracks: {} });
   const [themeDark, setThemeDark] = useState(() => window.localStorage.getItem(THEME_STORAGE_KEY) === "dark");
   const [resumeProjectFile, setResumeProjectFile] = useState<File | null>(null);
   const [resumeAudioFile, setResumeAudioFile] = useState<File | null>(null);
@@ -2532,6 +2553,8 @@ function App() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const originalAudioRef = useRef<HTMLAudioElement | null>(null);
   const masteredAudioRef = useRef<HTMLAudioElement | null>(null);
+  const soloAudioRef = useRef<HTMLAudioElement | null>(null);
+  const soloTracksAttemptRef = useRef<string | null>(null);
   const userScrollAtRef = useRef(0);
   const viewOptionsRef = useRef<HTMLDivElement | null>(null);
   const paragraphRefs = useRef<Array<HTMLElement | null>>([]);
@@ -2543,6 +2566,14 @@ function App() {
   const activeWorkspace = history.present;
   const activeEditor = activeWorkspace?.editor ?? null;
   const currentAudioFilename = selectedFile?.name ?? session?.audio_filename ?? null;
+  const overlapRegions = useMemo<OverlapRegion[]>(() => session?.overlap_regions ?? [], [session]);
+  const speakerTurns = useMemo<SpeakerTurn[]>(() => session?.speaker_turns ?? [], [session]);
+  // Speaker indices are appearance order, which matches session.speakers order.
+  const soloSpeakerIndex = useMemo(
+    () => (soloSpeakerId === null ? -1 : (session?.speakers.findIndex((speaker) => speaker.id === soloSpeakerId) ?? -1)),
+    [session, soloSpeakerId],
+  );
+  const activeSoloTrack = soloSpeakerIndex >= 0 ? (soloTracks.tracks[soloSpeakerIndex] ?? null) : null;
 
   useEffect(() => {
     let cancelled = false;
@@ -2732,29 +2763,44 @@ function App() {
     };
   }, [acknowledgedLowConfidenceWordIds, activeWorkspace, clickToPlay, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, lowConfidenceThreshold, model, normalizeExportTimingTo30Fps, removeDisfluencies, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, speakerAssignmentMode, speakerCount, speakerInputs, viewMode]);
 
-  // Keep audioRef pointing at the active A/B element; only the active one is audible.
+  // Keep audioRef pointing at the active element; only the active one is audible.
+  // A ready solo track outranks the A/B pair while a speaker is soloed.
   useEffect(() => {
     const original = originalAudioRef.current;
     const mastered = masteredAudioRef.current;
-    const active = playbackSource === "processed" && mastered ? mastered : original;
+    const solo = soloAudioRef.current;
+    const active = solo ?? (playbackSource === "processed" && mastered ? mastered : original);
     if (!active) {
       return;
     }
+    const previous = audioRef.current;
     audioRef.current = active;
+    // Entering/leaving solo playback swaps elements with different content, so
+    // carry the position and play state across the swap.
+    if (previous && previous !== active && (previous === solo || active === solo)) {
+      if (Math.abs(active.currentTime - previous.currentTime) > 0.05) {
+        active.currentTime = previous.currentTime;
+      }
+      if (!previous.paused) {
+        previous.pause();
+        void active.play().catch(() => undefined);
+      }
+    }
     active.muted = false;
-    const inactive = active === mastered ? original : mastered;
-    if (inactive) {
-      inactive.muted = true;
+    for (const element of [original, mastered, solo]) {
+      if (element && element !== active) {
+        element.muted = true;
+      }
     }
     if (Number.isFinite(active.duration) && active.duration > 0) {
       setAudioDuration(active.duration);
     }
     setIsPlaying(!active.paused);
-  }, [playbackSource, processedAudio, audioUrl]);
+  }, [playbackSource, processedAudio, audioUrl, activeSoloTrack]);
 
   // Transport state: play/pause indicator, duration, speed, and user mute.
   useEffect(() => {
-    const elements = [originalAudioRef.current, masteredAudioRef.current].filter(
+    const elements = [originalAudioRef.current, masteredAudioRef.current, soloAudioRef.current].filter(
       (element): element is HTMLAudioElement => element !== null,
     );
     if (!elements.length) {
@@ -2786,15 +2832,15 @@ function App() {
         element.removeEventListener("durationchange", onMetadata);
       }
     };
-  }, [audioUrl, processedAudio, playbackSource]);
+  }, [audioUrl, processedAudio, playbackSource, activeSoloTrack]);
 
   useEffect(() => {
-    for (const element of [originalAudioRef.current, masteredAudioRef.current]) {
+    for (const element of [originalAudioRef.current, masteredAudioRef.current, soloAudioRef.current]) {
       if (element) {
         element.playbackRate = playbackRate;
       }
     }
-  }, [playbackRate, audioUrl, processedAudio]);
+  }, [playbackRate, audioUrl, processedAudio, activeSoloTrack]);
 
   function skipBy(seconds: number) {
     const audio = audioRef.current;
@@ -2805,7 +2851,7 @@ function App() {
   }
 
   useEffect(() => {
-    const elements = [originalAudioRef.current, masteredAudioRef.current].filter(
+    const elements = [originalAudioRef.current, masteredAudioRef.current, soloAudioRef.current].filter(
       (element): element is HTMLAudioElement => element !== null,
     );
     if (!elements.length || !activeEditor) {
@@ -2843,7 +2889,7 @@ function App() {
         element.removeEventListener("timeupdate", onTimeUpdate);
       }
     };
-  }, [activeEditor, skipCuts, processedAudio, audioUrl, playbackSource]);
+  }, [activeEditor, skipCuts, processedAudio, audioUrl, playbackSource, activeSoloTrack]);
 
   // While both timelines match, mirror play/pause/seek onto the muted peer so
   // switching between Original and Mastered is a gapless mute swap.
@@ -2895,10 +2941,25 @@ function App() {
     const spokenIds = new Set(activeWords.map((word) => word.speaker_id));
     return session.speakers.filter((speaker) => spokenIds.has(speaker.id));
   }, [session, activeWords]);
-  const soloIntervals = useMemo(
-    () => (soloSpeakerId === null ? [] : buildSpeakerIntervals(activeWords, soloSpeakerId)),
-    [activeWords, soloSpeakerId],
-  );
+  const soloIntervals = useMemo(() => {
+    if (soloSpeakerId === null) {
+      return [];
+    }
+    const wordIntervals = buildSpeakerIntervals(activeWords, soloSpeakerId);
+    if (!activeSoloTrack || soloSpeakerIndex < 0) {
+      return wordIntervals;
+    }
+    // The solo track already isolates this voice inside overlaps, so open the
+    // gate for every diarized turn — including overlap spans whose words never
+    // made it into the transcript.
+    const turnIntervals = speakerTurns
+      .filter((turn) => turn.speaker_index === soloSpeakerIndex)
+      .map((turn) => ({
+        start: Math.max(0, turn.start - SOLO_SPAN_PADDING_S),
+        end: turn.end + SOLO_SPAN_PADDING_S,
+      }));
+    return mergeIntervalLists(wordIntervals, turnIntervals);
+  }, [activeWords, soloSpeakerId, activeSoloTrack, soloSpeakerIndex, speakerTurns]);
 
   useEffect(() => {
     if (soloSpeakerId !== null && !soloableSpeakers.some((speaker) => speaker.id === soloSpeakerId)) {
@@ -2910,7 +2971,7 @@ function App() {
     const gateActive = soloSpeakerId !== null && soloIntervals.length > 0;
     const time = audioRef.current?.currentTime ?? 0;
     const audible = !userMuted && (!gateActive || timeInIntervals(time, soloIntervals));
-    for (const element of [originalAudioRef.current, masteredAudioRef.current]) {
+    for (const element of [originalAudioRef.current, masteredAudioRef.current, soloAudioRef.current]) {
       if (element) {
         element.volume = audible ? 1 : 0;
       }
@@ -2919,7 +2980,7 @@ function App() {
 
   useEffect(() => {
     applyPlaybackVolume();
-    const elements = [originalAudioRef.current, masteredAudioRef.current].filter(
+    const elements = [originalAudioRef.current, masteredAudioRef.current, soloAudioRef.current].filter(
       (element): element is HTMLAudioElement => element !== null,
     );
     const reapply = () => applyPlaybackVolume();
@@ -2933,7 +2994,63 @@ function App() {
         element.removeEventListener("seeked", reapply);
       }
     };
-  }, [applyPlaybackVolume, audioUrl, processedAudio, playbackSource]);
+  }, [applyPlaybackVolume, audioUrl, processedAudio, playbackSource, activeSoloTrack]);
+
+  // Solo tracks are prepared automatically: as soon as a transcription reports
+  // overlap regions, one background job renders a per-speaker version of the
+  // recording whose overlaps contain only that speaker's separated voice. The
+  // "Only <name>" selector then just works — no extra buttons. Main playback
+  // (All speakers) never uses these tracks.
+  useEffect(() => {
+    if (!session || !selectedFile || !overlapRegions.length || !speakerTurns.length) {
+      return;
+    }
+    const attemptKey = `${session.audio_filename}|${session.duration ?? 0}|${overlapRegions.length}`;
+    if (soloTracksAttemptRef.current === attemptKey) {
+      return;
+    }
+    soloTracksAttemptRef.current = attemptKey;
+    let cancelled = false;
+
+    async function prepare() {
+      setSoloTracks({ status: "running", tracks: {} });
+      try {
+        const jobId = await startSoloTracksJob(API_BASE_URL, selectedFile!, overlapRegions, speakerTurns);
+        while (!cancelled) {
+          const status = await fetchSoloTracksJob(API_BASE_URL, jobId);
+          if (status.status === "done" && status.result) {
+            const tracks: Record<number, { url: string; token: string }> = {};
+            for (const track of status.result.tracks) {
+              tracks[track.speaker_index] = {
+                url: separatedAudioUrl(API_BASE_URL, track.token),
+                token: track.token,
+              };
+            }
+            if (!cancelled) {
+              setSoloTracks({ status: "done", tracks });
+            }
+            return;
+          }
+          if (status.status === "error") {
+            if (!cancelled) {
+              setSoloTracks({ status: "error", tracks: {} });
+            }
+            return;
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 1500));
+        }
+      } catch {
+        if (!cancelled) {
+          setSoloTracks({ status: "error", tracks: {} });
+        }
+      }
+    }
+
+    void prepare();
+    return () => {
+      cancelled = true;
+    };
+  }, [session, selectedFile, overlapRegions, speakerTurns]);
 
   // While a speaker is soloed, also re-evaluate audibility every frame so the
   // mute gate tracks playback more tightly than timeupdate's ~4 Hz. This loop
@@ -2977,8 +3094,6 @@ function App() {
     () => buildQaReport(activeEditor?.captions ?? [], activeWords, glossaryMatches, lowConfidenceThreshold),
     [activeEditor, activeWords, glossaryMatches, lowConfidenceThreshold],
   );
-  const overlapRegions = useMemo<OverlapRegion[]>(() => session?.overlap_regions ?? [], [session]);
-  const speakerTurns = useMemo<SpeakerTurn[]>(() => session?.speaker_turns ?? [], [session]);
   const sidePanelMeta =
     sidePanelTab === "guide"
       ? {
@@ -3553,6 +3668,9 @@ function App() {
     setCurrentTime(0);
     setProcessedAudio(null);
     setPlaybackSource("original");
+    setSoloTracks({ status: "idle", tracks: {} });
+    setSoloSpeakerId(null);
+    soloTracksAttemptRef.current = null;
     if (audioUrl) {
       URL.revokeObjectURL(audioUrl);
     }
@@ -4979,6 +5097,11 @@ function App() {
           {processedAudio ? (
             <audio ref={masteredAudioRef} className="peer-audio-hidden" src={processedAudio.url} preload="auto" />
           ) : null}
+          {activeSoloTrack ? (
+            // Keyed by token so switching the soloed speaker remounts the
+            // element and playback position transfers instead of resetting.
+            <audio key={activeSoloTrack.token} ref={soloAudioRef} className="peer-audio-hidden" src={activeSoloTrack.url} preload="auto" />
+          ) : null}
           <WaveformTimeline
             analysis={waveformAnalysis}
             captions={activeEditor?.captions ?? []}
@@ -5027,6 +5150,19 @@ function App() {
                 <AudioLines size={12} aria-hidden />
                 &nbsp;{overlapRegions.length} overlap{overlapRegions.length === 1 ? "" : "s"} to untangle
               </button>
+            ) : null}
+            {soloTracks.status === "running" ? (
+              <span className="metric-chip" title="Preparing per-speaker audio so the Only-speaker selector isolates voices inside overlaps">
+                <Loader2 size={12} className="spin" aria-hidden /> Isolating overlap voices…
+              </span>
+            ) : null}
+            {soloTracks.status === "done" && Object.keys(soloTracks.tracks).length ? (
+              <span
+                className="metric-chip"
+                title="The Only-speaker selector now plays each voice alone, even through overlaps"
+              >
+                Solo voices ready
+              </span>
             ) : null}
           </div>
           {activeWarnings.length ? (

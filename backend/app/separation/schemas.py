@@ -67,3 +67,40 @@ class SeparationResult(BaseModel):
 
     def model_post_init(self, __context: Any) -> None:  # keep parity with mastering result shape
         return None
+
+
+class OverlapRegionIn(BaseModel):
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    speaker_indices: list[int] = Field(min_length=2)
+
+
+class SoloTracksParams(BaseModel):
+    """Auto-prepared per-speaker playback tracks: every overlap region is
+    replaced by that speaker's isolated voice, the rest stays original."""
+
+    regions: list[OverlapRegionIn] = Field(min_length=1)
+    turns: list[TurnInput] = Field(min_length=1)
+    output: SeparationOutputParams = SeparationOutputParams()
+
+
+class SoloTrackOut(BaseModel):
+    speaker_index: int
+    token: str
+    output_filename: str
+
+
+class SoloRegionReport(BaseModel):
+    start: float
+    end: float
+    speaker_index: int
+    applied: bool
+    detail: str | None = None
+
+
+class SoloTracksResult(BaseModel):
+    tracks: list[SoloTrackOut]
+    regions: list[SoloRegionReport]
+    output_format: str
+    device_used: str
+    warnings: list[WarningItem] = []
