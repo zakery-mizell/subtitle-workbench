@@ -15,6 +15,12 @@ Local web app for:
   - silence and filler-word ("um", "uh") cutting with subtitle timestamp remapping and Audacity label export
   - before/after loudness report (LUFS, LRA, true peak, noise floor)
   - encoded export: wav, flac, mp3, aac, opus
+- AI overlap separation ("Overlaps" tab + automatic solo tracks), fully local:
+  - detects regions where speakers talk over each other (raw pyannote diarization)
+  - automatically renders per-speaker solo tracks so "Only <name>" playback isolates each voice even inside overlaps
+  - spotlight one voice above a ducked mix, or mute a voice entirely, per overlap region
+  - recovers words that transcription lost inside overlaps and adds them to the transcript
+  - exports simultaneous speech as broadcast-style dialogue subtitles (one line per speaker)
 
 ## What is implemented
 
@@ -72,7 +78,8 @@ speaker changes; "Segment (stable)" is still available in the setup drawer.
 
 When a transcript has multiple speakers, the transport bar gains a speaker selector ("All speakers"
 / "Only <name>") that mutes playback outside the chosen speaker's words, so you can audit one voice
-at a time. It affects playback only, never exports.
+at a time. It affects playback only, never exports. With the UniSE overlap engine installed, the
+selector goes further: overlap sections play that speaker's AI-separated voice alone (see below).
 For very long files, the backend skips diarization by default and returns a single-speaker transcript with a warning. This avoids a second long GPU-heavy pass after Whisper finishes.
 
 ## Audio mastering ("Master" tab)
@@ -88,15 +95,62 @@ Notes:
 - After mastering, the player gets an Original/Mastered A/B toggle.
 - Long files: mastering is limited to 4 hours per file.
 
+## Overlapping speech ("Overlaps" tab + automatic solo tracks)
+
+When more than one speaker is configured, transcription also returns the raw (non-exclusive)
+diarization, so genuine overlaps survive. They show as translucent bands on the waveform and an
+"N overlaps to untangle" chip.
+
+Everything below needs the UniSE engine installed first (about 2.8 GB of checkpoints):
+
+```bash
+./scripts/install-unise.sh        # macOS
+powershell -ExecutionPolicy Bypass -File .\scripts\install-unise.ps1   # Windows
+```
+
+What it does:
+
+- **Automatic solo tracks** — after transcription, a background job renders one full-length track
+  per speaker in which every overlap is replaced by that speaker's isolated voice (UniSE
+  target-speaker extraction, enrollment picked from the speaker's nearest clean solo span). The
+  "Only <name>" selector uses these tracks transparently; "All speakers" playback always stays the
+  untouched original, so a false-positive overlap can never degrade normal listening. Finished
+  tracks persist across page reloads (artifacts are revalidated instead of re-rendered).
+- **Overlaps tab** — per-region controls to *spotlight* one voice (duck the original mix ~11 dB and
+  lay the separated voice on top) or *mute* one voice (replace the region with the
+  everyone-but-X reconstruction). The result plugs into the instant Original/Separated A/B toggle.
+- **Word recovery** — spotlighted stems are transcribed with WhisperX; recovered words (usually
+  lost, because mixed audio transcribes only the dominant voice) can be added to the transcript as
+  a caption for that speaker with one click.
+- **Dialogue subtitles** — captions of different speakers that share more than half of the shorter
+  one's duration export as a single dialogue cue (one line per speaker, "- " dashes or "NAME: "
+  prefixes), so the SRT never contains overlapping timecodes. In the editor those captions stay
+  separately editable, marked with an overlap badge, and playback highlights both.
+
+Notes:
+
+- Separation is generative 16 kHz re-synthesis confined to the overlap regions (the rest of the
+  audio is untouched, bit-for-bit). Words can occasionally warble — review recovered text before
+  trusting it, and treat spotlight/mute renders as listening/repair aids rather than mastering
+  output.
+- Inference cost scales with total overlap duration x speakers involved, not file length
+  (roughly 2.4x real-time per speaker per overlap on Apple Silicon MPS; much faster on CUDA).
+- UniSE model code is vendored into `vendor/unified-audio/` and checkpoints into
+  `checkpoints/unise/` by the install script; `backend/tools/demo_unise.py` builds a synthetic
+  two-voice overlap clip and verifies the engine end to end.
+
 ## Project layout
 
 - `backend/app/main.py`
 - `backend/app/text_processing.py`
 - `backend/app/mastering/` (audio post production pipeline)
-- `backend/app/jobs.py` (in-process job registry for mastering)
+- `backend/app/separation/` (UniSE overlap separation: engine, blending, overlap math)
+- `backend/app/jobs.py` (in-process job registry shared by mastering and separation)
 - `frontend/src/App.tsx`
 - `frontend/src/MasteringPanel.tsx`
+- `frontend/src/OverlapsPanel.tsx`
 - `scripts/install.ps1` (Windows) / `scripts/install.sh` (macOS)
+- `scripts/install-unise.ps1` / `scripts/install-unise.sh` (optional overlap-separation engine)
 
 ## Configure
 
