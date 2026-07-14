@@ -585,6 +585,7 @@ def resolve_separation_artifact(token: str) -> Path:
 
 
 @app.get("/api/separate/{token}/audio")
+@app.head("/api/separate/{token}/audio")  # reload revalidation probes artifacts with HEAD
 def separated_audio_file(token: str) -> FileResponse:
     artifact = resolve_separation_artifact(token)
     media_type = MASTER_MEDIA_TYPES.get(artifact.suffix.lower(), "application/octet-stream")

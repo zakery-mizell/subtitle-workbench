@@ -184,6 +184,10 @@ function buildSpeakerIntervals(words: WordToken[], speakerId: number): SoloInter
   return merged;
 }
 
+function soloTracksSessionKey(session: TranscriptResponse): string {
+  return `${session.audio_filename}|${session.duration ?? 0}|${(session.overlap_regions ?? []).length}`;
+}
+
 function mergeIntervalLists(...lists: SoloInterval[][]): SoloInterval[] {
   const spans = lists.flat().sort((a, b) => a.start - b.start);
   const merged: SoloInterval[] = [];
@@ -306,6 +310,9 @@ interface PersistedWorkspace {
   removeDisfluencies: boolean;
   acknowledgedLowConfidenceWordIds: string[];
   lowConfidenceThreshold: number;
+  // Finished auto solo-track artifacts (speaker index -> server token), keyed
+  // to the session so a reload can revalidate them instead of re-running UniSE.
+  soloTracks?: { key: string; tokens: Record<number, string> } | null;
 }
 
 interface ProjectAudioPayload {
@@ -2555,6 +2562,7 @@ function App() {
   const masteredAudioRef = useRef<HTMLAudioElement | null>(null);
   const soloAudioRef = useRef<HTMLAudioElement | null>(null);
   const soloTracksAttemptRef = useRef<string | null>(null);
+  const persistedSoloTokensRef = useRef<{ key: string; tokens: Record<number, string> } | null>(null);
   const userScrollAtRef = useRef(0);
   const viewOptionsRef = useRef<HTMLDivElement | null>(null);
   const paragraphRefs = useRef<Array<HTMLElement | null>>([]);
@@ -2672,6 +2680,10 @@ function App() {
               typeof saved.lowConfidenceThreshold === "number" && Number.isFinite(saved.lowConfidenceThreshold)
                 ? saved.lowConfidenceThreshold
                 : DEFAULT_LOW_CONFIDENCE_THRESHOLD,
+            soloTracks:
+              saved.soloTracks && typeof saved.soloTracks.key === "string" && saved.soloTracks.tokens
+                ? saved.soloTracks
+                : null,
           },
           {
             statusMessage: "Restored the last autosaved workspace. Reattach the audio file if you need playback.",
@@ -2761,7 +2773,7 @@ function App() {
         autosaveTimerRef.current = null;
       }
     };
-  }, [acknowledgedLowConfidenceWordIds, activeWorkspace, clickToPlay, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, lowConfidenceThreshold, model, normalizeExportTimingTo30Fps, removeDisfluencies, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, speakerAssignmentMode, speakerCount, speakerInputs, viewMode]);
+  }, [acknowledgedLowConfidenceWordIds, activeWorkspace, clickToPlay, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, lowConfidenceThreshold, model, normalizeExportTimingTo30Fps, removeDisfluencies, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, soloTracks, speakerAssignmentMode, speakerCount, speakerInputs, viewMode]);
 
   // Keep audioRef pointing at the active element; only the active one is audible.
   // A ready solo track outranks the A/B pair while a speaker is soloed.
@@ -3013,6 +3025,35 @@ function App() {
     let cancelled = false;
 
     async function prepare() {
+      // Reload path: previously rendered tracks whose artifacts still exist on
+      // the server are adopted as-is instead of re-running separation.
+      const persisted = persistedSoloTokensRef.current;
+      if (persisted && persisted.key === attemptKey && Object.keys(persisted.tokens).length) {
+        const entries = Object.entries(persisted.tokens);
+        const alive = await Promise.all(
+          entries.map(async ([, token]) => {
+            try {
+              const response = await fetch(separatedAudioUrl(API_BASE_URL, token), { method: "HEAD" });
+              return response.ok;
+            } catch {
+              return false;
+            }
+          }),
+        );
+        if (cancelled) {
+          return;
+        }
+        if (alive.length && alive.every(Boolean)) {
+          const tracks: Record<number, { url: string; token: string }> = {};
+          for (const [index, token] of entries) {
+            tracks[Number(index)] = { url: separatedAudioUrl(API_BASE_URL, token), token };
+          }
+          setSoloTracks({ status: "done", tracks });
+          return;
+        }
+        persistedSoloTokensRef.current = null; // expired on the server; re-render
+      }
+
       setSoloTracks({ status: "running", tracks: {} });
       try {
         const jobId = await startSoloTracksJob(API_BASE_URL, selectedFile!, overlapRegions, speakerTurns);
@@ -3479,6 +3520,15 @@ function App() {
       removeDisfluencies,
       acknowledgedLowConfidenceWordIds,
       lowConfidenceThreshold,
+      soloTracks:
+        session && soloTracks.status === "done" && Object.keys(soloTracks.tracks).length
+          ? {
+              key: soloTracksSessionKey(session),
+              tokens: Object.fromEntries(
+                Object.entries(soloTracks.tracks).map(([index, track]) => [index, track.token]),
+              ),
+            }
+          : (persistedSoloTokensRef.current ?? null),
     };
   }
 
@@ -3554,6 +3604,14 @@ function App() {
     if (options && "audioFile" in options) {
       setAudioFile(options.audioFile ?? null);
     }
+    // Adopt previously rendered solo tracks (revalidated by the auto-solo
+    // effect) instead of re-running separation after every reload.
+    persistedSoloTokensRef.current =
+      "soloTracks" in persisted && persisted.soloTracks?.key && persisted.soloTracks.tokens
+        ? persisted.soloTracks
+        : null;
+    soloTracksAttemptRef.current = null;
+    setSoloTracks({ status: "idle", tracks: {} });
 
     const restoredEditor =
       persisted.editor ??
@@ -3699,6 +3757,9 @@ function App() {
     setSoloTracks({ status: "idle", tracks: {} });
     setSoloSpeakerId(null);
     soloTracksAttemptRef.current = null;
+    // persistedSoloTokensRef survives on purpose: re-loading the session's own
+    // audio after a reload should adopt the finished tracks, and the session
+    // key check rejects tokens that belong to a different transcription.
     if (audioUrl) {
       URL.revokeObjectURL(audioUrl);
     }
