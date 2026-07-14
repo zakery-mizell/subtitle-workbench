@@ -72,18 +72,100 @@ function normalizeExportRange(
   };
 }
 
+// Two captions count as simultaneous dialogue when they belong to different
+// speakers and share more than half of the shorter one's duration.
+const DIALOGUE_OVERLAP_RATIO = 0.5;
+
+export function captionsAreSimultaneous(a: Caption, b: Caption): boolean {
+  if (a.speaker_id !== null && a.speaker_id === b.speaker_id) {
+    return false;
+  }
+  const overlap = Math.min(a.end, b.end) - Math.max(a.start, b.start);
+  if (overlap <= 0) {
+    return false;
+  }
+  const shorter = Math.min(a.end - a.start, b.end - b.start);
+  return shorter > 0 && overlap / shorter > DIALOGUE_OVERLAP_RATIO;
+}
+
+function flattenCaptionText(caption: Caption): string {
+  return caption.lines.join(" ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Merge simultaneous captions of different speakers into single dialogue cues
+ * (one line per speaker), so the exported SRT never contains overlapping
+ * timecodes — players render those unpredictably. Line prefixes follow the
+ * broadcast convention: "- " dashes, or "NAME: " when attribution is on.
+ */
+export function mergeSimultaneousCaptions(
+  captions: Caption[],
+  speakers: Speaker[],
+  includeSpeakerLabels: boolean,
+): Caption[] {
+  const speakerMap = new Map(speakers.map((speaker) => [speaker.id, speaker.name]));
+  const speakerConfig = new Map(speakers.map((speaker) => [speaker.id, speaker]));
+
+  const merged: Caption[] = [];
+  let group: Caption[] = [];
+
+  const flush = () => {
+    if (!group.length) {
+      return;
+    }
+    if (group.length === 1) {
+      merged.push(group[0]);
+    } else {
+      const lines = group.map((caption) => {
+        const label =
+          includeSpeakerLabels && speakerAllowsAttribution(caption, speakerConfig)
+            ? resolveSpeakerName(caption, speakerMap)
+            : null;
+        return `${label ? `${label}: ` : "- "}${flattenCaptionText(caption)}`;
+      });
+      merged.push({
+        id: `dialogue-${group.map((caption) => caption.id).join("+")}`,
+        start: Math.min(...group.map((caption) => caption.start)),
+        end: Math.max(...group.map((caption) => caption.end)),
+        speaker_id: null,
+        speaker_name: null,
+        lines,
+        word_ids: group.flatMap((caption) => caption.word_ids),
+        blank_after: group.some((caption) => caption.blank_after),
+      });
+    }
+    group = [];
+  };
+
+  for (const caption of captions) {
+    const joins =
+      group.length > 0 &&
+      group.some((member) => captionsAreSimultaneous(member, caption)) &&
+      !group.some((member) => member.speaker_id !== null && member.speaker_id === caption.speaker_id);
+    if (joins) {
+      group.push(caption);
+    } else {
+      flush();
+      group = [caption];
+    }
+  }
+  flush();
+  return merged;
+}
+
 export function captionsToSrt(
   captions: Caption[],
   speakers: Speaker[],
   extendToNextOnExport = false,
   normalizeTo30Fps = false,
 ): string {
-  const visibleCaptions = captions
+  const sortedCaptions = captions
     .filter((caption) => caption.lines.some((line) => line.trim()))
     .sort((left, right) => left.start - right.start || left.end - right.end);
   const speakerMap = new Map(speakers.map((speaker) => [speaker.id, speaker.name]));
   const speakerConfig = new Map(speakers.map((speaker) => [speaker.id, speaker]));
-  const includeSpeakerLabels = shouldIncludeSpeakerLabels(visibleCaptions, speakers);
+  const includeSpeakerLabels = shouldIncludeSpeakerLabels(sortedCaptions, speakers);
+  const visibleCaptions = mergeSimultaneousCaptions(sortedCaptions, speakers, includeSpeakerLabels);
 
   return visibleCaptions
     .map((caption, index) => {

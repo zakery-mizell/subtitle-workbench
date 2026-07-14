@@ -142,7 +142,9 @@ export async function startSoloTracksJob(
   const params = {
     regions,
     turns: turns.map((turn) => ({ start: turn.start, end: turn.end, speaker_index: turn.speaker_index })),
-    output: { format: "wav", bitrate_kbps: null },
+    // FLAC halves the disk footprint of these full-length per-speaker tracks
+    // (a 1 h recording is ~600 MB as 48 kHz WAV) and <audio> plays it fine.
+    output: { format: "flac", bitrate_kbps: null },
   };
   const formData = new FormData();
   formData.append("audio", audioFile);

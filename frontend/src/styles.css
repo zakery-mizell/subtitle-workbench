@@ -1253,6 +1253,22 @@ button.caption-time:hover {
   color: var(--muted-strong);
 }
 
+.caption-simultaneous-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.1rem 0.3rem;
+  border-radius: 999px;
+  border: 1px solid var(--overlap-band);
+  background: var(--overlap-band);
+  color: var(--playhead);
+  cursor: help;
+}
+
+.caption-card.is-simultaneous {
+  border-left: 2px solid var(--playhead);
+}
+
 .mastering-stats {
   width: 100%;
   border-collapse: collapse;

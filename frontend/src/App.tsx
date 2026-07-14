@@ -21,7 +21,7 @@ import {
   X,
 } from "lucide-react";
 
-import { buildExportFilename, captionsToSrt, guideToSrt } from "./lib/exporters";
+import { buildExportFilename, captionsAreSimultaneous, captionsToSrt, guideToSrt } from "./lib/exporters";
 import {
   appendGlossaryTerms,
   detectJargonCandidates,
@@ -3155,6 +3155,34 @@ function App() {
     return activeEditor.captions.findIndex((caption) => currentTime >= caption.start && currentTime <= caption.end);
   }, [activeEditor, currentTime]);
 
+  // Simultaneous speech renders as multiple co-timed captions; highlight all
+  // of them, not just the first one the playhead lands in.
+  const activeCaptionIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const caption of activeEditor?.captions ?? []) {
+      if (currentTime >= caption.start && currentTime <= caption.end) {
+        ids.add(caption.id);
+      }
+    }
+    return ids;
+  }, [activeEditor, currentTime]);
+
+  // Captions that co-occur with a different speaker's caption (they export as
+  // one dialogue cue and get a badge in the editor).
+  const simultaneousCaptionIds = useMemo(() => {
+    const ids = new Set<string>();
+    const sorted = [...(activeEditor?.captions ?? [])].sort((a, b) => a.start - b.start);
+    for (let i = 0; i < sorted.length; i += 1) {
+      for (let j = i + 1; j < sorted.length && sorted[j].start < sorted[i].end; j += 1) {
+        if (captionsAreSimultaneous(sorted[i], sorted[j])) {
+          ids.add(sorted[i].id);
+          ids.add(sorted[j].id);
+        }
+      }
+    }
+    return ids;
+  }, [activeEditor]);
+
   const activeParagraphIndex = useMemo(() => {
     if (!activeEditor) {
       return -1;
@@ -5283,7 +5311,7 @@ function App() {
                             ref={(node) => {
                               captionRefs.current[index] = node;
                             }}
-                            className={`caption-card ${caption.lines.length > 1 ? "is-multiline" : ""} ${index === activeCaptionIndex ? "is-active" : ""} ${caption.blank_after ? "has-gap" : ""}`}
+                            className={`caption-card ${caption.lines.length > 1 ? "is-multiline" : ""} ${activeCaptionIds.has(caption.id) ? "is-active" : ""} ${caption.blank_after ? "has-gap" : ""} ${simultaneousCaptionIds.has(caption.id) ? "is-simultaneous" : ""}`}
                             key={caption.id}
                           >
                             {multiSpeaker ? (
@@ -5325,6 +5353,14 @@ function App() {
                                   {event.kind === "overlap" ? <AlertTriangle size={11} aria-hidden /> : <ArrowLeftRight size={11} aria-hidden />}
                                 </button>
                               ))}
+                              {simultaneousCaptionIds.has(caption.id) ? (
+                                <span
+                                  className="caption-simultaneous-badge"
+                                  title="Plays at the same time as another speaker's caption. Exports as one dialogue subtitle with a line per speaker."
+                                >
+                                  <AudioLines size={11} aria-hidden />
+                                </span>
+                              ) : null}
                             </div>
                             <TimedTextEditor
                               className="subtitle-editor"
