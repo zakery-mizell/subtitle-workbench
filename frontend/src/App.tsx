@@ -6,6 +6,7 @@ import {
   BookOpen,
   ClipboardCheck,
   Download,
+  Gem,
   Info,
   Loader2,
   Pause,
@@ -37,6 +38,7 @@ import { parseSrt } from "./lib/srt";
 import { formatClock, formatGutterClock } from "./lib/time";
 import MasteringPanel from "./MasteringPanel";
 import OverlapsPanel from "./OverlapsPanel";
+import RestorePanel from "./RestorePanel";
 import type { RegionReport, SeparationResult } from "./lib/separation";
 import { fetchSoloTracksJob, separatedAudioUrl, startSoloTracksJob } from "./lib/separation";
 import type {
@@ -184,8 +186,10 @@ function buildSpeakerIntervals(words: WordToken[], speakerId: number): SoloInter
   return merged;
 }
 
-function soloTracksSessionKey(session: TranscriptResponse): string {
-  return `${session.audio_filename}|${session.duration ?? 0}|${(session.overlap_regions ?? []).length}`;
+function soloTracksSessionKey(session: TranscriptResponse, restore: boolean): string {
+  // The restore flag is part of the key so Diamond-restored tokens are never
+  // reused for a raw run (or vice versa) after a reload.
+  return `${session.audio_filename}|${session.duration ?? 0}|${(session.overlap_regions ?? []).length}|${restore ? "restore" : "raw"}`;
 }
 
 function mergeIntervalLists(...lists: SoloInterval[][]): SoloInterval[] {
@@ -230,6 +234,7 @@ const SIDE_PANEL_TABS = [
   { id: "jargon", label: "Vocab" },
   { id: "qa", label: "QA" },
   { id: "overlaps", label: "Overlaps" },
+  { id: "restore", label: "Restore" },
   { id: "master", label: "Master" },
   { id: "export", label: "Export" },
 ] as const;
@@ -238,6 +243,7 @@ const SIDE_PANEL_TAB_ICONS = {
   jargon: BookOpen,
   qa: ClipboardCheck,
   overlaps: AudioLines,
+  restore: Gem,
   master: Wand2,
   export: Download,
 } as const;
@@ -310,6 +316,8 @@ interface PersistedWorkspace {
   removeDisfluencies: boolean;
   acknowledgedLowConfidenceWordIds: string[];
   lowConfidenceThreshold: number;
+  // Whether the auto solo-tracks were (or should be) Diamond-restored.
+  restoreSoloTracks?: boolean;
   // Finished auto solo-track artifacts (speaker index -> server token), keyed
   // to the session so a reload can revalidate them instead of re-running UniSE.
   soloTracks?: { key: string; tokens: Record<number, string> } | null;
@@ -2548,6 +2556,10 @@ function App() {
     status: "idle" | "running" | "done" | "error";
     tracks: Record<number, { url: string; token: string }>;
   }>({ status: "idle", tracks: {} });
+  // When on, the auto-prepared solo tracks are regenerated at 44.1 kHz studio
+  // quality (Diamond) after voice isolation. Baked into the solo-tracks cache
+  // key so raw and restored renders never share tokens.
+  const [restoreSoloTracks, setRestoreSoloTracks] = useState(false);
   const [themeDark, setThemeDark] = useState(() => window.localStorage.getItem(THEME_STORAGE_KEY) === "dark");
   const [resumeProjectFile, setResumeProjectFile] = useState<File | null>(null);
   const [resumeAudioFile, setResumeAudioFile] = useState<File | null>(null);
@@ -2663,7 +2675,7 @@ function App() {
             showTimingHighlights: typeof saved.showTimingHighlights === "boolean" ? saved.showTimingHighlights : true,
             viewMode: saved.viewMode === "transcript" ? "transcript" : "subtitles",
             sidePanelTab:
-              saved.sidePanelTab === "jargon" || saved.sidePanelTab === "qa" || saved.sidePanelTab === "guide" || saved.sidePanelTab === "overlaps" || saved.sidePanelTab === "master" || saved.sidePanelTab === "export"
+              saved.sidePanelTab === "jargon" || saved.sidePanelTab === "qa" || saved.sidePanelTab === "guide" || saved.sidePanelTab === "overlaps" || saved.sidePanelTab === "restore" || saved.sidePanelTab === "master" || saved.sidePanelTab === "export"
                 ? saved.sidePanelTab
                 : "guide",
             isGuidePanelCollapsed: DEFAULT_GUIDE_PANEL_COLLAPSED,
@@ -2680,6 +2692,7 @@ function App() {
               typeof saved.lowConfidenceThreshold === "number" && Number.isFinite(saved.lowConfidenceThreshold)
                 ? saved.lowConfidenceThreshold
                 : DEFAULT_LOW_CONFIDENCE_THRESHOLD,
+            restoreSoloTracks: typeof saved.restoreSoloTracks === "boolean" ? saved.restoreSoloTracks : false,
             soloTracks:
               saved.soloTracks && typeof saved.soloTracks.key === "string" && saved.soloTracks.tokens
                 ? saved.soloTracks
@@ -2773,7 +2786,7 @@ function App() {
         autosaveTimerRef.current = null;
       }
     };
-  }, [acknowledgedLowConfidenceWordIds, activeWorkspace, clickToPlay, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, lowConfidenceThreshold, model, normalizeExportTimingTo30Fps, removeDisfluencies, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, soloTracks, speakerAssignmentMode, speakerCount, speakerInputs, viewMode]);
+  }, [acknowledgedLowConfidenceWordIds, activeWorkspace, clickToPlay, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, lowConfidenceThreshold, model, normalizeExportTimingTo30Fps, removeDisfluencies, restoreSoloTracks, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, soloTracks, speakerAssignmentMode, speakerCount, speakerInputs, viewMode]);
 
   // Keep audioRef pointing at the active element; only the active one is audible.
   // A ready solo track outranks the A/B pair while a speaker is soloed.
@@ -3017,7 +3030,7 @@ function App() {
     if (!session || !selectedFile || !overlapRegions.length || !speakerTurns.length) {
       return;
     }
-    const attemptKey = `${session.audio_filename}|${session.duration ?? 0}|${overlapRegions.length}`;
+    const attemptKey = soloTracksSessionKey(session, restoreSoloTracks);
     if (soloTracksAttemptRef.current === attemptKey) {
       return;
     }
@@ -3056,7 +3069,7 @@ function App() {
 
       setSoloTracks({ status: "running", tracks: {} });
       try {
-        const jobId = await startSoloTracksJob(API_BASE_URL, selectedFile!, overlapRegions, speakerTurns);
+        const jobId = await startSoloTracksJob(API_BASE_URL, selectedFile!, overlapRegions, speakerTurns, restoreSoloTracks);
         while (!cancelled) {
           const status = await fetchSoloTracksJob(API_BASE_URL, jobId);
           if (status.status === "done" && status.result) {
@@ -3091,7 +3104,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [session, selectedFile, overlapRegions, speakerTurns]);
+  }, [session, selectedFile, overlapRegions, speakerTurns, restoreSoloTracks]);
 
   // While a speaker is soloed, also re-evaluate audibility every frame so the
   // mute gate tracks playback more tightly than timeupdate's ~4 Hz. This loop
@@ -3154,6 +3167,12 @@ function App() {
               title: "Untangle simultaneous speech",
               detail: `${overlapRegions.length} overlap${overlapRegions.length === 1 ? "" : "s"} found`,
             }
+          : sidePanelTab === "restore"
+            ? {
+                eyebrow: "Restore",
+                title: "Diamond speech restoration",
+                detail: "Studio-quality 44.1 kHz",
+              }
           : sidePanelTab === "master"
             ? {
                 eyebrow: "Master",
@@ -3180,7 +3199,9 @@ function App() {
         ? `${glossaryTerms.length} term${glossaryTerms.length === 1 ? "" : "s"}`
         : sidePanelTab === "overlaps"
           ? `${overlapRegions.length} overlap${overlapRegions.length === 1 ? "" : "s"}`
-          : sidePanelTab === "master"
+          : sidePanelTab === "restore"
+            ? "Diamond restoration"
+            : sidePanelTab === "master"
             ? processedAudio
               ? "Processed audio loaded"
               : "Local processing"
@@ -3520,10 +3541,11 @@ function App() {
       removeDisfluencies,
       acknowledgedLowConfidenceWordIds,
       lowConfidenceThreshold,
+      restoreSoloTracks,
       soloTracks:
         session && soloTracks.status === "done" && Object.keys(soloTracks.tracks).length
           ? {
-              key: soloTracksSessionKey(session),
+              key: soloTracksSessionKey(session, restoreSoloTracks),
               tokens: Object.fromEntries(
                 Object.entries(soloTracks.tracks).map(([index, track]) => [index, track.token]),
               ),
@@ -3580,7 +3602,7 @@ function App() {
     setShowTimingHighlights(Boolean(persisted.showTimingHighlights));
     setViewMode(persisted.viewMode === "transcript" ? "transcript" : "subtitles");
     setSidePanelTab(
-      persisted.sidePanelTab === "jargon" || persisted.sidePanelTab === "qa" || persisted.sidePanelTab === "guide" || persisted.sidePanelTab === "overlaps" || persisted.sidePanelTab === "master" || persisted.sidePanelTab === "export"
+      persisted.sidePanelTab === "jargon" || persisted.sidePanelTab === "qa" || persisted.sidePanelTab === "guide" || persisted.sidePanelTab === "overlaps" || persisted.sidePanelTab === "restore" || persisted.sidePanelTab === "master" || persisted.sidePanelTab === "export"
         ? persisted.sidePanelTab
         : "guide",
     );
@@ -3604,6 +3626,7 @@ function App() {
     if (options && "audioFile" in options) {
       setAudioFile(options.audioFile ?? null);
     }
+    setRestoreSoloTracks(Boolean(persisted.restoreSoloTracks));
     // Adopt previously rendered solo tracks (revalidated by the auto-solo
     // effect) instead of re-running separation after every reload.
     persistedSoloTokensRef.current =
@@ -5248,9 +5271,13 @@ function App() {
             {soloTracks.status === "done" && Object.keys(soloTracks.tracks).length ? (
               <span
                 className="metric-chip"
-                title="The Only-speaker selector now plays each voice alone, even through overlaps"
+                title={
+                  restoreSoloTracks
+                    ? "The Only-speaker selector plays each Diamond-restored voice alone, even through overlaps"
+                    : "The Only-speaker selector now plays each voice alone, even through overlaps"
+                }
               >
-                Solo voices ready
+                {restoreSoloTracks ? "Solo voices ready · restored" : "Solo voices ready"}
               </span>
             ) : null}
           </div>
@@ -5798,10 +5825,16 @@ function App() {
                     turns={speakerTurns}
                     speakers={activeEditor?.speakers ?? speakerInputs}
                     language={activeWorkspace?.language ?? session?.language ?? null}
+                    restoreSoloTracks={restoreSoloTracks}
+                    onRestoreSoloTracksChange={setRestoreSoloTracks}
                     onProcessed={handleSeparationProcessed}
                     onApplyWords={applySeparatedWords}
                     onSeek={seekAudio}
                   />
+                ) : null}
+
+                {sidePanelTab === "restore" ? (
+                  <RestorePanel apiBaseUrl={API_BASE_URL} audioFile={selectedFile} />
                 ) : null}
 
                 {sidePanelTab === "master" ? (

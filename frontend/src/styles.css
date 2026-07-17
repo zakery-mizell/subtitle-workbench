@@ -1187,6 +1187,22 @@ button.caption-time:hover {
   gap: 0.55rem;
 }
 
+.restore-advanced > summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--muted);
+  padding: 0.15rem 0;
+}
+
+.restore-advanced[open] > summary {
+  margin-bottom: 0.45rem;
+}
+
+.restore-player {
+  width: 100%;
+  margin-top: 0.6rem;
+}
+
 .mastering-progress-track {
   width: 100%;
   height: 8px;

@@ -17,6 +17,7 @@ from ..config import settings
 from ..diarization import SpeakerTurn
 from ..jobs import ProgressReporter
 from ..mastering.audio_io import MasterAudio, decode_master, encode_master
+from ..restore.engine import RestoreUnavailable, restore_waveform
 from ..schemas import WarningItem
 from . import blend
 from .overlap import pick_enrollment_span
@@ -240,9 +241,37 @@ def run_solo_tracks(
         if not applied_any:
             continue
 
+        track_samples = samples
+        track_sr = original.sample_rate
+        if params.restore:
+            position = f"{speaker_indices.index(speaker) + 1}/{len(speaker_indices)}"
+            reporter.stage("restore", 0.90, 0.98, f"Restoring speaker {position}")
+
+            def restore_progress(fraction: float, message: str | None = None) -> None:
+                label = None
+                if message:
+                    label = f"Restoring speaker {position} — {message.removeprefix('Restoring ').strip()}"
+                reporter.tick(fraction, label)
+
+            # The assembled track can be stereo (channels, n); Diamond is mono.
+            mono = samples.mean(axis=0).astype(np.float32) if samples.shape[0] > 1 else samples[0]
+            try:
+                restored, out_sr = restore_waveform(mono, original.sample_rate, progress=restore_progress)
+                track_samples = restored[None, :]
+                track_sr = out_sr
+            except RestoreUnavailable as exc:
+                warnings.append(WarningItem(code="restore_unavailable", message=str(exc)))
+            except Exception as exc:  # graceful degradation: keep the unrestored track
+                warnings.append(
+                    WarningItem(
+                        code="restore_failed",
+                        message=f"Speaker {speaker + 1}'s track could not be restored. Details: {exc}",
+                    )
+                )
+
         token, output_path = _output_paths(source_filename, params.output.format, suffix=f"solo{speaker}")
         encode_master(
-            MasterAudio(samples=samples, sample_rate=original.sample_rate),
+            MasterAudio(samples=track_samples, sample_rate=track_sr),
             str(output_path),
             params.output.format,
             params.output.bitrate_kbps,

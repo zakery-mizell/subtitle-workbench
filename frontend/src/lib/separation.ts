@@ -138,10 +138,14 @@ export async function startSoloTracksJob(
   audioFile: File,
   regions: OverlapRegion[],
   turns: SpeakerTurn[],
+  restore = false,
 ): Promise<string> {
   const params = {
     regions,
     turns: turns.map((turn) => ({ start: turn.start, end: turn.end, speaker_index: turn.speaker_index })),
+    // When set, each per-speaker track is regenerated at 44.1 kHz studio quality
+    // (Diamond) after isolation; default keeps the raw separated stems.
+    restore,
     // FLAC halves the disk footprint of these full-length per-speaker tracks
     // (a 1 h recording is ~600 MB as 48 kHz WAV) and <audio> plays it fine.
     output: { format: "flac", bitrate_kbps: null },

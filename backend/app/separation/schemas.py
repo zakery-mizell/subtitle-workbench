@@ -82,6 +82,8 @@ class SoloTracksParams(BaseModel):
     regions: list[OverlapRegionIn] = Field(min_length=1)
     turns: list[TurnInput] = Field(min_length=1)
     output: SeparationOutputParams = SeparationOutputParams()
+    # Restore each assembled per-speaker track with Diamond (44.1 kHz output).
+    restore: bool = False
 
 
 class SoloTrackOut(BaseModel):

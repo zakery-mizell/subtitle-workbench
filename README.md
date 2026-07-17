@@ -139,18 +139,55 @@ Notes:
   `checkpoints/unise/` by the install script; `backend/tools/demo_unise.py` builds a synthetic
   two-voice overlap clip and verifies the engine end to end.
 
+## Speech restoration ("Restore")
+
+[Diamond](https://huggingface.co/nineninesix/diamond-1.0) (`nineninesix/diamond-1.0`) is a
+sequence-to-sequence model that resynthesizes clean speech from degraded input. Unlike the
+mastering denoiser, it regenerates the voice rather than filtering it, so it can repair heavy
+codec artefacts, clipping, and muffling that subtractive tools cannot.
+
+Install it first (python deps plus the model checkpoint, downloaded on install or lazily on first
+use):
+
+```bash
+./scripts/install-restore.sh        # macOS
+powershell -ExecutionPolicy Bypass -File .\scripts\install-restore.ps1   # Windows
+```
+
+Two usage modes:
+
+- **Standalone restore** — a background job that restores a whole uploaded file end to end and
+  returns a 44.1 kHz artifact (`POST /api/restore`, polled like mastering/separation). No
+  transcription or diarization is involved.
+- **Restored solo tracks** — pass `"restore": true` in the automatic solo-tracks job and each
+  assembled per-speaker track is run through Diamond after the overlaps are stitched in. If the
+  engine is unavailable the job degrades gracefully: it keeps the unrestored track and adds a
+  warning.
+
+Notes / caveats:
+
+- Diamond is **generative resynthesis**: content above ~8 kHz is generated, not recovered. Treat
+  the output as a repair/listening aid rather than a faithful capture.
+- It is **English-trained** and can occasionally smear or invent words on badly clipped audio —
+  listen before trusting it.
+- Slow on CPU (~11x real-time on Apple Silicon; much faster on CUDA). The device auto-policy is
+  cuda if available else cpu — it never auto-picks MPS, which measured *slower* than CPU here
+  because the tiny autoregressive kernels are launch-bound. Set `RESTORE_DEVICE` to override.
+
 ## Project layout
 
 - `backend/app/main.py`
 - `backend/app/text_processing.py`
 - `backend/app/mastering/` (audio post production pipeline)
 - `backend/app/separation/` (UniSE overlap separation: engine, blending, overlap math)
-- `backend/app/jobs.py` (in-process job registry shared by mastering and separation)
+- `backend/app/restore/` (Diamond speech-restoration engine + job service)
+- `backend/app/jobs.py` (in-process job registry shared by mastering, separation, and restore)
 - `frontend/src/App.tsx`
 - `frontend/src/MasteringPanel.tsx`
 - `frontend/src/OverlapsPanel.tsx`
 - `scripts/install.ps1` (Windows) / `scripts/install.sh` (macOS)
 - `scripts/install-unise.ps1` / `scripts/install-unise.sh` (optional overlap-separation engine)
+- `scripts/install-restore.ps1` / `scripts/install-restore.sh` (optional Diamond restore engine)
 
 ## Configure
 

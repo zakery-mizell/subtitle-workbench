@@ -1,0 +1,24 @@
+# Runtime dependencies for the Diamond speech-restoration engine
+# (nineninesix/diamond-1.0, pip package diamond-s2s + descript-audio-codec).
+#
+# This is NOT a plain `pip install -r` file: the pieces must be installed in a
+# specific order with mixed --no-deps, so use scripts/install-restore.sh (or
+# .ps1) which runs the exact dance below. It is documented here for reference.
+#
+# The catch: descript-audiotools pins protobuf<3.20, but this venv needs
+# protobuf 7 (onnxruntime). Installing the descript packages normally would
+# downgrade protobuf and break onnxruntime. So install them WITHOUT their deps,
+# then add only the runtime deps they actually need, then Diamond itself:
+#
+#   pip install --no-deps descript-audio-codec descript-audiotools
+#   pip install argbind ffmpy flatten-dict markdown2 pystoi randomname fire \
+#               torch-stoi tensorboard importlib_resources
+#   pip install --no-deps "git+https://github.com/nineninesix-ai/diamond-inference"
+#
+# The pip "dependency resolver" conflict warning about protobuf is expected and
+# harmless. julius, librosa, einops, omegaconf, safetensors, soundfile,
+# huggingface-hub, and torch/torchaudio already arrive via the base + denoise +
+# separation requirement sets, so they are not repeated here.
+#
+# The model checkpoint (diamond.safetensors + diamond.json) downloads from
+# Hugging Face into the repo's models/ cache on install (or lazily on first use).

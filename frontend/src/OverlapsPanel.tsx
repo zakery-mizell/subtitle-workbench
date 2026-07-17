@@ -31,6 +31,8 @@ interface OverlapsPanelProps {
   turns: SpeakerTurn[];
   speakers: Speaker[];
   language: string | null;
+  restoreSoloTracks: boolean;
+  onRestoreSoloTracksChange: (value: boolean) => void;
   onProcessed: (result: SeparationResult, audioUrl: string) => void;
   onApplyWords: (report: RegionReport) => void;
   onSeek: (time: number, options?: { play?: boolean }) => void;
@@ -51,6 +53,8 @@ export function OverlapsPanel({
   turns,
   speakers,
   language,
+  restoreSoloTracks,
+  onRestoreSoloTracksChange,
   onProcessed,
   onApplyWords,
   onSeek,
@@ -268,6 +272,27 @@ export function OverlapsPanel({
 
       {regions.length ? (
         <>
+          <div className="panel-section-heading">
+            <p className="eyebrow">Only-speaker playback</p>
+            <h3>Per-speaker solo tracks</h3>
+          </div>
+          <p className="helper-text">
+            The transport bar&apos;s Only-speaker selector plays each voice alone, isolating them inside overlaps.
+            These tracks are prepared automatically.
+          </p>
+          <label className="mastering-toggle">
+            <input
+              type="checkbox"
+              checked={restoreSoloTracks}
+              onChange={(event) => onRestoreSoloTracksChange(event.target.checked)}
+            />
+            <span>Restore voices (Diamond)</span>
+          </label>
+          <p className="helper-text">
+            Regenerates each solo track as studio-quality 44.1 kHz speech after isolation. English-trained and roughly
+            10× slower than real-time on this Mac; changing this re-renders the solo tracks.
+          </p>
+
           <label className="mastering-toggle">
             <input type="checkbox" checked={transcribeStems} onChange={(event) => setTranscribeStems(event.target.checked)} />
             <span>Transcribe spotlighted voices (recovers words lost in the overlap)</span>

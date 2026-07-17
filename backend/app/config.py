@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     mastering_device: str = "auto"
     mastering_job_ttl_seconds: float = 14400.0
     model_cache_dir: str = str(ROOT_DIR / "models")
+    # Diamond restore device (env RESTORE_DEVICE). None = auto: cuda if
+    # available else cpu (never auto-mps; see restore/engine.py device notes).
+    restore_device: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=str(ROOT_DIR / ".env"),
