@@ -4,10 +4,11 @@
 $ErrorActionPreference = "Stop"
 
 $RootDir = Split-Path -Parent $PSScriptRoot
-$VenvDir = & (Join-Path $PSScriptRoot "resolve-venv.ps1")
-$PythonBin = Join-Path $VenvDir "python.exe"
+. (Join-Path $PSScriptRoot "resolve-venv.ps1")
+$VenvDir = Resolve-WorkbenchVenv -Root $RootDir
+$PythonBin = Join-Path $VenvDir "Scripts\python.exe"
 if (-not (Test-Path $PythonBin)) {
-    $PythonBin = Join-Path $VenvDir "Scripts/python.exe"
+    $PythonBin = Join-Path $VenvDir "python.exe"
 }
 
 Write-Host "==> Installing Diamond python dependencies"
