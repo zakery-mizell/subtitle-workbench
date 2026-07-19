@@ -131,8 +131,9 @@ export function RestorePanel({ apiBaseUrl, audioFile }: RestorePanelProps) {
         }}
         onDragLeave={() => setDragActive(false)}
         onDrop={(event) => {
+          // preventDefault marks the drop as consumed; the window-level handler
+          // still clears the global overlay but leaves the workspace file alone.
           event.preventDefault();
-          event.stopPropagation();
           setDragActive(false);
           const dropped = event.dataTransfer.files?.[0];
           if (dropped) {

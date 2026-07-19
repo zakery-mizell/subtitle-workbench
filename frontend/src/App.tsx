@@ -3365,6 +3365,9 @@ function App() {
     const onDrop = (event: DragEvent) => {
       depth = 0;
       setGlobalDragActive(false);
+      if (event.defaultPrevented) {
+        return; // an inner dropzone (e.g. Restore) already consumed this file
+      }
       const file = event.dataTransfer?.files?.[0];
       if (file && (file.type.startsWith("audio/") || file.type.startsWith("video/"))) {
         event.preventDefault();
