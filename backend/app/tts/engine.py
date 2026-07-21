@@ -18,9 +18,9 @@ otherwise "sdpa". Importing qwen_tts prints a harmless flash-attn warning.
 """
 from __future__ import annotations
 
-import os
 import re
 import threading
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -94,7 +94,6 @@ class TtsEngine:
     """Loaded Qwen3-TTS model bound to one torch device."""
 
     def __init__(self, model_size: str, device: str) -> None:
-        os.environ.setdefault("HF_HOME", str(settings.model_cache_dir))
         if model_size not in MODEL_REPOS:
             raise TtsUnavailable(f"Unknown Qwen3-TTS model size: {model_size!r}.")
         try:
@@ -105,11 +104,32 @@ class TtsEngine:
                 "cloning was skipped. Install it with scripts/install-tts.sh (or .ps1)."
             ) from exc
 
-        repo_id = MODEL_REPOS[model_size]
-        # Left unwrapped so a device-specific load/download failure surfaces as a
-        # plain exception, which load_engine catches to fall back to CPU.
+        # Resolve the checkpoint to a local snapshot path with an explicit
+        # cache_dir, then load from that directory. Loading by repo id would
+        # use the ambient HF cache, whose location freezes at the FIRST
+        # transformers import -- and transcribe_with_whisperx points HF_HOME at
+        # the whisper cache before triggering that import, so a job that
+        # transcribes the reference first would re-download checkpoints into
+        # models/whisper (and its .py-named cache markers used to restart the
+        # dev reloader mid-job). A local directory path sidesteps the ambient
+        # cache for every internal loader call.
+        try:
+            from huggingface_hub import snapshot_download
+
+            local_path = snapshot_download(
+                MODEL_REPOS[model_size],
+                cache_dir=str(Path(settings.model_cache_dir) / "hub"),
+            )
+        except Exception as exc:  # download/network failures
+            raise TtsUnavailable(
+                f"The Qwen3-TTS checkpoint ({MODEL_REPOS[model_size]}) could not "
+                f"be downloaded. Details: {exc}"
+            ) from exc
+
+        # Left unwrapped so a device-specific load failure surfaces as a plain
+        # exception, which load_engine catches to fall back to CPU.
         self.model = Qwen3TTSModel.from_pretrained(
-            repo_id,
+            local_path,
             device_map=device,
             dtype=_dtype_for(device),
             attn_implementation=_attn_impl_for(device),

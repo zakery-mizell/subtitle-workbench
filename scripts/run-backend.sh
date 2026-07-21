@@ -14,4 +14,7 @@ fi
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 
 cd "$ROOT"
-exec "$VENV/bin/python" -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
+# --reload-dir backend: only watch source code. Model downloads write .py-named
+# files into the models/ HF caches, which would restart the server mid-job and
+# lose the in-process job registry.
+exec "$VENV/bin/python" -m uvicorn backend.app.main:app --reload --reload-dir backend --host 127.0.0.1 --port 8000

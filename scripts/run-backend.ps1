@@ -10,7 +10,10 @@ if (-not (Test-Path $venvPython)) {
 
 Push-Location $root
 try {
-  & $venvPython -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
+  # --reload-dir backend: only watch source code. Model downloads write
+  # .py-named files into the models/ HF caches, which would restart the
+  # server mid-job and lose the in-process job registry.
+  & $venvPython -m uvicorn backend.app.main:app --reload --reload-dir backend --host 127.0.0.1 --port 8000
 } finally {
   Pop-Location
 }
