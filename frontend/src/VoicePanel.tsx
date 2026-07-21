@@ -152,6 +152,7 @@ export function VoicePanel({ apiBaseUrl }: VoicePanelProps) {
         />
         <span>{file ? file.name : "Drag a reference clip here or click to choose one."}</span>
       </label>
+      <p className="helper-text">Only the first 30 seconds are used — a clean 3–10 second clip of one voice works best.</p>
 
       <label className="toggle-row">
         <input

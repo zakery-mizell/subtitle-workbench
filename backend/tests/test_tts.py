@@ -148,6 +148,26 @@ class TtsEndpointTests(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/api/tts/{result['token']}").status_code, 200)
         self.assertEqual(self.client.get(f"/api/tts/{result['token']}/audio").status_code, 404)
 
+    def test_auto_transcribe_runs_on_the_trimmed_reference(self) -> None:
+        # The transcript must describe the SAME audio the prompt encoder sees
+        # (decode_reference's 30s-trimmed output, 2400 samples in this mock),
+        # not the original upload -- a longer upload's transcript would derail
+        # ICL generation into re-speaking the reference.
+        import soundfile as sf
+
+        seen_frames: list[int] = []
+
+        def capturing_transcribe(audio_path, **kwargs):
+            seen_frames.append(sf.info(audio_path).frames)
+            return {"segments": [{"text": "hello there"}]}, [], False
+
+        with mock.patch("backend.app.whisperx_transcription.transcribe_with_whisperx", side_effect=capturing_transcribe):
+            payload = self._post('{"text": "Hi.", "output_format": "wav"}')
+
+        self.assertEqual(payload["status"], "done")
+        self.assertEqual(seen_frames, [2400])
+        self.client.delete(f"/api/tts/{payload['result']['token']}")
+
     def test_auto_transcribe_failure_falls_back_to_voice_signature(self) -> None:
         with mock.patch("backend.app.whisperx_transcription.transcribe_with_whisperx", side_effect=RuntimeError("asr down")):
             payload = self._post('{"text": "Read this aloud.", "output_format": "wav"}')

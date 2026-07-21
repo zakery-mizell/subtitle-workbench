@@ -8,6 +8,7 @@ from __future__ import annotations
 import subprocess
 import uuid
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import numpy as np
 
@@ -85,14 +86,19 @@ def decode_reference(source_path: str) -> tuple[np.ndarray, bool]:
 
 
 def _resolve_ref_text(
-    source_path: str,
+    ref_wav: np.ndarray,
     params: TtsParams,
     warnings: list[WarningItem],
 ) -> tuple[str | None, str]:
     """Return (ref_text, clone_mode): ICL "transcript" when a transcript exists.
 
-    A manual transcript wins; otherwise auto-transcribe the clip when enabled.
-    Any failure (exception or empty text) falls back to x-vector-only mode.
+    A manual transcript wins; otherwise auto-transcribe when enabled. The
+    transcription runs on `ref_wav` -- the SAME decoded, 30s-trimmed audio the
+    prompt encoder sees -- never on the original upload: transcribing a longer
+    upload would pair 30 s of reference codes with the transcript of the whole
+    file, and that mismatch derails ICL generation into re-speaking the
+    reference instead of the requested text. Any failure (exception or empty
+    text) falls back to x-vector-only mode.
     """
     manual = (params.ref_text or "").strip()
     if manual:
@@ -101,14 +107,26 @@ def _resolve_ref_text(
         return None, "voice-signature"
 
     try:
+        import soundfile as sf
+
         from ..whisperx_transcription import transcribe_with_whisperx
 
-        result, _, _ = transcribe_with_whisperx(
-            source_path,
-            model_name=params.whisper_model,
-            requested_language=_WHISPER_LANG.get(params.language),
-            hotwords=None,
-        )
+        Path(settings.temp_upload_dir).mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile(delete=False, suffix=".wav", dir=settings.temp_upload_dir) as handle:
+            ref_path = handle.name
+        try:
+            sf.write(ref_path, ref_wav, TTS_REFERENCE_RATE)
+            result, _, _ = transcribe_with_whisperx(
+                ref_path,
+                model_name=params.whisper_model,
+                requested_language=_WHISPER_LANG.get(params.language),
+                hotwords=None,
+            )
+        finally:
+            try:
+                Path(ref_path).unlink()
+            except FileNotFoundError:
+                pass
         text = " ".join(
             str(segment.get("text") or "").strip()
             for segment in (result.get("segments") or [])
@@ -150,7 +168,7 @@ def run_tts(
         )
 
     reporter.stage("ref_transcript", 0.05, 0.18, "Preparing the reference transcript")
-    ref_text, clone_mode = _resolve_ref_text(source_path, params, warnings)
+    ref_text, clone_mode = _resolve_ref_text(ref_wav, params, warnings)
 
     reporter.stage("load_model", 0.18, 0.30, f"Loading Qwen3-TTS {params.model_size} model")
     try:
