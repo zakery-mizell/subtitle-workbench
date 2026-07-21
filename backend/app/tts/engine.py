@@ -35,6 +35,16 @@ MODEL_REPOS = {
 # Silence stitched between chunks of a multi-chunk synthesis.
 CHUNK_GAP_SECONDS = 0.12
 
+# Runaway-generation guard. A reference transcript that mismatches the
+# reference audio can send ICL generation off the rails: instead of stopping
+# after the sentence, the model rambles until its (huge) default token budget
+# runs out -- measured >24 minutes for one sentence on MPS. The 12 Hz models
+# emit 12 codec frames per second of audio, so cap new tokens per chunk at a
+# generous multiple of the text length: ~3 frames/char covers even slow CJK
+# speech, plus a flat allowance for leading/trailing silence.
+MAX_NEW_TOKENS_PER_CHAR = 3
+MAX_NEW_TOKENS_FLOOR = 160
+
 # Sentence-boundary splitter that keeps the delimiter with its sentence; the
 # trailing alternative captures a final run with no terminal punctuation.
 _SENTENCE_RE = re.compile(r"[^.!?…。！？]*[.!?…。！？]+|[^.!?…。！？]+$")
@@ -132,6 +142,7 @@ class TtsEngine:
             text=text_chunk,
             language=language,
             voice_clone_prompt=prompt_items,
+            max_new_tokens=max_new_tokens_for(text_chunk),
         )
         return np.asarray(wavs[0], dtype=np.float32).reshape(-1), int(sr)
 
@@ -153,6 +164,11 @@ def load_engine(model_size: str, device_preference: str | None = None) -> TtsEng
             engine = TtsEngine(model_size, "cpu")
         _engine_cache[(engine.model_size, engine.device)] = engine
         return engine
+
+
+def max_new_tokens_for(text_chunk: str) -> int:
+    """Codec-token budget for one chunk (see the runaway guard note above)."""
+    return MAX_NEW_TOKENS_PER_CHAR * len(text_chunk) + MAX_NEW_TOKENS_FLOOR
 
 
 def _hard_split(sentence: str, max_chars: int) -> list[str]:

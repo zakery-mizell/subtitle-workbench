@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from backend.app import main
 from backend.app.tts import engine as tts_engine
 from backend.app.tts import service as tts_service
-from backend.app.tts.engine import split_text_into_chunks
+from backend.app.tts.engine import max_new_tokens_for, split_text_into_chunks
 
 
 class SplitTextTests(unittest.TestCase):
@@ -39,6 +39,14 @@ class SplitTextTests(unittest.TestCase):
     def test_unbreakable_long_word_stays_whole(self) -> None:
         word = "x" * 50
         self.assertEqual(split_text_into_chunks(word, max_chars=10), [word])
+
+    def test_max_new_tokens_scales_with_chunk_length(self) -> None:
+        # 12 codec frames/sec: the budget must comfortably cover normal speech
+        # (a 120-char English sentence is ~8 s ≈ 96 frames) while bounding
+        # runaway generation from a mismatched reference transcript.
+        self.assertEqual(max_new_tokens_for(""), 160)
+        self.assertEqual(max_new_tokens_for("a" * 120), 3 * 120 + 160)
+        self.assertGreater(max_new_tokens_for("a" * 120), 96)
 
 
 class FakeEngine:

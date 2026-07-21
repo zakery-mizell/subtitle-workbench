@@ -5,7 +5,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON_BIN="$("$ROOT_DIR/scripts/resolve-venv.sh")/python"
+source "$ROOT_DIR/scripts/resolve-venv.sh"
+PYTHON_BIN="$(resolve_workbench_venv "$ROOT_DIR")/bin/python"
 
 echo "==> Installing Qwen3-TTS python dependencies"
 # qwen-tts's normal install pins transformers==4.57.3 / accelerate==1.12.0 and

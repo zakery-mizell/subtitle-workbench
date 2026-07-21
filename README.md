@@ -208,6 +208,11 @@ Notes / caveats:
 
 - Long texts are synthesized sentence-by-sentence in chunks, so progress is visible and memory
   stays bounded.
+- A typed transcript that does not match the clip can derail ICL generation into a ramble;
+  synthesis is token-capped per chunk (~3 codec frames per character), so a bad transcript
+  truncates instead of hanging the job. Measured on Apple Silicon MPS: roughly 6x real-time
+  for both model sizes with an accurate transcript (a one-minute job for ~7 s of speech,
+  including reference transcription); much faster on CUDA.
 - Device auto-policy is cuda → mps → cpu (unlike Diamond, this model is compute-bound, so Apple
   Silicon MPS is worth it; voice clone needs float32 on MPS). Set `TTS_DEVICE` to override.
 - Clone responsibly: only clone voices you have the right to use.
