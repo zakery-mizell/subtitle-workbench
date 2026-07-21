@@ -28,6 +28,8 @@ from .restore.service import find_restore_artifact, run_restore
 from .separation.overlap import find_overlap_regions
 from .separation.schemas import SeparationParams, SeparationResult, SoloTracksParams, SoloTracksResult
 from .separation.service import find_separation_artifact, run_separation, run_solo_tracks
+from .tts.schemas import TtsParams, TtsResult
+from .tts.service import find_tts_artifact, run_tts
 from .text_processing import build_captions, build_guide_blocks, build_paragraphs, build_words, remove_disfluencies
 from .waveform_analysis import analyze_waveform
 from .whisperx_transcription import transcribe_with_whisperx
@@ -638,6 +640,70 @@ def restored_waveform(token: str) -> WaveformAnalysisResponse:
 @app.delete("/api/restore/{token}")
 def delete_restored(token: str) -> dict[str, str]:
     artifact = find_restore_artifact(token)
+    if artifact:
+        delete_file_quietly(str(artifact))
+    return {"status": "deleted"}
+
+
+def parse_tts_params(params_json: str) -> TtsParams:
+    try:
+        return TtsParams.model_validate_json(params_json)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"params_json is not a valid TTS configuration. Details: {exc.error_count()} invalid field(s).") from exc
+
+
+@app.post("/api/tts", response_model=MasterJobResponse)
+async def synthesize_tts(
+    audio: UploadFile = File(...),
+    params_json: str = Form("{}"),
+) -> MasterJobResponse:
+    params = parse_tts_params(params_json)
+    source_filename = audio.filename or "voice"
+    temp_path = await save_upload_to_temp(audio)
+
+    job_registry.purge_expired(settings.mastering_job_ttl_seconds, delete_artifact=delete_file_quietly)
+
+    def run(job, reporter) -> TtsResult:
+        try:
+            result = run_tts(temp_path, source_filename, params, reporter)
+        finally:
+            delete_file_quietly(temp_path)
+        artifact = find_tts_artifact(result.token)
+        if artifact:
+            job.artifacts.append(str(artifact))
+        return result
+
+    return MasterJobResponse(job_id=job_registry.submit(run))
+
+
+def resolve_tts_artifact(token: str) -> Path:
+    artifact = find_tts_artifact(token)
+    if artifact is None or not artifact.is_file():
+        raise HTTPException(status_code=404, detail="No synthesized audio was found for this token. It may have expired.")
+    return artifact
+
+
+@app.get("/api/tts/{token}/audio")
+@app.head("/api/tts/{token}/audio")  # reload revalidation probes artifacts with HEAD
+def tts_audio_file(token: str) -> FileResponse:
+    artifact = resolve_tts_artifact(token)
+    media_type = MASTER_MEDIA_TYPES.get(artifact.suffix.lower(), "application/octet-stream")
+    download_name = artifact.name.split("__", 1)[-1]
+    return FileResponse(str(artifact), media_type=media_type, filename=download_name)
+
+
+@app.get("/api/tts/{token}/waveform", response_model=WaveformAnalysisResponse)
+def tts_waveform(token: str) -> WaveformAnalysisResponse:
+    artifact = resolve_tts_artifact(token)
+    try:
+        return analyze_waveform(str(artifact))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.delete("/api/tts/{token}")
+def delete_tts(token: str) -> dict[str, str]:
+    artifact = find_tts_artifact(token)
     if artifact:
         delete_file_quietly(str(artifact))
     return {"status": "deleted"}

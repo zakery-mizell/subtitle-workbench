@@ -174,6 +174,44 @@ Notes / caveats:
   cuda if available else cpu — it never auto-picks MPS, which measured *slower* than CPU here
   because the tiny autoregressive kernels are launch-bound. Set `RESTORE_DEVICE` to override.
 
+## Voice cloning ("Voice")
+
+[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (`Qwen/Qwen3-TTS-12Hz-1.7B-Base`, Apache-2.0) is
+an open-weights text-to-speech model with instant voice cloning: give it a few seconds of any
+voice and it speaks arbitrary text in that voice. Everything runs locally — the reference clip
+and the synthesized audio never leave the machine.
+
+Install it first (python deps plus the 1.7B checkpoint, ~4.5 GB):
+
+```bash
+./scripts/install-tts.sh        # macOS
+powershell -ExecutionPolicy Bypass -File .\scripts\install-tts.ps1   # Windows
+```
+
+How it works (the "Voice" tab):
+
+- Drop in a reference clip (audio or video; a clean 3–10 second sample of one voice works best;
+  clips longer than 30 s are trimmed), type the text to speak, and run. The job is polled like
+  mastering/restore (`POST /api/tts`).
+- Cloning is highest-fidelity in **transcript mode**: the model conditions on the reference
+  audio *and* its transcript. The panel auto-transcribes the clip with WhisperX by default, or
+  you can type/correct the transcript yourself.
+- With no transcript at all (auto-transcribe off or failed), it falls back to **voice-signature
+  mode** — cloning from the speaker embedding alone. It still sounds like the speaker, but with
+  lower fidelity; the result is labeled accordingly.
+- Language select covers the 10 supported languages (Chinese, English, German, Italian,
+  Portuguese, Spanish, Japanese, Korean, French, Russian) plus Auto-detect.
+- Advanced: a smaller `0.6b` model variant (faster, ~2.5 GB, downloads lazily on first use) and
+  the WhisperX model used for reference transcription.
+
+Notes / caveats:
+
+- Long texts are synthesized sentence-by-sentence in chunks, so progress is visible and memory
+  stays bounded.
+- Device auto-policy is cuda → mps → cpu (unlike Diamond, this model is compute-bound, so Apple
+  Silicon MPS is worth it; voice clone needs float32 on MPS). Set `TTS_DEVICE` to override.
+- Clone responsibly: only clone voices you have the right to use.
+
 ## Project layout
 
 - `backend/app/main.py`
@@ -181,13 +219,16 @@ Notes / caveats:
 - `backend/app/mastering/` (audio post production pipeline)
 - `backend/app/separation/` (UniSE overlap separation: engine, blending, overlap math)
 - `backend/app/restore/` (Diamond speech-restoration engine + job service)
-- `backend/app/jobs.py` (in-process job registry shared by mastering, separation, and restore)
+- `backend/app/tts/` (Qwen3-TTS voice-cloning engine + job service)
+- `backend/app/jobs.py` (in-process job registry shared by mastering, separation, restore, and TTS)
 - `frontend/src/App.tsx`
 - `frontend/src/MasteringPanel.tsx`
 - `frontend/src/OverlapsPanel.tsx`
+- `frontend/src/VoicePanel.tsx`
 - `scripts/install.ps1` (Windows) / `scripts/install.sh` (macOS)
 - `scripts/install-unise.ps1` / `scripts/install-unise.sh` (optional overlap-separation engine)
 - `scripts/install-restore.ps1` / `scripts/install-restore.sh` (optional Diamond restore engine)
+- `scripts/install-tts.ps1` / `scripts/install-tts.sh` (optional Qwen3-TTS voice-cloning engine)
 
 ## Configure
 

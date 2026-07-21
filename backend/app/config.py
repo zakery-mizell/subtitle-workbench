@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     # Diamond restore device (env RESTORE_DEVICE). None = auto: cuda if
     # available else cpu (never auto-mps; see restore/engine.py device notes).
     restore_device: str | None = None
+    # Qwen3-TTS voice-clone device (env TTS_DEVICE). None = auto: cuda, else
+    # mps, else cpu (mps IS auto-picked here; see tts/engine.py device notes).
+    tts_device: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=str(ROOT_DIR / ".env"),

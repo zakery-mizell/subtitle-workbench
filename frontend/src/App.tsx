@@ -9,6 +9,7 @@ import {
   Gem,
   Info,
   Loader2,
+  Mic,
   Pause,
   Play,
   Redo2,
@@ -39,6 +40,7 @@ import { formatClock, formatGutterClock } from "./lib/time";
 import MasteringPanel from "./MasteringPanel";
 import OverlapsPanel from "./OverlapsPanel";
 import RestorePanel from "./RestorePanel";
+import VoicePanel from "./VoicePanel";
 import type { RegionReport, SeparationResult } from "./lib/separation";
 import { fetchSoloTracksJob, separatedAudioUrl, startSoloTracksJob } from "./lib/separation";
 import type {
@@ -235,6 +237,7 @@ const SIDE_PANEL_TABS = [
   { id: "qa", label: "QA" },
   { id: "overlaps", label: "Overlaps" },
   { id: "restore", label: "Restore" },
+  { id: "voice", label: "Voice" },
   { id: "master", label: "Master" },
   { id: "export", label: "Export" },
 ] as const;
@@ -244,6 +247,7 @@ const SIDE_PANEL_TAB_ICONS = {
   qa: ClipboardCheck,
   overlaps: AudioLines,
   restore: Gem,
+  voice: Mic,
   master: Wand2,
   export: Download,
 } as const;
@@ -2675,7 +2679,7 @@ function App() {
             showTimingHighlights: typeof saved.showTimingHighlights === "boolean" ? saved.showTimingHighlights : true,
             viewMode: saved.viewMode === "transcript" ? "transcript" : "subtitles",
             sidePanelTab:
-              saved.sidePanelTab === "jargon" || saved.sidePanelTab === "qa" || saved.sidePanelTab === "guide" || saved.sidePanelTab === "overlaps" || saved.sidePanelTab === "restore" || saved.sidePanelTab === "master" || saved.sidePanelTab === "export"
+              saved.sidePanelTab === "jargon" || saved.sidePanelTab === "qa" || saved.sidePanelTab === "guide" || saved.sidePanelTab === "overlaps" || saved.sidePanelTab === "restore" || saved.sidePanelTab === "voice" || saved.sidePanelTab === "master" || saved.sidePanelTab === "export"
                 ? saved.sidePanelTab
                 : "guide",
             isGuidePanelCollapsed: DEFAULT_GUIDE_PANEL_COLLAPSED,
@@ -3173,6 +3177,12 @@ function App() {
                 title: "Diamond speech restoration",
                 detail: "Studio-quality 44.1 kHz",
               }
+            : sidePanelTab === "voice"
+              ? {
+                  eyebrow: "Voice",
+                  title: "Qwen3-TTS voice cloning",
+                  detail: "Clone any uploaded voice",
+                }
           : sidePanelTab === "master"
             ? {
                 eyebrow: "Master",
@@ -3201,6 +3211,8 @@ function App() {
           ? `${overlapRegions.length} overlap${overlapRegions.length === 1 ? "" : "s"}`
           : sidePanelTab === "restore"
             ? "Diamond restoration"
+            : sidePanelTab === "voice"
+              ? "Qwen3-TTS cloning"
             : sidePanelTab === "master"
             ? processedAudio
               ? "Processed audio loaded"
@@ -3605,7 +3617,7 @@ function App() {
     setShowTimingHighlights(Boolean(persisted.showTimingHighlights));
     setViewMode(persisted.viewMode === "transcript" ? "transcript" : "subtitles");
     setSidePanelTab(
-      persisted.sidePanelTab === "jargon" || persisted.sidePanelTab === "qa" || persisted.sidePanelTab === "guide" || persisted.sidePanelTab === "overlaps" || persisted.sidePanelTab === "restore" || persisted.sidePanelTab === "master" || persisted.sidePanelTab === "export"
+      persisted.sidePanelTab === "jargon" || persisted.sidePanelTab === "qa" || persisted.sidePanelTab === "guide" || persisted.sidePanelTab === "overlaps" || persisted.sidePanelTab === "restore" || persisted.sidePanelTab === "voice" || persisted.sidePanelTab === "master" || persisted.sidePanelTab === "export"
         ? persisted.sidePanelTab
         : "guide",
     );
@@ -5838,6 +5850,10 @@ function App() {
 
                 {sidePanelTab === "restore" ? (
                   <RestorePanel apiBaseUrl={API_BASE_URL} audioFile={selectedFile} />
+                ) : null}
+
+                {sidePanelTab === "voice" ? (
+                  <VoicePanel apiBaseUrl={API_BASE_URL} />
                 ) : null}
 
                 {sidePanelTab === "master" ? (

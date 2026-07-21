@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from ..restore.schemas import RestoreResult
 from ..schemas import WarningItem
 from ..separation.schemas import SeparationResult, SoloTracksResult
+from ..tts.schemas import TtsResult
 
 LevelerStrength = Literal["tight", "moderate", "soft"]
 CutApplyMode = Literal["apply", "silence", "list_only"]
@@ -155,5 +156,5 @@ class JobStatusResponse(BaseModel):
     progress: float
     message: str | None = None
     error: str | None = None
-    # Mastering, separation, and restore jobs share the registry and this shape.
-    result: "MasteringResult | SeparationResult | SoloTracksResult | RestoreResult | None" = None
+    # Mastering, separation, restore, and TTS jobs share the registry and shape.
+    result: "MasteringResult | SeparationResult | SoloTracksResult | RestoreResult | TtsResult | None" = None
