@@ -24,7 +24,11 @@ def _load_model() -> object:
     if MODEL_NAME in _model_cache:
         return _model_cache[MODEL_NAME]
 
-    os.environ.setdefault("HF_HOME", settings.model_cache_dir)
+    # Hard-set, not setdefault: transcribe_with_whisperx points HF_HOME at the
+    # whisper cache process-wide, so after any transcription in this process a
+    # setdefault is a no-op and ClearVoice's auxiliary checkpoints silently
+    # re-download into models/whisper.
+    os.environ["HF_HOME"] = str(settings.model_cache_dir)
     try:
         from clearvoice import ClearVoice
     except ImportError as exc:

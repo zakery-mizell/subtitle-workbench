@@ -104,7 +104,12 @@ class UniSEEngine:
         if message:
             raise SeparationUnavailable(message)
 
-        os.environ.setdefault("HF_HOME", settings.model_cache_dir)
+        # Hard-set, not setdefault: transcribe_with_whisperx points HF_HOME at
+        # the whisper cache process-wide, so after any transcription in this
+        # process a setdefault is a no-op and the vendored model's ambient-cache
+        # downloads (e.g. microsoft/wavlm-base-plus from model/model.py) silently
+        # re-download into models/whisper.
+        os.environ["HF_HOME"] = str(settings.model_cache_dir)
         import torch
 
         vendor_path = str(VENDOR_DIR)
