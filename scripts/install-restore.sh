@@ -5,7 +5,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON_BIN="$("$ROOT_DIR/scripts/resolve-venv.sh")/python"
+source "$ROOT_DIR/scripts/resolve-venv.sh"
+PYTHON_BIN="$(resolve_workbench_venv "$ROOT_DIR")/bin/python"
 
 echo "==> Installing Diamond python dependencies"
 # descript-audiotools pins protobuf<3.20, but this venv needs protobuf 7

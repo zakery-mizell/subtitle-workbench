@@ -6,7 +6,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENDOR_DIR="$ROOT_DIR/vendor/unified-audio"
-PYTHON_BIN="$("$ROOT_DIR/scripts/resolve-venv.sh")/python"
+source "$ROOT_DIR/scripts/resolve-venv.sh"
+PYTHON_BIN="$(resolve_workbench_venv "$ROOT_DIR")/bin/python"
 
 echo "==> Vendoring QuarkAudio-UniSE model code"
 if [ ! -f "$VENDOR_DIR/QuarkAudio-UniSE/model/model.py" ]; then
