@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import threading
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -58,7 +59,13 @@ class RestoreEngine:
     """Loaded Diamond model bound to one torch device."""
 
     def __init__(self, device: str) -> None:
-        os.environ.setdefault("HF_HOME", str(settings.model_cache_dir))
+        # Hard-set, not setdefault: transcribe_with_whisperx force-points
+        # HF_HOME at the whisper cache process-wide, and a job transcribes
+        # BEFORE loading this engine -- setdefault would silently re-download
+        # the checkpoint into models/whisper. Whisper re-asserts its own value
+        # on every call, so both modules stay deterministic. The explicit
+        # cache_dir below covers the code paths that ignore HF_HOME.
+        os.environ["HF_HOME"] = str(settings.model_cache_dir)
         try:
             from huggingface_hub import hf_hub_download
         except ImportError as exc:
@@ -80,8 +87,11 @@ class RestoreEngine:
         try:
             # Both files must land in the same snapshot dir; the .json config
             # sits next to the .safetensors weights (hf_hub_download does this).
-            checkpoint = hf_hub_download(CHECKPOINT_REPO, "diamond.safetensors")
-            hf_hub_download(CHECKPOINT_REPO, "diamond.json")
+            cache_dir = str(Path(settings.model_cache_dir) / "hub")
+            checkpoint = hf_hub_download(
+                CHECKPOINT_REPO, "diamond.safetensors", cache_dir=cache_dir
+            )
+            hf_hub_download(CHECKPOINT_REPO, "diamond.json", cache_dir=cache_dir)
         except Exception as exc:  # download/network failures
             raise RestoreUnavailable(
                 f"The Diamond checkpoint ({CHECKPOINT_REPO}) could not be "
