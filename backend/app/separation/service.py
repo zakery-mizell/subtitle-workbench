@@ -6,6 +6,7 @@ Mirrors the mastering pipeline's shape (token, artifact dir, ProgressReporter)
 so the API endpoints and frontend polling can work the same way.
 """
 
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
@@ -295,11 +296,30 @@ def run_solo_tracks(
                     )
                 )
 
-        token, output_path = _output_paths(source_filename, params.output.format, suffix=f"solo{speaker}")
+        # A gated track is mostly digital silence, so its bitrate is wildly
+        # uneven and a FLAC without a seektable seeks tens of seconds off (the
+        # browser interpolates time from byte offsets). Fall back to a container
+        # that seeks exactly on its own when the flac tools are missing.
+        track_format = params.output.format
+        if gated and track_format == "flac" and shutil.which("metaflac") is None:
+            track_format = "wav"
+            if not any(warning.code == "separation_seektable_missing" for warning in warnings):
+                warnings.append(
+                    WarningItem(
+                        code="separation_seektable_missing",
+                        message=(
+                            "Speaker tracks were written as WAV because exact seeking in a gated "
+                            "FLAC needs the `flac` command-line tools. Install flac for much "
+                            "smaller files."
+                        ),
+                    )
+                )
+
+        token, output_path = _output_paths(source_filename, track_format, suffix=f"solo{speaker}")
         encode_master(
             MasterAudio(samples=track_samples, sample_rate=track_sr),
             str(output_path),
-            params.output.format,
+            track_format,
             params.output.bitrate_kbps,
         )
         tracks.append(

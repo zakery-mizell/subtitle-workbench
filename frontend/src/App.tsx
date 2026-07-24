@@ -435,6 +435,7 @@ function timeInIntervals(time: number, intervals: SoloInterval[]): boolean {
   return intervalIndexAt(time, intervals) >= 0;
 }
 
+
 /**
  * Playback gain for the solo gate: 1 inside an interval, 0 outside, with a short
  * linear ramp just inside each edge. Runs in a requestAnimationFrame loop, so it

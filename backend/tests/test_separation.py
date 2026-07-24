@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
 from backend.app.diarization import SpeakerTurn
+from backend.app.mastering.audio_io import MasterAudio, add_flac_seekpoints, encode_master
+
+SEEKTABLE_BLOCK_TYPE = 3
 from backend.app.separation import blend
 from backend.app.separation.overlap import (
     find_overlap_regions,
@@ -214,6 +221,45 @@ class RegionGateTests(unittest.TestCase):
         self.assertTrue(blend.apply_region_gate(samples, sr, [(1.0, 9.0)]))  # must not raise
         self.assertEqual(samples.shape[1], int(2.0 * sr))
         self.assertGreater(float(np.abs(samples[0, int(1.5 * sr) :]).max()), 0.0)
+
+
+class FlacSeektableTests(unittest.TestCase):
+    """A gated FLAC without a seektable seeks tens of seconds off in a browser."""
+
+    @staticmethod
+    def _metadata_block_types(path: str) -> list[int]:
+        types: list[int] = []
+        with open(path, "rb") as handle:
+            self_magic = handle.read(4)
+            assert self_magic == b"fLaC"
+            while True:
+                header = handle.read(4)
+                types.append(header[0] & 0x7F)
+                size = int.from_bytes(b"\x00" + header[1:4], "big")
+                handle.seek(size, 1)
+                if header[0] & 0x80:
+                    return types
+
+    def test_encoded_flac_carries_a_seektable(self) -> None:
+        if shutil.which("metaflac") is None:
+            self.skipTest("metaflac is not installed")
+        tone = (np.sin(np.linspace(0, 400 * 2 * np.pi, 48000 * 3, dtype=np.float32)) * 0.2)[None, :]
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "tone.flac")
+            encode_master(MasterAudio(samples=tone, sample_rate=48000), path, "flac")
+            self.assertIn(SEEKTABLE_BLOCK_TYPE, self._metadata_block_types(path))
+
+    def test_add_seekpoints_reports_false_without_metaflac(self) -> None:
+        with mock.patch("backend.app.mastering.audio_io.shutil.which", return_value=None):
+            self.assertFalse(add_flac_seekpoints("/nonexistent.flac"))
+
+    def test_wav_output_is_untouched(self) -> None:
+        tone = (np.sin(np.linspace(0, 400 * 2 * np.pi, 48000, dtype=np.float32)) * 0.2)[None, :]
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "tone.wav")
+            encode_master(MasterAudio(samples=tone, sample_rate=48000), path, "wav")
+            with open(path, "rb") as handle:
+                self.assertEqual(handle.read(4), b"RIFF")
 
 
 if __name__ == "__main__":

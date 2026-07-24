@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from dataclasses import dataclass
 
@@ -113,6 +114,30 @@ ENCODER_ARGS: dict[str, list[str]] = {
 DEFAULT_BITRATES_KBPS: dict[str, int] = {"mp3": 192, "aac": 160, "opus": 128}
 
 
+def add_flac_seekpoints(path: str, interval: str = "1s") -> bool:
+    """Add a SEEKTABLE to a FLAC file so browsers can seek it exactly.
+
+    ffmpeg's FLAC muxer writes no seektable, and without one a browser maps time
+    to a byte offset by interpolating the average bitrate. That is roughly right
+    for continuous audio but catastrophic once the bitrate is uneven: a solo
+    track gated to one speaker is mostly digital silence, which costs almost no
+    bytes, and a seek to 20 s measured 54 s off. Requires the `flac` tools;
+    returns False when metaflac is unavailable so callers can pick a container
+    that seeks exactly on its own.
+    """
+    if shutil.which("metaflac") is None:
+        return False
+    try:
+        subprocess.run(
+            ["metaflac", f"--add-seekpoint={interval}", path],
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
 def encode_master(audio: MasterAudio, out_path: str, fmt: str, bitrate_kbps: int | None = None) -> None:
     """Encode float32 PCM to the requested format via ffmpeg stdin pipe."""
     if fmt not in ENCODER_ARGS:
@@ -146,6 +171,12 @@ def encode_master(audio: MasterAudio, out_path: str, fmt: str, bitrate_kbps: int
     except subprocess.CalledProcessError as exc:
         detail = exc.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"Could not encode the processed audio. Details: {detail}") from exc
+
+    if fmt == "flac":
+        # Best effort: every FLAC artifact here is scrubbed in the browser, so a
+        # seektable is always worth having. Callers that cannot tolerate loose
+        # seeking check for metaflac themselves and pick another container.
+        add_flac_seekpoints(out_path)
 
 
 def remove_dc_offset(audio: MasterAudio) -> MasterAudio:
