@@ -42,6 +42,10 @@ interface RegionsPanelProps {
   regions: SpeakerRegion[];
   /** True once manual edits replaced the audio-derived regions. */
   overrideActive: boolean;
+  /** True when the rendered per-speaker tracks predate the current regions. */
+  tracksStale: boolean;
+  /** True while a solo-track render is in flight. */
+  tracksRendering: boolean;
   frames: WaveformFrame[];
   speechSpans: SpeechSpan[];
   overlapRegions: OverlapRegion[];
@@ -52,6 +56,7 @@ interface RegionsPanelProps {
   theme: "light" | "dark";
   onChange: (regions: SpeakerRegion[]) => void;
   onReset: () => void;
+  onRerenderTracks: () => void;
   onSoloSpeakerChange: (speakerId: number | null) => void;
   onSeek: (time: number, options?: { play?: boolean }) => void;
 }
@@ -469,6 +474,8 @@ export function RegionsPanel({
   soloableSpeakerIds,
   regions,
   overrideActive,
+  tracksStale,
+  tracksRendering,
   frames,
   speechSpans,
   overlapRegions,
@@ -479,6 +486,7 @@ export function RegionsPanel({
   theme,
   onChange,
   onReset,
+  onRerenderTracks,
   onSoloSpeakerChange,
   onSeek,
 }: RegionsPanelProps) {
@@ -1016,6 +1024,12 @@ export function RegionsPanel({
           Regions are still derived from the audio. The first edit freezes them into a manual list.
         </p>
       )}
+      {tracksStale ? (
+        <p className="status-text">
+          The exported per-speaker tracks still use the regions from the last render. Re-render
+          them before running a conversion.
+        </p>
+      ) : null}
       <div className="inline-actions">
         <button
           type="button"
@@ -1028,6 +1042,13 @@ export function RegionsPanel({
           }}
         >
           Re-derive from audio
+        </button>
+        {/* Gated only on a render already being in flight. Staleness drives the
+            warning above, not this button: workspaces saved before tracks
+            carried a region signature can never report stale, and a failed
+            render needs a retry -- both would be dead ends otherwise. */}
+        <button type="button" disabled={tracksRendering} onClick={onRerenderTracks}>
+          {tracksRendering ? "Rendering speaker tracks…" : "Re-render speaker tracks"}
         </button>
       </div>
     </section>

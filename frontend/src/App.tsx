@@ -398,11 +398,33 @@ export function buildSpeakerRegionsFromSpeech(
   return bySpeaker;
 }
 
-function soloTracksSessionKey(session: TranscriptResponse, restore: boolean, regionCount: number): string {
+function soloTracksSessionKey(
+  session: TranscriptResponse,
+  restore: boolean,
+  regionCount: number,
+  renderNonce: number,
+): string {
   // The restore flag is part of the key so Diamond-restored tokens are never
   // reused for a raw run (or vice versa) after a reload. The region count stands
   // in for the gating envelope: re-derived regions must re-render the tracks.
-  return `${session.audio_filename}|${session.duration ?? 0}|${(session.overlap_regions ?? []).length}|${regionCount}|${restore ? "restore" : "raw"}`;
+  // Hand edits that only move boundaries keep the count, so the nonce carries an
+  // explicit re-render request -- rendering on every nudge would launch a
+  // minutes-long job per keystroke.
+  return `${session.audio_filename}|${session.duration ?? 0}|${(session.overlap_regions ?? []).length}|${regionCount}|${restore ? "restore" : "raw"}|n${renderNonce}`;
+}
+
+// Cheap FNV-1a over the gating envelope, to tell whether the rendered tracks
+// still match the regions on screen.
+function regionsSignature(regions: { start: number; end: number; speaker_index: number }[]): string {
+  let hash = 0x811c9dc5;
+  for (const region of regions) {
+    const text = `${region.speaker_index}:${region.start.toFixed(3)}:${region.end.toFixed(3)};`;
+    for (let index = 0; index < text.length; index++) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
+  }
+  return (hash >>> 0).toString(36);
 }
 
 function mergeIntervalLists(...lists: SoloInterval[][]): SoloInterval[] {
@@ -543,6 +565,12 @@ interface CaptionWordSyncOptions {
   preserveTiming?: boolean;
 }
 
+interface SoloTrackArtifacts {
+  key: string;
+  tokens: Record<number, string>;
+  regionsSignature?: string;
+}
+
 interface PersistedWorkspace {
   version: number;
   session: TranscriptResponse | null;
@@ -570,7 +598,13 @@ interface PersistedWorkspace {
   restoreSoloTracks?: boolean;
   // Finished auto solo-track artifacts (speaker index -> server token), keyed
   // to the session so a reload can revalidate them instead of re-running UniSE.
-  soloTracks?: { key: string; tokens: Record<number, string> } | null;
+  // regionsSignature is the gating envelope the artifacts were actually rendered
+  // against, so a reload can still tell that later hand edits left them stale.
+  soloTracks?: SoloTrackArtifacts | null;
+  // Bumped by "Re-render speaker tracks". It is part of the solo-track key, so
+  // it has to survive a reload -- otherwise the restored key can never match the
+  // one the render effect recomputes and every reload re-renders from scratch.
+  soloTrackRenderNonce?: number;
 }
 
 interface ProjectAudioPayload {
@@ -2911,6 +2945,13 @@ function App() {
     status: "idle" | "running" | "done" | "error";
     tracks: Record<number, { url: string; token: string }>;
   }>({ status: "idle", tracks: {} });
+  // Exported per-speaker tracks are gated to the regions as they were when the
+  // render ran; hand edits afterwards leave them stale until re-rendered. The
+  // nonce carries an explicit re-render request into the cache key -- rendering
+  // on every nudge would launch a minutes-long job per drag. Both are declared
+  // here because the autosave effect below persists them.
+  const [trackRenderNonce, setTrackRenderNonce] = useState(0);
+  const [renderedRegionsSignature, setRenderedRegionsSignature] = useState<string | null>(null);
   // When on, the auto-prepared solo tracks are regenerated at 44.1 kHz studio
   // quality (Diamond) after voice isolation. Baked into the solo-tracks cache
   // key so raw and restored renders never share tokens.
@@ -2929,7 +2970,7 @@ function App() {
   const masteredAudioRef = useRef<HTMLAudioElement | null>(null);
   const soloAudioRef = useRef<HTMLAudioElement | null>(null);
   const soloTracksAttemptRef = useRef<string | null>(null);
-  const persistedSoloTokensRef = useRef<{ key: string; tokens: Record<number, string> } | null>(null);
+  const persistedSoloTokensRef = useRef<SoloTrackArtifacts | null>(null);
   const userScrollAtRef = useRef(0);
   const viewOptionsRef = useRef<HTMLDivElement | null>(null);
   const paragraphRefs = useRef<Array<HTMLElement | null>>([]);
@@ -3138,7 +3179,7 @@ function App() {
         autosaveTimerRef.current = null;
       }
     };
-  }, [acknowledgedLowConfidenceWordIds, activeWorkspace, clickToPlay, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, lowConfidenceThreshold, model, normalizeExportTimingTo30Fps, removeDisfluencies, restoreSoloTracks, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, soloTracks, speakerAssignmentMode, speakerCount, speakerInputs, viewMode]);
+  }, [acknowledgedLowConfidenceWordIds, activeWorkspace, clickToPlay, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, lowConfidenceThreshold, model, normalizeExportTimingTo30Fps, removeDisfluencies, restoreSoloTracks, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, soloTracks, speakerAssignmentMode, speakerCount, speakerInputs, trackRenderNonce, viewMode]);
 
   // Keep audioRef pointing at the active element; only the active one is audible.
   // A ready solo track outranks the A/B pair while a speaker is soloed.
@@ -3442,6 +3483,10 @@ function App() {
     soloTrackRegionsRef.current = soloTrackRegions;
   }, [soloTrackRegions]);
 
+  const currentRegionsSignature = useMemo(() => regionsSignature(soloTrackRegions), [soloTrackRegions]);
+  const soloTracksStale =
+    renderedRegionsSignature !== null && renderedRegionsSignature !== currentRegionsSignature;
+
   // Solo tracks are prepared automatically: as soon as a transcription reports
   // overlap regions — or the captions yield snapped speaker regions — one
   // background job renders a per-speaker version of the recording whose overlaps
@@ -3453,7 +3498,7 @@ function App() {
     if (!session || !selectedFile || (!canSeparate && !soloTrackRegionCount)) {
       return;
     }
-    const attemptKey = soloTracksSessionKey(session, restoreSoloTracks, soloTrackRegionCount);
+    const attemptKey = soloTracksSessionKey(session, restoreSoloTracks, soloTrackRegionCount, trackRenderNonce);
     if (soloTracksAttemptRef.current === attemptKey) {
       return;
     }
@@ -3485,6 +3530,10 @@ function App() {
             tracks[Number(index)] = { url: separatedAudioUrl(API_BASE_URL, token), token };
           }
           setSoloTracks({ status: "done", tracks });
+          // These artifacts are gated to the regions recorded alongside them,
+          // not to whatever is on screen now: stamping the live regions here
+          // would re-mark hand-edited tracks as fresh on every reload.
+          setRenderedRegionsSignature(persisted.regionsSignature ?? null);
           return;
         }
         persistedSoloTokensRef.current = null; // expired on the server; re-render
@@ -3492,12 +3541,17 @@ function App() {
 
       setSoloTracks({ status: "running", tracks: {} });
       try {
+        // Freeze the envelope for this attempt: the signature stored with the
+        // artifacts has to describe exactly the regions that were sent, or the
+        // staleness check compares the tracks against regions they never used.
+        const renderedRegions = soloTrackRegionsRef.current;
+        const renderedSignature = regionsSignature(renderedRegions);
         const jobId = await startSoloTracksJob(
           API_BASE_URL,
           selectedFile!,
           overlapRegions,
           speakerTurns,
-          soloTrackRegionsRef.current,
+          renderedRegions,
           restoreSoloTracks,
         );
         while (!cancelled) {
@@ -3511,7 +3565,18 @@ function App() {
               };
             }
             if (!cancelled) {
+              // Record the artifacts under the very key this attempt ran with.
+              // The autosave snapshot writes this record verbatim rather than
+              // recomputing the key, so the two can never drift apart.
+              persistedSoloTokensRef.current = {
+                key: attemptKey,
+                tokens: Object.fromEntries(
+                  Object.entries(tracks).map(([index, track]) => [index, track.token]),
+                ),
+                regionsSignature: renderedSignature,
+              };
               setSoloTracks({ status: "done", tracks });
+              setRenderedRegionsSignature(renderedSignature);
             }
             return;
           }
@@ -3534,7 +3599,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [session, selectedFile, overlapRegions, speakerTurns, soloTrackRegionCount, restoreSoloTracks]);
+  }, [session, selectedFile, overlapRegions, speakerTurns, soloTrackRegionCount, restoreSoloTracks, trackRenderNonce]);
 
   // While a speaker is soloed, also re-evaluate audibility every frame so the
   // mute gate tracks playback more tightly than timeupdate's ~4 Hz. This loop
@@ -4011,15 +4076,12 @@ function App() {
       acknowledgedLowConfidenceWordIds,
       lowConfidenceThreshold,
       restoreSoloTracks,
-      soloTracks:
-        session && soloTracks.status === "done" && Object.keys(soloTracks.tracks).length
-          ? {
-              key: soloTracksSessionKey(session, restoreSoloTracks, soloTrackRegionCount),
-              tokens: Object.fromEntries(
-                Object.entries(soloTracks.tracks).map(([index, track]) => [index, track.token]),
-              ),
-            }
-          : (persistedSoloTokensRef.current ?? null),
+      // Written by the solo-track effect when a render lands, so this is the
+      // exact key that effect computed. Rebuilding the key here instead is how
+      // the persisted and recomputed keys drift apart -- and a key that never
+      // matches means every reload re-renders.
+      soloTracks: persistedSoloTokensRef.current ?? null,
+      soloTrackRenderNonce: trackRenderNonce,
     };
   }
 
@@ -4098,6 +4160,18 @@ function App() {
       "soloTracks" in persisted && persisted.soloTracks?.key && persisted.soloTracks.tokens
         ? persisted.soloTracks
         : null;
+    // Both halves of the freshness bookkeeping have to come back with the
+    // tokens: the nonce because it is baked into the key the effect recomputes,
+    // the signature because it is what flags region edits made before the
+    // reload. Dropping either one strands the tracks -- a lost nonce re-renders
+    // unconditionally, a lost signature hides the staleness warning and leaves
+    // the re-render button disabled with no way to reach it.
+    setTrackRenderNonce(
+      typeof persisted.soloTrackRenderNonce === "number" && Number.isFinite(persisted.soloTrackRenderNonce)
+        ? persisted.soloTrackRenderNonce
+        : 0,
+    );
+    setRenderedRegionsSignature(persistedSoloTokensRef.current?.regionsSignature ?? null);
     soloTracksAttemptRef.current = null;
     setSoloTracks({ status: "idle", tracks: {} });
 
@@ -6340,6 +6414,8 @@ function App() {
                     soloableSpeakerIds={soloableSpeakers.map((speaker) => speaker.id)}
                     regions={editableRegions}
                     overrideActive={regionOverrides !== null}
+                    tracksStale={soloTracksStale}
+                    tracksRendering={soloTracks.status === "running"}
                     frames={waveformAnalysis?.frames ?? []}
                     speechSpans={waveformAnalysis?.speech_spans ?? []}
                     overlapRegions={overlapRegions}
@@ -6350,6 +6426,7 @@ function App() {
                     theme={themeDark ? "dark" : "light"}
                     onChange={handleRegionsChange}
                     onReset={handleRegionsReset}
+                    onRerenderTracks={() => setTrackRenderNonce((nonce) => nonce + 1)}
                     onSoloSpeakerChange={setSoloSpeakerId}
                     onSeek={seekAudio}
                   />
