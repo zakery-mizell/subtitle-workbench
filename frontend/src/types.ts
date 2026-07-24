@@ -94,6 +94,17 @@ export interface OverlapRegion {
   speaker_indices: number[];
 }
 
+/**
+ * One manually edited speaker region. Only present once the user overrides the
+ * audio-derived regions; see frontend/src/lib/regions.ts.
+ */
+export interface SpeakerRegion {
+  id: string;
+  start: number;
+  end: number;
+  speaker_id: number;
+}
+
 export interface TranscriptResponse {
   audio_filename: string;
   duration: number | null;

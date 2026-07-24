@@ -4,6 +4,7 @@ import {
   ArrowLeftRight,
   ArrowRightLeft,
   AudioLines,
+  AudioWaveform,
   Bandage,
   BookOpen,
   ClipboardCheck,
@@ -36,10 +37,13 @@ import { buildQaReport, formatQaReport } from "./lib/qa";
 import { DEFAULT_LOW_CONFIDENCE_THRESHOLD, isLowConfidenceWord } from "./lib/confidence";
 import { remapCaptions, remapGuideBlocks, remapTime, remapWords, unremapTime } from "./lib/cuts";
 import type { CutRegion, MasteringResult } from "./lib/mastering";
+import { materializeRegions, regionsToSpeakerMap, sanitizeSpeakerRegions } from "./lib/regions";
+import type { RegionMarker } from "./lib/regions";
 import { parseSrt } from "./lib/srt";
 import { formatClock, formatGutterClock } from "./lib/time";
 import MasteringPanel from "./MasteringPanel";
 import OverlapsPanel from "./OverlapsPanel";
+import RegionsPanel from "./RegionsPanel";
 import RestorePanel from "./RestorePanel";
 import ConvertPanel from "./ConvertPanel";
 import PatchPanel from "./PatchPanel";
@@ -56,6 +60,7 @@ import type {
   SpeechSpan,
   Speaker,
   SpeakerAssignmentMode,
+  SpeakerRegion,
   SpeakerTurn,
   TranscriptResponse,
   WaveformAnalysisResponse,
@@ -467,6 +472,7 @@ const SIDE_PANEL_TABS = [
   { id: "jargon", label: "Vocab" },
   { id: "qa", label: "QA" },
   { id: "overlaps", label: "Overlaps" },
+  { id: "regions", label: "Regions" },
   { id: "restore", label: "Restore" },
   { id: "convert", label: "Convert" },
   { id: "patch", label: "Patch" },
@@ -478,6 +484,7 @@ const SIDE_PANEL_TAB_ICONS = {
   jargon: BookOpen,
   qa: ClipboardCheck,
   overlaps: AudioLines,
+  regions: AudioWaveform,
   restore: Gem,
   convert: ArrowRightLeft,
   patch: Bandage,
@@ -503,6 +510,11 @@ interface EditorState {
   guideBlocks: GuideBlock[];
   speakers: Speaker[];
   paragraphs: Paragraph[];
+  // Manually edited speaker regions. Null (or absent, in a save written before
+  // the Regions panel existed) means the audio-derived regions still apply.
+  // Living inside the editor state is what gets these onto the undo stack and
+  // into both the autosave and the project file for free.
+  regionOverrides?: SpeakerRegion[] | null;
 }
 
 interface WorkspaceState {
@@ -679,6 +691,11 @@ function normalizeSpeakers(speakers: Speaker[]): Speaker[] {
   return speakers.map((speaker, index) => normalizeSpeaker(speaker, index));
 }
 
+/** Persisted tab ids are validated against the live tab list, not a hand-kept union. */
+function coerceSidePanelTab(value: unknown): SidePanelTab {
+  return SIDE_PANEL_TABS.some((tab) => tab.id === value) ? (value as SidePanelTab) : "guide";
+}
+
 function persistWorkspace(snapshot: PersistedWorkspace) {
   try {
     window.localStorage.setItem(AUTOSAVE_STORAGE_KEY, JSON.stringify(snapshot));
@@ -723,6 +740,7 @@ function cloneEditorState(state: EditorState): EditorState {
       word_ids: [...paragraph.word_ids],
       caption_ids: paragraph.caption_ids ? [...paragraph.caption_ids] : undefined,
     })),
+    regionOverrides: state.regionOverrides ? state.regionOverrides.map((region) => ({ ...region })) : null,
   };
 }
 
@@ -1760,6 +1778,10 @@ function normalizeEditorState(state: EditorState): EditorState {
   if (!next.paragraphs.length) {
     next.paragraphs = buildParagraphsFromCaptions(next.captions);
   }
+  // Every restore path (autosave, project file, session load) comes through
+  // here, so this is where a hand-edited or truncated override gets vetted:
+  // malformed entries are dropped, never thrown on.
+  next.regionOverrides = sanitizeSpeakerRegions(state.regionOverrides);
   return next;
 }
 
@@ -3007,10 +3029,7 @@ function App() {
             showLineGuides: typeof saved.showLineGuides === "boolean" ? saved.showLineGuides : false,
             showTimingHighlights: typeof saved.showTimingHighlights === "boolean" ? saved.showTimingHighlights : true,
             viewMode: saved.viewMode === "transcript" ? "transcript" : "subtitles",
-            sidePanelTab:
-              saved.sidePanelTab === "jargon" || saved.sidePanelTab === "qa" || saved.sidePanelTab === "guide" || saved.sidePanelTab === "overlaps" || saved.sidePanelTab === "restore" || saved.sidePanelTab === "convert" || saved.sidePanelTab === "patch" || saved.sidePanelTab === "master" || saved.sidePanelTab === "export"
-                ? saved.sidePanelTab
-                : "guide",
+            sidePanelTab: coerceSidePanelTab(saved.sidePanelTab),
             isGuidePanelCollapsed: DEFAULT_GUIDE_PANEL_COLLAPSED,
             extendCaptionsOnExport: typeof saved.extendCaptionsOnExport === "boolean" ? saved.extendCaptionsOnExport : false,
             normalizeExportTimingTo30Fps:
@@ -3303,7 +3322,7 @@ function App() {
   // job must gate on exactly the same edges. Null means "not derivable" (no
   // waveform analysis yet, or no speaker-labelled captions) — then the legacy
   // word-span path applies.
-  const speakerRegions = useMemo(() => {
+  const derivedSpeakerRegions = useMemo(() => {
     const spans = waveformAnalysis?.speech_spans ?? [];
     const captions = activeEditor?.captions ?? [];
     if (!spans.length || !captions.some((caption) => caption.speaker_id !== null)) {
@@ -3316,6 +3335,23 @@ function App() {
     );
     return regions.size ? regions : null;
   }, [waveformAnalysis, activeEditor, session]);
+  const regionOverrides = activeEditor?.regionOverrides ?? null;
+  // Manual edits win outright. No diff/merge against the derivation: once the
+  // user has drawn a boundary by hand, re-deriving over it would silently undo
+  // the fix. "Re-derive from audio" (which clears the override) is the way back.
+  const speakerRegions = useMemo(() => {
+    if (!regionOverrides) {
+      return derivedSpeakerRegions;
+    }
+    const regions = regionsToSpeakerMap(regionOverrides);
+    return regions.size ? regions : null;
+  }, [regionOverrides, derivedSpeakerRegions]);
+  // What the Regions panel edits: the override when there is one, otherwise the
+  // derivation flattened so the first edit materializes it.
+  const editableRegions = useMemo<SpeakerRegion[]>(
+    () => regionOverrides ?? materializeRegions(derivedSpeakerRegions),
+    [regionOverrides, derivedSpeakerRegions],
+  );
   const soloIntervals = useMemo(() => {
     if (soloSpeakerId === null) {
       return [];
@@ -3561,6 +3597,12 @@ function App() {
               title: "Untangle simultaneous speech",
               detail: `${overlapRegions.length} overlap${overlapRegions.length === 1 ? "" : "s"} found`,
             }
+          : sidePanelTab === "regions"
+            ? {
+                eyebrow: "Regions",
+                title: "Speaker regions",
+                detail: "Zoom in and fix handoffs",
+              }
           : sidePanelTab === "restore"
             ? {
                 eyebrow: "Restore",
@@ -3605,6 +3647,8 @@ function App() {
         ? `${glossaryTerms.length} term${glossaryTerms.length === 1 ? "" : "s"}`
         : sidePanelTab === "overlaps"
           ? `${overlapRegions.length} overlap${overlapRegions.length === 1 ? "" : "s"}`
+          : sidePanelTab === "regions"
+            ? `${editableRegions.length} region${editableRegions.length === 1 ? "" : "s"}${regionOverrides ? " (manual)" : ""}`
           : sidePanelTab === "restore"
             ? "Diamond restoration"
             : sidePanelTab === "convert"
@@ -3668,6 +3712,18 @@ function App() {
   const speakerTimelineEvents = useMemo(
     () => detectSpeakerTimelineEvents(activeEditor?.captions ?? [], activeWords, waveformAnalysis?.speech_spans ?? []),
     [activeEditor, activeWords, waveformAnalysis],
+  );
+  // The same events as ticks for the Regions strip. Reduced to the fields the
+  // panel draws so it never has to import App's editor types.
+  const regionMarkers = useMemo<RegionMarker[]>(
+    () =>
+      speakerTimelineEvents.map((event) => ({
+        id: event.id,
+        time: event.time,
+        kind: event.kind,
+        label: event.label,
+      })),
+    [speakerTimelineEvents],
   );
   // Tight handoffs and overlaps, keyed by the caption they fall inside, so the
   // caption list can flag them in the gutter. Plain switches are normal
@@ -4014,11 +4070,7 @@ function App() {
     setShowLineGuides(Boolean(persisted.showLineGuides));
     setShowTimingHighlights(Boolean(persisted.showTimingHighlights));
     setViewMode(persisted.viewMode === "transcript" ? "transcript" : "subtitles");
-    setSidePanelTab(
-      persisted.sidePanelTab === "jargon" || persisted.sidePanelTab === "qa" || persisted.sidePanelTab === "guide" || persisted.sidePanelTab === "overlaps" || persisted.sidePanelTab === "restore" || persisted.sidePanelTab === "convert" || persisted.sidePanelTab === "patch" || persisted.sidePanelTab === "master" || persisted.sidePanelTab === "export"
-        ? persisted.sidePanelTab
-        : "guide",
-    );
+    setSidePanelTab(coerceSidePanelTab(persisted.sidePanelTab));
     setIsGuidePanelCollapsed(DEFAULT_GUIDE_PANEL_COLLAPSED);
     setExtendCaptionsOnExport(Boolean(persisted.extendCaptionsOnExport));
     setNormalizeExportTimingTo30Fps(Boolean(persisted.normalizeExportTimingTo30Fps));
@@ -4606,6 +4658,24 @@ function App() {
     setStatusMessage(
       `Waveform snap adjusted ${result.edgeAdjustmentCount} edge${result.edgeAdjustmentCount === 1 ? "" : "s"} across ${result.captionAdjustmentCount} subtitle${result.captionAdjustmentCount === 1 ? "" : "s"}.`,
     );
+  }
+
+  // Region edits go through the same editor commit as the waveform snap above,
+  // which is what puts them on the undo stack and into the autosave.
+  function handleRegionsChange(next: SpeakerRegion[]) {
+    commit((draft) => {
+      draft.regionOverrides = next.map((region) => ({ ...region }));
+    });
+  }
+
+  function handleRegionsReset() {
+    if (!activeEditor?.regionOverrides) {
+      return;
+    }
+    commit((draft) => {
+      draft.regionOverrides = null;
+    });
+    setStatusMessage("Speaker regions are derived from the audio again.");
   }
 
   async function handleTranscribe() {
@@ -6260,6 +6330,27 @@ function App() {
                     onRestoreSoloTracksChange={setRestoreSoloTracks}
                     onProcessed={handleSeparationProcessed}
                     onApplyWords={applySeparatedWords}
+                    onSeek={seekAudio}
+                  />
+                ) : null}
+
+                {sidePanelTab === "regions" ? (
+                  <RegionsPanel
+                    speakers={activeEditor?.speakers ?? speakerInputs}
+                    soloableSpeakerIds={soloableSpeakers.map((speaker) => speaker.id)}
+                    regions={editableRegions}
+                    overrideActive={regionOverrides !== null}
+                    frames={waveformAnalysis?.frames ?? []}
+                    speechSpans={waveformAnalysis?.speech_spans ?? []}
+                    overlapRegions={overlapRegions}
+                    markers={regionMarkers}
+                    duration={waveformAnalysis?.duration ?? session?.duration ?? audioDuration}
+                    currentTime={currentTime}
+                    soloSpeakerId={soloSpeakerId}
+                    theme={themeDark ? "dark" : "light"}
+                    onChange={handleRegionsChange}
+                    onReset={handleRegionsReset}
+                    onSoloSpeakerChange={setSoloSpeakerId}
                     onSeek={seekAudio}
                   />
                 ) : null}

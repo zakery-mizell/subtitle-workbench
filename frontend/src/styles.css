@@ -1281,6 +1281,109 @@ button.caption-time:hover {
   color: var(--muted-strong);
 }
 
+/* Manual speaker-region editor. The canvases inside .regions-body all span the
+   full body width, which is what keeps the strip and every lane time-aligned. */
+.regions-zoom {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.regions-zoom button {
+  padding: 0.16rem 0.44rem;
+  font-size: 0.8rem;
+  min-height: 26px;
+}
+
+.regions-zoom button.is-active {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.regions-body {
+  padding: 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  overflow: hidden;
+  /* The editor owns ctrl+scroll zoom and arrow-key nudges while focused. */
+  touch-action: none;
+}
+
+.regions-body:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* Measured for the canvas width, so it must carry no padding or border of its
+   own: the strip and every lane are drawn on this exact pixel width. */
+.regions-track {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.regions-strip-canvas {
+  display: block;
+  width: 100%;
+  height: 78px;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
+.regions-lane {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.regions-lane-header {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.78rem;
+  color: var(--muted-strong);
+}
+
+.regions-lane-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.regions-lane-stat {
+  margin-left: auto;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.regions-lane-solo,
+.regions-lane-add {
+  padding: 0.05rem 0.36rem;
+  min-height: 20px;
+  font-size: 0.74rem;
+  box-shadow: none;
+}
+
+.regions-lane-solo.is-active {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.regions-lane.is-soloed .regions-lane-name {
+  color: var(--accent-strong);
+}
+
+.regions-lane-canvas {
+  display: block;
+  width: 100%;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  cursor: crosshair;
+}
+
 .caption-simultaneous-badge {
   display: inline-flex;
   align-items: center;
