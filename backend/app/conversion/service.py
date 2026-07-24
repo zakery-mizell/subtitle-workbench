@@ -24,6 +24,10 @@ from .schemas import ConversionParams, ConversionResult
 
 MAX_REFERENCE_SAMPLES = int(MAX_REFERENCE_SECONDS * SEEDVC_SR)
 
+# Above this the result carries a heads-up that whole-file conversion is a
+# multi-hour job on Apple Silicon; the live progress message carries the ETA.
+LONG_SOURCE_WARN_SECONDS = 600.0
+
 
 def conversion_output_dir() -> Path:
     return Path(settings.mastering_output_dir).parent / "conversion"
@@ -105,6 +109,20 @@ def run_conversion(
                 )
             )
 
+        source_duration_sec = source_frames / SEEDVC_SR
+        if source_duration_sec > LONG_SOURCE_WARN_SECONDS:
+            warnings.append(
+                WarningItem(
+                    code="convert_long_source",
+                    message=(
+                        f"The source was {int(source_duration_sec / 60)} minutes long. Conversion runs at "
+                        "roughly a minute per 25 s chunk on Apple Silicon (several minutes per chunk with "
+                        "style conversion); for long recordings consider converting only the sections you "
+                        "need, or running on a CUDA machine."
+                    ),
+                )
+            )
+
         reporter.stage("load_model", 0.05, 0.30, "Loading Seed-VC model")
         try:
             engine = load_engine()
@@ -120,7 +138,7 @@ def run_conversion(
             intelligibility_cfg=params.intelligibility_cfg,
             similarity_cfg=params.similarity_cfg,
             convert_style=params.convert_style,
-            source_duration_sec=source_frames / SEEDVC_SR,
+            source_duration_sec=source_duration_sec,
             progress=reporter.tick,
         )
 

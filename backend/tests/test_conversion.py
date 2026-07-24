@@ -60,6 +60,58 @@ class ExpectedChunksTests(unittest.TestCase):
         self.assertEqual(expected_chunks(51.0), 3)
 
 
+class FormatEtaTests(unittest.TestCase):
+    def test_seconds_below_a_minute(self) -> None:
+        from backend.app.conversion.engine import format_eta
+
+        self.assertEqual(format_eta(0), "0 s")
+        self.assertEqual(format_eta(41.4), "41 s")
+
+    def test_minutes(self) -> None:
+        from backend.app.conversion.engine import format_eta
+
+        self.assertEqual(format_eta(90), "2 min")
+        self.assertEqual(format_eta(59 * 60), "59 min")
+
+    def test_hours_keep_two_digit_minutes(self) -> None:
+        from backend.app.conversion.engine import format_eta
+
+        self.assertEqual(format_eta(17 * 3600 + 5 * 60), "17 h 05 min")
+
+    def test_negative_clamps_to_zero(self) -> None:
+        from backend.app.conversion.engine import format_eta
+
+        self.assertEqual(format_eta(-5), "0 s")
+
+
+class ChunkTickerTests(unittest.TestCase):
+    def test_progress_is_monotonic_and_messages_carry_chunk_counts(self) -> None:
+        from backend.app.conversion.engine import _ChunkTicker
+
+        emitted: list[tuple[float, str]] = []
+        ticker = _ChunkTicker(4, lambda fraction, message: emitted.append((fraction, message)))
+        ticker._emit(0.0)
+        ticker._emit(0.5)  # mid-chunk tick
+        ticker.chunk_done()
+        ticker._emit(0.2)
+        ticker.chunk_done()
+
+        fractions = [fraction for fraction, _ in emitted]
+        self.assertEqual(fractions, sorted(fractions))
+        self.assertIn("chunk 1/4", emitted[0][1])
+        self.assertIn("chunk 2/4", emitted[2][1])
+        self.assertIn("left)", emitted[-1][1])
+
+    def test_final_chunk_caps_at_ninety_seven_percent(self) -> None:
+        from backend.app.conversion.engine import _ChunkTicker
+
+        emitted: list[float] = []
+        ticker = _ChunkTicker(2, lambda fraction, _message: emitted.append(fraction))
+        ticker.chunk_done()
+        ticker.chunk_done()
+        self.assertAlmostEqual(emitted[-1], 0.97)
+
+
 class ArtifactPathTests(unittest.TestCase):
     def test_output_paths_use_vc_token_and_seedvc_suffix(self) -> None:
         with TemporaryDirectory() as tmp:

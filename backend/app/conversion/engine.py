@@ -29,6 +29,7 @@ import math
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -175,6 +176,84 @@ def expected_chunks(source_duration_sec: float) -> int:
     return max(1, math.ceil(source_duration_sec / 25.0))
 
 
+# A chunk takes on the order of a minute on Apple Silicon (several with
+# convert_style), so ticking only at chunk boundaries reads as a hang. Until the
+# first chunk lands there is no measurement, so start from this guess and refine
+# with the running mean of measured chunk times.
+INITIAL_CHUNK_SECONDS = 90.0
+_TICK_INTERVAL_SECONDS = 2.0
+
+
+def format_eta(seconds: float) -> str:
+    """~ETA as a compact human string: "40 s", "12 min", "1 h 05 min"."""
+    seconds = max(seconds, 0.0)
+    if seconds < 60:
+        return f"{int(round(seconds))} s"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{int(round(minutes))} min"
+    hours = int(minutes // 60)
+    return f"{hours} h {int(round(minutes - hours * 60)):02d} min"
+
+
+class _ChunkTicker:
+    """Publishes smooth intra-chunk progress from wall-clock time.
+
+    The streaming generator only reports at chunk boundaries; between them a
+    daemon thread interpolates elapsed time against the per-chunk estimate (capped
+    below the boundary so real completions stay ahead) and stamps every message
+    with the chunk counter and a remaining-time estimate. Emitted fractions are
+    clamped monotonic because a growing estimate could otherwise step backwards.
+    """
+
+    def __init__(self, expected: int, progress: Callable[[float, str], None]) -> None:
+        self._expected = expected
+        self._progress = progress
+        self._durations: list[float] = []
+        self._chunk_started = time.monotonic()
+        self._done = 0
+        self._last_fraction = 0.0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self) -> "_ChunkTicker":
+        self._emit(0.0)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self._stop.set()
+        self._thread.join()
+
+    def chunk_done(self) -> None:
+        now = time.monotonic()
+        self._durations.append(now - self._chunk_started)
+        self._chunk_started = now
+        self._done += 1
+        self._emit(0.0)
+
+    def _estimate(self) -> float:
+        if not self._durations:
+            return INITIAL_CHUNK_SECONDS
+        return sum(self._durations) / len(self._durations)
+
+    def _emit(self, within_chunk: float) -> None:
+        done = min(self._done + within_chunk, float(self._expected))
+        fraction = max(min(done / self._expected, 0.97), self._last_fraction)
+        self._last_fraction = fraction
+        remaining = max(self._expected - done, 0.0) * self._estimate()
+        current = min(self._done + 1, self._expected)
+        self._progress(
+            fraction,
+            f"Converting chunk {current}/{self._expected} (~{format_eta(remaining)} left)",
+        )
+
+    def _run(self) -> None:
+        while not self._stop.wait(_TICK_INTERVAL_SECONDS):
+            elapsed = time.monotonic() - self._chunk_started
+            self._emit(min(elapsed / self._estimate(), 0.95))
+
+
 def convert_voice(
     source_path: str,
     ref_path: str,
@@ -188,7 +267,7 @@ def convert_voice(
     top_p: float = 0.9,
     temperature: float = 1.0,
     repetition_penalty: float = 1.0,
-    progress: Callable[[float], None] | None = None,
+    progress: Callable[[float, str], None] | None = None,
 ) -> tuple[np.ndarray, int]:
     """Convert the source performance into the reference timbre; returns (audio, sr).
 
@@ -222,15 +301,13 @@ def convert_voice(
     )
 
     expected = expected_chunks(source_duration_sec)
-    done = 0
     out_sr = SEEDVC_SR
     final_audio: np.ndarray | None = None
-    for _mp3_bytes, full_audio in generator:
-        done += 1
-        if progress:
-            progress(min(done / expected, 0.97))
-        if full_audio is not None:
-            out_sr, final_audio = full_audio
+    with _ChunkTicker(expected, progress or (lambda _fraction, _message: None)) as ticker:
+        for _mp3_bytes, full_audio in generator:
+            ticker.chunk_done()
+            if full_audio is not None:
+                out_sr, final_audio = full_audio
 
     if final_audio is None:
         raise ConversionUnavailable("Seed-VC produced no audio for this pair of clips.")
