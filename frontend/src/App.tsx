@@ -267,6 +267,7 @@ type SelectionKind = "paragraph" | "caption";
 type SidePanelTab = (typeof SIDE_PANEL_TABS)[number]["id"];
 type LegacyPersistedWorkspace = Partial<PersistedWorkspace> & { hotwords?: unknown; version?: unknown };
 type SpeakerTimelineEventKind = "switch" | "tight_handoff" | "overlap";
+type TranscriptionOverrides = { model?: string; speakers?: Speaker[] };
 
 interface EditorState {
   captions: Caption[];
@@ -1914,6 +1915,27 @@ function hasExplicitImportedSpeakerLabels(captions: Caption[]): boolean {
   return captions.some((caption) => Boolean(caption.speaker_name?.trim()));
 }
 
+// Only-speaker playback gates on `word.speaker_id`, so speakers that come from SRT labels
+// have to be pushed down onto the words the captions matched. Unmatched words stay
+// unattributed, which the solo gate correctly treats as "not the soloed speaker".
+function retagWordsFromCaptions(words: WordToken[], captions: Caption[]): WordToken[] {
+  const speakerByWordId = new Map<string, { speaker_id: number | null; speaker_name: string | null }>();
+  for (const caption of captions) {
+    for (const wordId of caption.word_ids) {
+      speakerByWordId.set(wordId, { speaker_id: caption.speaker_id, speaker_name: caption.speaker_name });
+    }
+  }
+
+  return words.map((word) => {
+    const assigned = speakerByWordId.get(word.id);
+    return {
+      ...word,
+      speaker_id: assigned?.speaker_id ?? null,
+      speaker_name: assigned?.speaker_name ?? null,
+    };
+  });
+}
+
 function buildRealignedImportedSession(
   audioFilename: string,
   captions: Caption[],
@@ -1933,13 +1955,14 @@ function buildRealignedImportedSession(
   const alignedCaptions = importedHasSpeakers ? rematchedCaptions : applyBlockSpeakers(rematchedCaptions, baseSession.words);
   const paragraphs = applyBlockSpeakers(buildParagraphsFromCaptions(alignedCaptions), baseSession.words);
   const matchedCaptionCount = alignedCaptions.filter((caption) => caption.word_ids.length > 0).length;
+  const words = importedHasSpeakers ? retagWordsFromCaptions(baseSession.words, alignedCaptions) : cloneWords(baseSession.words);
 
   return {
     ...baseSession,
     audio_filename: audioFilename,
     duration: baseSession.duration ?? alignedCaptions[alignedCaptions.length - 1]?.end ?? null,
     speakers: speakerSource.map((speaker) => ({ ...speaker })),
-    words: cloneWords(baseSession.words),
+    words,
     paragraphs,
     captions: alignedCaptions,
     guide_blocks: [],
@@ -4003,15 +4026,19 @@ function App() {
     setStatusMessage("Cuts applied. Subtitles now match the processed audio (undo to restore).");
   }
 
-  function buildTranscriptionFormData(audioFile: File): FormData {
-    const effectiveSpeakerAssignmentMode: SpeakerAssignmentMode = speakerCount > 1 ? speakerAssignmentMode : "segment";
+  // Overrides let a caller request a transcription that differs from the sidebar setup
+  // without touching the sidebar state the workspace is persisted with.
+  function buildTranscriptionFormData(audioFile: File, overrides?: TranscriptionOverrides): FormData {
+    const effectiveSpeakers = normalizeSpeakers(overrides?.speakers ?? speakerInputs);
+    const effectiveSpeakerCount = overrides?.speakers ? effectiveSpeakers.length : speakerCount;
+    const effectiveSpeakerAssignmentMode: SpeakerAssignmentMode = effectiveSpeakerCount > 1 ? speakerAssignmentMode : "segment";
     const formData = new FormData();
     formData.append("audio", audioFile);
-    formData.append("model", model);
-    formData.append("speaker_count", String(speakerCount));
+    formData.append("model", overrides?.model ?? model);
+    formData.append("speaker_count", String(effectiveSpeakerCount));
     formData.append(
       "speakers_json",
-      JSON.stringify(normalizeSpeakers(speakerInputs).map((speaker) => ({ id: speaker.id, name: speaker.name }))),
+      JSON.stringify(effectiveSpeakers.map((speaker) => ({ id: speaker.id, name: speaker.name }))),
     );
     formData.append("speaker_assignment_mode", effectiveSpeakerAssignmentMode);
     formData.append("remove_disfluencies", String(removeDisfluencies));
@@ -4021,10 +4048,10 @@ function App() {
     return formData;
   }
 
-  async function requestTranscription(audioFile: File): Promise<TranscriptResponse> {
+  async function requestTranscription(audioFile: File, overrides?: TranscriptionOverrides): Promise<TranscriptResponse> {
     const response = await fetch(`${API_BASE_URL}/api/transcribe`, {
       method: "POST",
-      body: buildTranscriptionFormData(audioFile),
+      body: buildTranscriptionFormData(audioFile, overrides),
     });
 
     if (!response.ok) {
@@ -4268,15 +4295,23 @@ function App() {
       return;
     }
 
+    const importedHasSpeakers = hasExplicitImportedSpeakerLabels(captions);
+
     setLoading(true);
     setStatusMessage(
       options?.retimeCaptions
-        ? "Running WhisperX on the uploaded audio and retiming the imported captions."
-        : "Running WhisperX on the uploaded audio while preserving the imported SRT timing.",
+        ? "Running a quick `tiny` word-timing pass on the uploaded audio and retiming the imported captions."
+        : "Running a quick `tiny` word-timing pass on the uploaded audio while preserving the imported SRT timing.",
     );
     requestCompletionNotificationPermission();
     try {
-      const payload = await requestTranscription(resumeAudioFile);
+      const payload = await requestTranscription(resumeAudioFile, {
+        // Legacy loads only need word timings to match the imported text onto the audio;
+        // no transcribed word is surfaced as content, so the smallest model is enough.
+        // A labeled SRT also makes diarization pointless — its labels re-tag the words.
+        model: "tiny",
+        speakers: importedHasSpeakers ? buildDefaultSpeakers() : undefined,
+      });
       const importedSession = buildRealignedImportedSession(resumeAudioFile.name, captions, payload, options);
       const normalizedImportedSession = {
         ...importedSession,
@@ -5044,8 +5079,8 @@ function App() {
           </details>
           <details className="rail-details">
             <summary>Legacy: audio + SRT</summary>
-            <p className="helper-text">Use this when you only have an audio file and an edited `.srt`. Default load preserves the original SRT timing and only rematches text to fresh WhisperX words.</p>
-            <p className="helper-text">`Load + retime to audio` is opt-in and rewrites caption timing from the audio. Larger WhisperX models usually rematch better; `tiny` is faster but more error-prone.</p>
+            <p className="helper-text">Use this when you only have an audio file and an edited `.srt`. The audio gets a quick word-timing pass with the `tiny` model regardless of the model chosen above — those words only anchor the SRT text to the audio and are never shown as content. Default load preserves the original SRT timing and only rematches text to those words.</p>
+            <p className="helper-text">When the SRT carries speaker labels (`NAME:` on its own line or as an inline `NAME: dialogue` prefix), those labels become the session speakers, stay editable after load, and drive only-speaker playback. `Load + retime to audio` is opt-in and rewrites caption timing from the audio.</p>
             <label>
               Audio file
               <input type="file" accept="audio/*,video/*" onChange={(event) => setResumeAudioFile(event.target.files?.[0] ?? null)} />
