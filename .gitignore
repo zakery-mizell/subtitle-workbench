@@ -7,6 +7,7 @@ models/
 tmp/
 reference/
 vendor/openai-whisper/
+vendor/seed-vc/
 .env
 __pycache__/
 *.pyc

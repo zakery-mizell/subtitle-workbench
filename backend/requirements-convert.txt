@@ -1,0 +1,27 @@
+# Runtime dependencies for the Seed-VC (V2) voice-conversion engine
+# (Plachtaa/seed-vc, vendored into vendor/seed-vc).
+#
+# This is NOT a plain `pip install -r` file. Seed-VC is not pip-installable and
+# its upstream requirements.txt pins torch==2.4 / transformers==4.46 / numpy==1.26,
+# which would break the rest of this app. Almost every dependency it needs
+# (torch, torchaudio, transformers, librosa, soundfile, huggingface_hub, pydub)
+# is already present via the base + denoise + separation requirement sets. Only
+# two packages are missing, so install just those with scripts/install-convert.sh
+# (or .ps1):
+#
+#   pip install hydra-core munch
+#
+# hydra-core (which brings omegaconf) instantiates the model graph from
+# configs/v2/vc_wrapper.yaml; munch is imported by the vendored code.
+#
+# ffmpeg must be on PATH (already an app-wide requirement): the streaming
+# converter mp3-encodes each chunk via pydub, which shells out to ffmpeg.
+#
+# The install script also downloads the checkpoints into the repo's models/ HF
+# cache (also fetched lazily on first use):
+#   - Plachta/Seed-VC            v2/cfm_small.pth, v2/ar_base.pth
+#   - Plachta/ASTRAL-quantization bsq32/bsq32_light.pth, bsq2048/bsq2048_light.pth
+#   - funasr/campplus            campplus_cn_common.bin
+#   - facebook/hubert-large-ll60k          (content encoder, ~1.2 GB)
+#   - nvidia/bigvgan_v2_22khz_80band_256x  (vocoder)
+#   - openai/whisper-small                 (tokenizer files only)

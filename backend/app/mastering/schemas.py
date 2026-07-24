@@ -4,6 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from ..conversion.schemas import ConversionResult
 from ..restore.schemas import RestoreResult
 from ..schemas import WarningItem
 from ..separation.schemas import SeparationResult, SoloTracksResult
@@ -155,5 +156,5 @@ class JobStatusResponse(BaseModel):
     progress: float
     message: str | None = None
     error: str | None = None
-    # Mastering, separation, and restore jobs share the registry and this shape.
-    result: "MasteringResult | SeparationResult | SoloTracksResult | RestoreResult | None" = None
+    # Mastering, separation, restore, and conversion jobs share the registry and shape.
+    result: "MasteringResult | SeparationResult | SoloTracksResult | RestoreResult | ConversionResult | None" = None

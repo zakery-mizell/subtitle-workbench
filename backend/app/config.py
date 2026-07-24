@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     # Diamond restore device (env RESTORE_DEVICE). None = auto: cuda if
     # available else cpu (never auto-mps; see restore/engine.py device notes).
     restore_device: str | None = None
+    # Seed-VC voice-conversion device (env CONVERSION_DEVICE). None = auto: cuda,
+    # else mps, else cpu (mps IS auto-picked here; see conversion/engine.py notes).
+    conversion_device: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=str(ROOT_DIR / ".env"),

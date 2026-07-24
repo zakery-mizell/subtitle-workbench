@@ -23,6 +23,8 @@ from .mastering.cutting import CutRegion, export_audacity_labels
 from .mastering.pipeline import find_master_artifact, run_mastering
 from .mastering.schemas import JobStatusResponse, MasterJobResponse, MasteringParams
 from .schemas import CapabilitiesResponse, Caption, OverlapRegionOut, Paragraph, RetranscribeRangeResponse, SpeakerAssignmentMode, SpeakerInput, SpeakerTurnOut, TranscriptResponse, WarningItem, WaveformAnalysisResponse, WordToken
+from .conversion.schemas import ConversionParams, ConversionResult
+from .conversion.service import find_conversion_artifact, run_conversion
 from .restore.schemas import RestoreParams, RestoreResult
 from .restore.service import find_restore_artifact, run_restore
 from .separation.overlap import find_overlap_regions
@@ -638,6 +640,73 @@ def restored_waveform(token: str) -> WaveformAnalysisResponse:
 @app.delete("/api/restore/{token}")
 def delete_restored(token: str) -> dict[str, str]:
     artifact = find_restore_artifact(token)
+    if artifact:
+        delete_file_quietly(str(artifact))
+    return {"status": "deleted"}
+
+
+def parse_conversion_params(params_json: str) -> ConversionParams:
+    try:
+        return ConversionParams.model_validate_json(params_json)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"params_json is not a valid conversion configuration. Details: {exc.error_count()} invalid field(s).") from exc
+
+
+@app.post("/api/convert", response_model=MasterJobResponse)
+async def convert_voice_endpoint(
+    audio: UploadFile = File(...),
+    reference: UploadFile = File(...),
+    params_json: str = Form("{}"),
+) -> MasterJobResponse:
+    params = parse_conversion_params(params_json)
+    source_filename = audio.filename or "audio"
+    source_path = await save_upload_to_temp(audio)
+    ref_path = await save_upload_to_temp(reference)
+
+    job_registry.purge_expired(settings.mastering_job_ttl_seconds, delete_artifact=delete_file_quietly)
+
+    def run(job, reporter) -> ConversionResult:
+        try:
+            result = run_conversion(source_path, source_filename, ref_path, params, reporter)
+        finally:
+            delete_file_quietly(source_path)
+            delete_file_quietly(ref_path)
+        artifact = find_conversion_artifact(result.token)
+        if artifact:
+            job.artifacts.append(str(artifact))
+        return result
+
+    return MasterJobResponse(job_id=job_registry.submit(run))
+
+
+def resolve_conversion_artifact(token: str) -> Path:
+    artifact = find_conversion_artifact(token)
+    if artifact is None or not artifact.is_file():
+        raise HTTPException(status_code=404, detail="No converted audio was found for this token. It may have expired.")
+    return artifact
+
+
+@app.get("/api/convert/{token}/audio")
+@app.head("/api/convert/{token}/audio")  # reload revalidation probes artifacts with HEAD
+def converted_audio_file(token: str) -> FileResponse:
+    artifact = resolve_conversion_artifact(token)
+    media_type = MASTER_MEDIA_TYPES.get(artifact.suffix.lower(), "application/octet-stream")
+    download_name = artifact.name.split("__", 1)[-1]
+    return FileResponse(str(artifact), media_type=media_type, filename=download_name)
+
+
+@app.get("/api/convert/{token}/waveform", response_model=WaveformAnalysisResponse)
+def converted_waveform(token: str) -> WaveformAnalysisResponse:
+    artifact = resolve_conversion_artifact(token)
+    try:
+        return analyze_waveform(str(artifact))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.delete("/api/convert/{token}")
+def delete_converted(token: str) -> dict[str, str]:
+    artifact = find_conversion_artifact(token)
     if artifact:
         delete_file_quietly(str(artifact))
     return {"status": "deleted"}

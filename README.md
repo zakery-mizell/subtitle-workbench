@@ -174,6 +174,40 @@ Notes / caveats:
   cuda if available else cpu — it never auto-picks MPS, which measured *slower* than CPU here
   because the tiny autoregressive kernels are launch-bound. Set `RESTORE_DEVICE` to override.
 
+## Voice conversion ("Convert")
+
+[Seed-VC](https://github.com/Plachtaa/seed-vc) (V2, the `hubert-bsqvae-small` model) re-renders a
+source performance in the timbre of a reference voice: the words, timing, and delivery come from
+the source, the voice from the reference. Unlike restoration (which regenerates the *same* voice),
+conversion *swaps* the voice — useful for re-voicing a rough phone recording with a clean clip of
+the target speaker. It is zero-shot and speech-only (no singing/f0 mode); output is 22.05 kHz mono.
+
+Install it first (the two missing python deps plus the model checkpoints, downloaded on install or
+lazily on first use):
+
+```bash
+./scripts/install-convert.sh        # macOS
+powershell -ExecutionPolicy Bypass -File .\scripts\install-convert.ps1   # Windows
+```
+
+Usage: upload a **source recording** and a **target voice reference**, then run
+(`POST /api/convert`, polled like mastering/restore/separation). Both clips are decoded with ffmpeg
+and handed to the model; the output artifact is served/deleted like the other engines.
+
+Notes / caveats:
+
+- Only the first **25 seconds** of the reference are used (longer clips are trimmed with a warning);
+  a clean clip of one voice works best. Long sources are chunked internally (30 s windows, 5 s
+  overlap) — no manual splitting needed.
+- Advanced knobs: diffusion steps (default 50; higher = better/slower), length adjust, similarity
+  and intelligibility CFG, and a "convert style/accent too" toggle that engages the AR model to
+  transfer accent and emotion, not just timbre.
+- Device auto-policy is cuda → mps → cpu (MPS *is* auto-picked here — the diffusion/AR stack is
+  compute-bound, unlike Diamond); float16 on cuda, float32 on mps/cpu. Set `CONVERSION_DEVICE` to
+  override.
+- Seed-VC model code is vendored into `vendor/seed-vc/` (not pip-installable); checkpoints land in
+  the repo's `models/` Hugging Face cache.
+
 ## Project layout
 
 - `backend/app/main.py`
@@ -181,13 +215,16 @@ Notes / caveats:
 - `backend/app/mastering/` (audio post production pipeline)
 - `backend/app/separation/` (UniSE overlap separation: engine, blending, overlap math)
 - `backend/app/restore/` (Diamond speech-restoration engine + job service)
-- `backend/app/jobs.py` (in-process job registry shared by mastering, separation, and restore)
+- `backend/app/conversion/` (Seed-VC voice-conversion engine + job service)
+- `backend/app/jobs.py` (in-process job registry shared by mastering, separation, restore, and conversion)
 - `frontend/src/App.tsx`
 - `frontend/src/MasteringPanel.tsx`
 - `frontend/src/OverlapsPanel.tsx`
+- `frontend/src/ConvertPanel.tsx`
 - `scripts/install.ps1` (Windows) / `scripts/install.sh` (macOS)
 - `scripts/install-unise.ps1` / `scripts/install-unise.sh` (optional overlap-separation engine)
 - `scripts/install-restore.ps1` / `scripts/install-restore.sh` (optional Diamond restore engine)
+- `scripts/install-convert.ps1` / `scripts/install-convert.sh` (optional Seed-VC voice-conversion engine)
 
 ## Configure
 
