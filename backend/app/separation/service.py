@@ -135,28 +135,21 @@ def run_solo_tracks(
     """Render one playback track per speaker involved in any overlap.
 
     Each track is the untouched original except inside overlap regions, where
-    the mixture is replaced by that speaker's isolated voice (UniSE tse). The
-    frontend's solo selector gates the rest, so "Only X" plays X's original
-    solo speech plus X alone through the overlaps.
+    the mixture is replaced by that speaker's isolated voice (UniSE tse). When
+    `params.speaker_regions` are supplied the track is additionally gated to that
+    speaker's silence-snapped regions, so it stands alone on the original
+    timeline: same length and timings, everyone else silent.
     """
     warnings: list[WarningItem] = []
-
-    reporter.stage("decode", 0.0, 0.06, "Decoding audio")
-    original = decode_master(source_path)
-    mix16 = decode_mono_16k(source_path)
-    duration16 = mix16.size / UNISE_SAMPLE_RATE
-
-    reporter.stage("load_model", 0.06, 0.16, "Loading UniSE separation model")
-    try:
-        engine = load_engine()
-    except SeparationUnavailable as exc:
-        raise RuntimeError(str(exc)) from exc
 
     turns = [
         SpeakerTurn(start=turn.start, end=turn.end, label=str(turn.speaker_index))
         for turn in params.turns
     ]
-    speaker_indices = sorted({index for region in params.regions for index in region.speaker_indices})
+    speaker_indices = sorted(
+        {index for region in params.regions for index in region.speaker_indices}
+        | {region.speaker_index for region in params.speaker_regions}
+    )
 
     work_items = [
         (speaker, region)
@@ -164,18 +157,40 @@ def run_solo_tracks(
         for region in params.regions
         if speaker in region.speaker_indices
     ]
+
+    reporter.stage("decode", 0.0, 0.06, "Decoding audio")
+    original = decode_master(source_path)
+
+    # A gating-only job (clean recording, no overlaps) never touches UniSE, so it
+    # must not require the model to be installed or a second decode pass.
+    engine = None
+    mix16 = None
+    duration16 = 0.0
+    if work_items:
+        mix16 = decode_mono_16k(source_path)
+        duration16 = mix16.size / UNISE_SAMPLE_RATE
+        reporter.stage("load_model", 0.06, 0.16, "Loading UniSE separation model")
+        try:
+            engine = load_engine()
+        except SeparationUnavailable as exc:
+            raise RuntimeError(str(exc)) from exc
+
     tracks: list[SoloTrackOut] = []
     reports: list[SoloRegionReport] = []
     span_start, span_end = 0.16, 0.90
     done = 0
+    if not work_items:
+        reporter.stage("gate", 0.06, 0.90, "Preparing per-speaker tracks")
 
     for speaker in speaker_indices:
         samples = original.samples.copy()
         applied_any = False
 
         regions = [region for region in params.regions if speaker in region.speaker_indices]
-        enrollment_span = pick_enrollment_span(turns, speaker, near=regions[0].start)
-        enroll_audio = _seconds_slice(mix16, *enrollment_span) if enrollment_span else None
+        enrollment_span = (
+            pick_enrollment_span(turns, speaker, near=regions[0].start) if regions else None
+        )
+        enroll_audio = _seconds_slice(mix16, *enrollment_span) if enrollment_span and mix16 is not None else None
 
         for region in regions:
             stage_lo = span_start + (span_end - span_start) * done / len(work_items)
@@ -228,7 +243,7 @@ def run_solo_tracks(
             report.applied = True
             applied_any = True
 
-        if enrollment_span is None:
+        if regions and enrollment_span is None:
             warnings.append(
                 WarningItem(
                     code="separation_no_enrollment",
@@ -238,7 +253,18 @@ def run_solo_tracks(
                     ),
                 )
             )
-        if not applied_any:
+
+        # Gate to this speaker's regions. Their edges already sit in silence, so
+        # the equal-power crossfades only guard against clicks at the few splits
+        # that a genuine no-pause handoff forces mid-speech.
+        gated = blend.apply_region_gate(
+            samples,
+            original.sample_rate,
+            [(region.start, region.end) for region in params.speaker_regions if region.speaker_index == speaker],
+        )
+        # A gated track is worth emitting on its own; without gating an untouched
+        # copy of the original would be pointless.
+        if not applied_any and not gated:
             continue
 
         track_samples = samples
@@ -297,7 +323,7 @@ def run_solo_tracks(
         tracks=tracks,
         regions=reports,
         output_format=params.output.format,
-        device_used=engine.device,
+        device_used=engine.device if engine is not None else "none",
         warnings=warnings,
     )
 

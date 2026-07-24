@@ -133,16 +133,26 @@ export interface SoloTracksJobStatus {
   result: SoloTracksResult | null;
 }
 
+export interface SpeakerRegionParams {
+  start: number;
+  end: number;
+  speaker_index: number;
+}
+
 export async function startSoloTracksJob(
   apiBaseUrl: string,
   audioFile: File,
   regions: OverlapRegion[],
   turns: SpeakerTurn[],
+  speakerRegions: SpeakerRegionParams[] = [],
   restore = false,
 ): Promise<string> {
   const params = {
     regions,
     turns: turns.map((turn) => ({ start: turn.start, end: turn.end, speaker_index: turn.speaker_index })),
+    // Silence-snapped regions per speaker: the backend mutes everything outside
+    // them, so each track is timeline-preserving but carries one voice only.
+    speaker_regions: speakerRegions,
     // When set, each per-speaker track is regenerated at 44.1 kHz studio quality
     // (Diamond) after isolation; default keeps the raw separated stems.
     restore,

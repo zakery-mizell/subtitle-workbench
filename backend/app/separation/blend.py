@@ -62,6 +62,56 @@ def _edge_ramps(length: int, fade: int) -> np.ndarray:
     return envelope
 
 
+def region_envelope(
+    total: int,
+    sample_rate: int,
+    regions: list[tuple[float, float]],
+    crossfade_seconds: float = DEFAULT_CROSSFADE_SECONDS,
+) -> np.ndarray:
+    """Gain curve that is 1 inside `regions` and 0 outside, fading at the edges.
+
+    Regions that touch or overlap are merged first so no fade dips appear at an
+    internal joint.
+    """
+    envelope = np.zeros(total, dtype=np.float32)
+    if total <= 0:
+        return envelope
+
+    merged: list[list[int]] = []
+    for start, end in sorted(regions):
+        lo = max(0, min(total, int(round(start * sample_rate))))
+        hi = max(0, min(total, int(round(end * sample_rate))))
+        if hi <= lo:
+            continue
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+
+    fade = int(crossfade_seconds * sample_rate)
+    for lo, hi in merged:
+        envelope[lo:hi] = _edge_ramps(hi - lo, fade)
+    return envelope
+
+
+def apply_region_gate(
+    samples: np.ndarray,
+    sample_rate: int,
+    regions: list[tuple[float, float]],
+    crossfade_seconds: float = DEFAULT_CROSSFADE_SECONDS,
+) -> bool:
+    """Silence everything outside `regions`, keeping the timeline intact.
+
+    Mutates `samples` (channels, n) in place and reports whether it did anything;
+    an empty region list leaves the audio untouched.
+    """
+    if not regions or samples.shape[1] <= 0:
+        return False
+    envelope = region_envelope(samples.shape[1], sample_rate, regions, crossfade_seconds)
+    samples *= envelope[None, :]
+    return True
+
+
 def _region_bounds(render: RegionRender, sample_rate: int, total: int) -> tuple[int, int]:
     start = max(0, int(round(render.region_start * sample_rate)))
     end = min(total, int(round(render.region_end * sample_rate)))

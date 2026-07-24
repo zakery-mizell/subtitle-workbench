@@ -167,6 +167,28 @@ const SPEAKER_ASSIGNMENT_OPTIONS: Array<{ value: SpeakerAssignmentMode; label: s
 const SOLO_SPAN_PADDING_S = 0.15;
 const SOLO_SPAN_MERGE_GAP_S = 0.6;
 
+// Snapped speaker regions (preferred over the padding/merge rule above whenever
+// the waveform has been analysed). An imported SRT carries speaker identity but
+// no silence: measured on a 19-minute three-speaker file, 374 of 375 cues abut
+// the previous cue and 85 of 86 speaker handoffs have a zero-width gap, so 31%
+// of handoffs fall INSIDE a continuous speech span and the wrong voice bleeds
+// into the region. The audio has the missing silence — every handoff there sits
+// in a real gap (median 1.24 s, p10 0.58 s) and a boundary needs to move only a
+// median 0.35 s to reach it. So identity comes from the captions and boundaries
+// come from the VAD speech spans.
+//
+// Only 25 of 726 spans (2.2 s total) are genuinely shared by two speakers; below
+// this minority share a shared span goes wholly to the majority speaker rather
+// than being cut mid-speech for a sliver.
+const SHARED_SPAN_MIN_MINORITY_S = 0.15;
+// Regions open before the first word and close after the last, but stop short of
+// anyone else's speech so every transition lands in measured silence.
+const REGION_EXTEND_S = 0.25;
+const REGION_SILENCE_MARGIN_S = 0.08;
+// The handful of shared-span splits do cut mid-speech; ramp the playback gate
+// there instead of stepping it, or the cut clicks.
+const GATE_RAMP_S = 0.04;
+
 interface SoloInterval {
   start: number;
   end: number;
@@ -190,10 +212,192 @@ function buildSpeakerIntervals(words: WordToken[], speakerId: number): SoloInter
   return merged;
 }
 
-function soloTracksSessionKey(session: TranscriptResponse, restore: boolean): string {
+interface AttributedPiece {
+  start: number;
+  end: number;
+  speakerId: number;
+}
+
+/** Last speech end at or before `time`, or null when nobody spoke earlier. */
+function speechEndBefore(spans: SoloInterval[], time: number): number | null {
+  // Speech spans are sorted and non-overlapping, so ends rise with starts.
+  let low = 0;
+  let high = spans.length - 1;
+  let found: number | null = null;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (spans[mid].end <= time) {
+      found = spans[mid].end;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return found;
+}
+
+/** First speech start at or after `time`, or null when nobody speaks again. */
+function speechStartAfter(spans: SoloInterval[], time: number): number | null {
+  let low = 0;
+  let high = spans.length - 1;
+  let found: number | null = null;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (spans[mid].start >= time) {
+      found = spans[mid].start;
+      high = mid - 1;
+    } else {
+      low = mid + 1;
+    }
+  }
+  return found;
+}
+
+/** Attribute one speech span to speakers using the captions that overlap it. */
+function attributeSpan(span: SpeechSpan, overlaps: AttributedPiece[]): AttributedPiece[] {
+  const shares = new Map<number, number>();
+  for (const piece of overlaps) {
+    shares.set(piece.speakerId, (shares.get(piece.speakerId) ?? 0) + (piece.end - piece.start));
+  }
+  if (!shares.size) {
+    return []; // no speaker-labelled caption covers this span: it belongs to nobody
+  }
+
+  const ranked = [...shares.entries()].sort((left, right) => right[1] - left[1]);
+  const total = ranked.reduce((sum, [, share]) => sum + share, 0);
+  if (ranked.length === 1 || total - ranked[0][1] < SHARED_SPAN_MIN_MINORITY_S) {
+    // Caption edges must never clip inside a span: one owner takes all of it.
+    return [{ start: span.start, end: span.end, speakerId: ranked[0][0] }];
+  }
+
+  // Genuinely shared span. The caption boundary is the only handoff signal here.
+  const pieces: AttributedPiece[] = [];
+  for (const piece of overlaps) {
+    const previous = pieces[pieces.length - 1];
+    if (previous && previous.speakerId === piece.speakerId) {
+      previous.end = Math.max(previous.end, piece.end);
+    } else {
+      pieces.push({ ...piece });
+    }
+  }
+  for (let index = 0; index < pieces.length - 1; index += 1) {
+    const boundary =
+      pieces[index + 1].start >= pieces[index].end
+        ? pieces[index + 1].start
+        : (pieces[index].end + pieces[index + 1].start) / 2;
+    pieces[index].end = boundary;
+    pieces[index + 1].start = boundary;
+  }
+  pieces[0].start = span.start;
+  pieces[pieces.length - 1].end = span.end;
+  return pieces.filter((piece) => piece.end > piece.start);
+}
+
+/**
+ * Speaker regions whose edges sit in measured silence: identity from the
+ * captions, boundaries from the waveform's speech spans. Callers pass
+ * `waveformAnalysis.speech_spans` (20 ms resolution, computed pre-downsampling —
+ * the display `frames` array is too coarse for this). Kept pure and exported so
+ * it can be exercised standalone.
+ */
+export function buildSpeakerRegionsFromSpeech(
+  speechSpans: SpeechSpan[],
+  captions: Caption[],
+  duration: number | null,
+): Map<number, SoloInterval[]> {
+  const bySpeaker = new Map<number, SoloInterval[]>();
+  const labelled = captions
+    .filter((caption) => caption.speaker_id !== null && caption.end > caption.start)
+    .map((caption) => ({ start: caption.start, end: caption.end, speakerId: caption.speaker_id as number }))
+    .sort((left, right) => left.start - right.start);
+  if (!speechSpans.length || !labelled.length) {
+    return bySpeaker;
+  }
+  const spans = [...speechSpans].filter((span) => span.end > span.start).sort((left, right) => left.start - right.start);
+
+  const pieces: AttributedPiece[] = [];
+  // The spans an extended region edge must stay clear of: the raw spans, but
+  // subdivided wherever a span was split between two speakers, so a split edge
+  // does not extend over the other half of its own span.
+  const bounds: SoloInterval[] = [];
+  let cursor = 0;
+  for (const span of spans) {
+    while (cursor < labelled.length && labelled[cursor].end <= span.start) {
+      cursor += 1;
+    }
+    const overlaps: AttributedPiece[] = [];
+    for (let index = cursor; index < labelled.length && labelled[index].start < span.end; index += 1) {
+      const start = Math.max(span.start, labelled[index].start);
+      const end = Math.min(span.end, labelled[index].end);
+      if (end > start) {
+        overlaps.push({ start, end, speakerId: labelled[index].speakerId });
+      }
+    }
+    const attributed = attributeSpan(span, overlaps);
+    pieces.push(...attributed);
+    if (attributed.length) {
+      bounds.push(...attributed.map((piece) => ({ start: piece.start, end: piece.end })));
+    } else {
+      bounds.push({ start: span.start, end: span.end }); // speech nobody is labelled for
+    }
+  }
+
+  // Merge a speaker's consecutive pieces whenever nobody else speaks between
+  // them. No distance cap: bridging measured silence cannot swallow anyone, which
+  // is exactly what the blunt SOLO_SPAN_MERGE_GAP_S rule got wrong for short
+  // back-channels ("right", "yeah") from another speaker.
+  const merged: AttributedPiece[] = [];
+  for (const piece of pieces) {
+    const previous = merged[merged.length - 1];
+    if (previous && previous.speakerId === piece.speakerId) {
+      previous.end = Math.max(previous.end, piece.end);
+    } else {
+      merged.push({ ...piece });
+    }
+  }
+
+  for (const region of merged) {
+    let start = Math.max(0, region.start - REGION_EXTEND_S);
+    const previousEnd = speechEndBefore(bounds, region.start);
+    if (previousEnd !== null) {
+      start = Math.max(start, previousEnd + REGION_SILENCE_MARGIN_S);
+    }
+    let end = duration === null ? region.end + REGION_EXTEND_S : Math.min(duration, region.end + REGION_EXTEND_S);
+    const nextStart = speechStartAfter(bounds, region.end);
+    if (nextStart !== null) {
+      end = Math.min(end, nextStart - REGION_SILENCE_MARGIN_S);
+    }
+    // Never shrink below the speech this region owns. The margin math only
+    // inverts at a shared-span split, where the neighbouring "speech" is the
+    // other half of the very same span.
+    if (start > region.start) {
+      start = region.start;
+    }
+    if (end < region.end) {
+      end = region.end;
+    }
+
+    const existing = bySpeaker.get(region.speakerId);
+    if (!existing) {
+      bySpeaker.set(region.speakerId, [{ start, end }]);
+      continue;
+    }
+    // timeInIntervals binary-searches these, so keep them sorted and disjoint.
+    const previous = existing[existing.length - 1];
+    if (start <= previous.end) {
+      previous.end = Math.max(previous.end, end);
+    } else {
+      existing.push({ start, end });
+    }
+  }
+  return bySpeaker;
+}
+
+function soloTracksSessionKey(session: TranscriptResponse, restore: boolean, regionCount: number): string {
   // The restore flag is part of the key so Diamond-restored tokens are never
-  // reused for a raw run (or vice versa) after a reload.
-  return `${session.audio_filename}|${session.duration ?? 0}|${(session.overlap_regions ?? []).length}|${restore ? "restore" : "raw"}`;
+  // reused for a raw run (or vice versa) after a reload. The region count stands
+  // in for the gating envelope: re-derived regions must re-render the tracks.
+  return `${session.audio_filename}|${session.duration ?? 0}|${(session.overlap_regions ?? []).length}|${regionCount}|${restore ? "restore" : "raw"}`;
 }
 
 function mergeIntervalLists(...lists: SoloInterval[][]): SoloInterval[] {
@@ -210,7 +414,8 @@ function mergeIntervalLists(...lists: SoloInterval[][]): SoloInterval[] {
   return merged;
 }
 
-function timeInIntervals(time: number, intervals: SoloInterval[]): boolean {
+/** Index of the interval containing `time`, or -1. Requires sorted intervals. */
+function intervalIndexAt(time: number, intervals: SoloInterval[]): number {
   let low = 0;
   let high = intervals.length - 1;
   while (low <= high) {
@@ -220,10 +425,33 @@ function timeInIntervals(time: number, intervals: SoloInterval[]): boolean {
     } else if (time > intervals[mid].end) {
       low = mid + 1;
     } else {
-      return true;
+      return mid;
     }
   }
-  return false;
+  return -1;
+}
+
+function timeInIntervals(time: number, intervals: SoloInterval[]): boolean {
+  return intervalIndexAt(time, intervals) >= 0;
+}
+
+/**
+ * Playback gain for the solo gate: 1 inside an interval, 0 outside, with a short
+ * linear ramp just inside each edge. Runs in a requestAnimationFrame loop, so it
+ * shares the binary search rather than scanning.
+ */
+export function intervalGainAt(time: number, intervals: SoloInterval[], rampSeconds: number): number {
+  const index = intervalIndexAt(time, intervals);
+  if (index < 0) {
+    return 0;
+  }
+  const interval = intervals[index];
+  const ramp = Math.min(rampSeconds, (interval.end - interval.start) / 2);
+  if (ramp <= 0) {
+    return 1;
+  }
+  const distance = Math.min(time - interval.start, interval.end - time);
+  return Math.max(0, Math.min(1, distance / ramp));
 }
 const FOLLOW_SCROLL_SUSPEND_MS = 3000;
 const THEME_STORAGE_KEY = "subtitle-workbench:theme";
@@ -3070,9 +3298,32 @@ function App() {
     const spokenIds = new Set(activeWords.map((word) => word.speaker_id));
     return session.speakers.filter((speaker) => spokenIds.has(speaker.id));
   }, [session, activeWords]);
+  // One shared derivation of the snapped regions: the solo gate and the solo-track
+  // job must gate on exactly the same edges. Null means "not derivable" (no
+  // waveform analysis yet, or no speaker-labelled captions) — then the legacy
+  // word-span path applies.
+  const speakerRegions = useMemo(() => {
+    const spans = waveformAnalysis?.speech_spans ?? [];
+    const captions = activeEditor?.captions ?? [];
+    if (!spans.length || !captions.some((caption) => caption.speaker_id !== null)) {
+      return null;
+    }
+    const regions = buildSpeakerRegionsFromSpeech(
+      spans,
+      captions,
+      waveformAnalysis?.duration ?? session?.duration ?? null,
+    );
+    return regions.size ? regions : null;
+  }, [waveformAnalysis, activeEditor, session]);
   const soloIntervals = useMemo(() => {
     if (soloSpeakerId === null) {
       return [];
+    }
+    const snapped = speakerRegions?.get(soloSpeakerId);
+    if (snapped?.length) {
+      // Deliberately not unioned with speakerTurns: diarized turn edges are not
+      // silence-aligned and would drag the gate back over the other voice.
+      return snapped;
     }
     const wordIntervals = buildSpeakerIntervals(activeWords, soloSpeakerId);
     if (!activeSoloTrack || soloSpeakerIndex < 0) {
@@ -3088,7 +3339,7 @@ function App() {
         end: turn.end + SOLO_SPAN_PADDING_S,
       }));
     return mergeIntervalLists(wordIntervals, turnIntervals);
-  }, [activeWords, soloSpeakerId, activeSoloTrack, soloSpeakerIndex, speakerTurns]);
+  }, [activeWords, soloSpeakerId, speakerRegions, activeSoloTrack, soloSpeakerIndex, speakerTurns]);
 
   useEffect(() => {
     if (soloSpeakerId !== null && !soloableSpeakers.some((speaker) => speaker.id === soloSpeakerId)) {
@@ -3099,10 +3350,10 @@ function App() {
   const applyPlaybackVolume = useCallback(() => {
     const gateActive = soloSpeakerId !== null && soloIntervals.length > 0;
     const time = audioRef.current?.currentTime ?? 0;
-    const audible = !userMuted && (!gateActive || timeInIntervals(time, soloIntervals));
+    const gain = userMuted ? 0 : gateActive ? intervalGainAt(time, soloIntervals, GATE_RAMP_S) : 1;
     for (const element of [originalAudioRef.current, masteredAudioRef.current, soloAudioRef.current]) {
       if (element) {
-        element.volume = audible ? 1 : 0;
+        element.volume = gain;
       }
     }
   }, [userMuted, soloSpeakerId, soloIntervals]);
@@ -3125,16 +3376,47 @@ function App() {
     };
   }, [applyPlaybackVolume, audioUrl, processedAudio, playbackSource, activeSoloTrack]);
 
+  // The same snapped regions, flattened for the backend: it silences everything
+  // outside them so each exported per-speaker track stands alone on the original
+  // timeline (that is what the Convert engine needs to feed back in place).
+  const soloTrackRegions = useMemo(() => {
+    if (!speakerRegions || !session) {
+      return [];
+    }
+    const payload: Array<{ start: number; end: number; speaker_index: number }> = [];
+    for (const [speakerId, intervals] of speakerRegions) {
+      const speakerIndex = session.speakers.findIndex((speaker) => speaker.id === speakerId);
+      if (speakerIndex < 0) {
+        continue;
+      }
+      for (const interval of intervals) {
+        payload.push({ start: interval.start, end: interval.end, speaker_index: speakerIndex });
+      }
+    }
+    return payload;
+  }, [speakerRegions, session]);
+  // Every caption edit re-derives the regions into a fresh array, so the render
+  // job below keys off the region count only: re-running its effect would cancel
+  // an in-flight render. The ref keeps the payload current for whichever attempt
+  // does start.
+  const soloTrackRegionCount = soloTrackRegions.length;
+  const soloTrackRegionsRef = useRef(soloTrackRegions);
+  useEffect(() => {
+    soloTrackRegionsRef.current = soloTrackRegions;
+  }, [soloTrackRegions]);
+
   // Solo tracks are prepared automatically: as soon as a transcription reports
-  // overlap regions, one background job renders a per-speaker version of the
-  // recording whose overlaps contain only that speaker's separated voice. The
-  // "Only <name>" selector then just works — no extra buttons. Main playback
+  // overlap regions — or the captions yield snapped speaker regions — one
+  // background job renders a per-speaker version of the recording whose overlaps
+  // contain only that speaker's separated voice, gated to that speaker's regions.
+  // The "Only <name>" selector then just works — no extra buttons. Main playback
   // (All speakers) never uses these tracks.
   useEffect(() => {
-    if (!session || !selectedFile || !overlapRegions.length || !speakerTurns.length) {
+    const canSeparate = overlapRegions.length > 0 && speakerTurns.length > 0;
+    if (!session || !selectedFile || (!canSeparate && !soloTrackRegionCount)) {
       return;
     }
-    const attemptKey = soloTracksSessionKey(session, restoreSoloTracks);
+    const attemptKey = soloTracksSessionKey(session, restoreSoloTracks, soloTrackRegionCount);
     if (soloTracksAttemptRef.current === attemptKey) {
       return;
     }
@@ -3173,7 +3455,14 @@ function App() {
 
       setSoloTracks({ status: "running", tracks: {} });
       try {
-        const jobId = await startSoloTracksJob(API_BASE_URL, selectedFile!, overlapRegions, speakerTurns, restoreSoloTracks);
+        const jobId = await startSoloTracksJob(
+          API_BASE_URL,
+          selectedFile!,
+          overlapRegions,
+          speakerTurns,
+          soloTrackRegionsRef.current,
+          restoreSoloTracks,
+        );
         while (!cancelled) {
           const status = await fetchSoloTracksJob(API_BASE_URL, jobId);
           if (status.status === "done" && status.result) {
@@ -3208,7 +3497,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [session, selectedFile, overlapRegions, speakerTurns, restoreSoloTracks]);
+  }, [session, selectedFile, overlapRegions, speakerTurns, soloTrackRegionCount, restoreSoloTracks]);
 
   // While a speaker is soloed, also re-evaluate audibility every frame so the
   // mute gate tracks playback more tightly than timeupdate's ~4 Hz. This loop
@@ -3668,7 +3957,7 @@ function App() {
       soloTracks:
         session && soloTracks.status === "done" && Object.keys(soloTracks.tracks).length
           ? {
-              key: soloTracksSessionKey(session, restoreSoloTracks),
+              key: soloTracksSessionKey(session, restoreSoloTracks, soloTrackRegionCount),
               tokens: Object.fromEntries(
                 Object.entries(soloTracks.tracks).map(([index, track]) => [index, track.token]),
               ),

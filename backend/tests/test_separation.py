@@ -145,5 +145,76 @@ class BlendTests(unittest.TestCase):
         np.testing.assert_array_equal(samples[0, mid], samples[1, mid])
 
 
+class RegionGateTests(unittest.TestCase):
+    """Gating an exported solo track to one speaker's silence-snapped regions."""
+
+    def _tone(self, seconds: float, sr: int, freq: float = 220.0) -> np.ndarray:
+        t = np.arange(int(seconds * sr)) / sr
+        return (0.5 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+
+    def test_envelope_is_one_inside_and_zero_outside(self) -> None:
+        sr = 48000
+        envelope = blend.region_envelope(int(10.0 * sr), sr, [(2.0, 4.0)])
+        self.assertEqual(envelope.size, int(10.0 * sr))
+        self.assertAlmostEqual(float(envelope[int(3.0 * sr)]), 1.0, places=6)
+        self.assertEqual(float(envelope[int(1.0 * sr)]), 0.0)
+        self.assertEqual(float(envelope[int(6.0 * sr)]), 0.0)
+        # Edges themselves are the start of the fade, not full gain.
+        self.assertLess(float(envelope[int(2.0 * sr)]), 0.1)
+        self.assertLess(float(envelope[int(4.0 * sr) - 1]), 0.1)
+
+    def test_envelope_fades_are_monotonic(self) -> None:
+        sr = 48000
+        fade = int(blend.DEFAULT_CROSSFADE_SECONDS * sr)
+        envelope = blend.region_envelope(int(10.0 * sr), sr, [(2.0, 4.0)])
+        rise = envelope[int(2.0 * sr) : int(2.0 * sr) + fade]
+        fall = envelope[int(4.0 * sr) - fade : int(4.0 * sr)]
+        self.assertTrue(np.all(np.diff(rise) >= 0.0))
+        self.assertTrue(np.all(np.diff(fall) <= 0.0))
+        self.assertAlmostEqual(float(rise[0]), 0.0, places=6)
+        self.assertAlmostEqual(float(fall[-1]), 0.0, places=6)
+
+    def test_envelope_honours_every_region_and_merges_touching_ones(self) -> None:
+        sr = 48000
+        envelope = blend.region_envelope(int(12.0 * sr), sr, [(1.0, 2.0), (5.0, 6.0)])
+        self.assertAlmostEqual(float(envelope[int(1.5 * sr)]), 1.0, places=6)
+        self.assertEqual(float(envelope[int(3.5 * sr)]), 0.0)
+        self.assertAlmostEqual(float(envelope[int(5.5 * sr)]), 1.0, places=6)
+        # Touching regions must not dip at the joint: one fade, not two.
+        joined = blend.region_envelope(int(12.0 * sr), sr, [(1.0, 3.0), (3.0, 5.0)])
+        self.assertAlmostEqual(float(joined[int(3.0 * sr)]), 1.0, places=6)
+
+    def test_gate_silences_outside_and_keeps_length(self) -> None:
+        sr = 48000
+        samples = self._tone(8.0, sr)[None, :].copy()
+        applied = blend.apply_region_gate(samples, sr, [(2.0, 5.0)])
+        self.assertTrue(applied)
+        self.assertEqual(samples.shape[1], int(8.0 * sr))
+        self.assertGreater(float(np.abs(samples[0, int(3.0 * sr) : int(4.0 * sr)]).max()), 0.4)
+        self.assertEqual(float(np.abs(samples[0, : int(1.9 * sr)]).max()), 0.0)
+        self.assertEqual(float(np.abs(samples[0, int(5.1 * sr) :]).max()), 0.0)
+
+    def test_gate_applies_to_every_channel(self) -> None:
+        sr = 48000
+        samples = np.stack([self._tone(6.0, sr), self._tone(6.0, sr, freq=330.0)]).copy()
+        blend.apply_region_gate(samples, sr, [(1.0, 2.0)])
+        self.assertEqual(float(np.abs(samples[0, int(3.0 * sr) :]).max()), 0.0)
+        self.assertEqual(float(np.abs(samples[1, int(3.0 * sr) :]).max()), 0.0)
+
+    def test_no_regions_leaves_samples_byte_identical(self) -> None:
+        sr = 48000
+        samples = self._tone(4.0, sr)[None, :].copy()
+        before = samples.tobytes()
+        self.assertFalse(blend.apply_region_gate(samples, sr, []))
+        self.assertEqual(samples.tobytes(), before)
+
+    def test_regions_beyond_the_audio_are_clamped(self) -> None:
+        sr = 48000
+        samples = self._tone(2.0, sr)[None, :].copy()
+        self.assertTrue(blend.apply_region_gate(samples, sr, [(1.0, 9.0)]))  # must not raise
+        self.assertEqual(samples.shape[1], int(2.0 * sr))
+        self.assertGreater(float(np.abs(samples[0, int(1.5 * sr) :]).max()), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

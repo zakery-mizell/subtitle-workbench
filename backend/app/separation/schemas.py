@@ -75,12 +75,32 @@ class OverlapRegionIn(BaseModel):
     speaker_indices: list[int] = Field(min_length=2)
 
 
+class SpeakerRegionIn(BaseModel):
+    """One stretch of the timeline that belongs to a single speaker.
+
+    Derived in the frontend from the VAD speech spans, so both edges sit in
+    measured silence and the render's crossfades are inaudible.
+    """
+
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    speaker_index: int = Field(ge=0)
+
+
 class SoloTracksParams(BaseModel):
     """Auto-prepared per-speaker playback tracks: every overlap region is
-    replaced by that speaker's isolated voice, the rest stays original."""
+    replaced by that speaker's isolated voice, the rest stays original.
 
-    regions: list[OverlapRegionIn] = Field(min_length=1)
-    turns: list[TurnInput] = Field(min_length=1)
+    With `speaker_regions` the track is also gated to that speaker — silent
+    everywhere else, same length and timings as the original — which makes it
+    usable as a standalone stem, not just as playback for the frontend gate.
+    """
+
+    # Either list may be empty: overlap-free recordings still yield gated tracks,
+    # and gating-free ones still yield overlap replacements.
+    regions: list[OverlapRegionIn] = []
+    turns: list[TurnInput] = []
+    speaker_regions: list[SpeakerRegionIn] = []
     output: SeparationOutputParams = SeparationOutputParams()
     # Restore each assembled per-speaker track with Diamond (44.1 kHz output).
     restore: bool = False
