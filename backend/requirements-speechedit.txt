@@ -1,0 +1,40 @@
+# Runtime dependencies for the F5-TTS speech-edit engine
+# (SWivid/F5-TTS, F5TTS_v1_Base, pip package f5-tts).
+#
+# This is NOT a plain `pip install -r` file: f5-tts must be installed with
+# --no-deps, so use scripts/install-speechedit.sh (or .ps1) which runs the exact
+# dance below. It is documented here for reference.
+#
+# The catch: f5-tts's pyproject drags in gradio, bitsandbytes, and other deps
+# that inference never imports, and gradio's fastapi/pydantic pins are a real
+# collision risk with this app. So install f5-tts WITHOUT its deps, then add only
+# the runtime deps traced through real imports:
+#
+#   pip install --no-deps f5-tts
+#   pip install cached_path hydra-core vocos torchdiffeq pypinyin rjieba tomli \
+#               ema_pytorch wandb datasets
+#
+# The wheel still ships configs/*.yaml and the bundled vocab, so no extra data
+# files are needed.
+#
+# ema_pytorch, wandb, and datasets are IMPORT-TIME-ONLY landmines: inference uses
+# none of them, but f5_tts/model/__init__.py unconditionally imports the Trainer
+# (which imports ema_pytorch and wandb) and, via dataset.py, `datasets`. Those
+# imports must resolve or the package will not load at all.
+#
+# hydra-core is also used by the Convert (Seed-VC) engine; it is repeated here so
+# this requirement set stands alone.
+#
+# Already present in the venv (base + denoise + separation + convert sets), not
+# repeated here: torch 2.8, torchaudio, transformers 4.57.6, numpy 2.2.6,
+# librosa, x-transformers 2.3.1, accelerate, soundfile, pydub, click, omegaconf,
+# matplotlib, safetensors, tqdm, torchcodec.
+#
+# Expected `pip check` noise: because f5-tts is installed with --no-deps, `pip
+# check` WILL report f5-tts as having unmet requirements (gradio, bitsandbytes,
+# etc.). That is EXPECTED and harmless -- those pins were skipped on purpose.
+# Only pip-check complaints that mention OTHER packages are worth investigating.
+#
+# Checkpoints (into the repo's models/ HF cache):
+#   SWivid/F5-TTS  F5TTS_v1_Base/model_1250000.safetensors  (~1.35 GB)
+#   charactr/vocos-mel-24khz  config.yaml + pytorch_model.bin  (~54 MB)

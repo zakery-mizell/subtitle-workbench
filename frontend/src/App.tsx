@@ -4,6 +4,7 @@ import {
   ArrowLeftRight,
   ArrowRightLeft,
   AudioLines,
+  Bandage,
   BookOpen,
   ClipboardCheck,
   Download,
@@ -41,6 +42,7 @@ import MasteringPanel from "./MasteringPanel";
 import OverlapsPanel from "./OverlapsPanel";
 import RestorePanel from "./RestorePanel";
 import ConvertPanel from "./ConvertPanel";
+import PatchPanel from "./PatchPanel";
 import type { RegionReport, SeparationResult } from "./lib/separation";
 import { fetchSoloTracksJob, separatedAudioUrl, startSoloTracksJob } from "./lib/separation";
 import type {
@@ -238,6 +240,7 @@ const SIDE_PANEL_TABS = [
   { id: "overlaps", label: "Overlaps" },
   { id: "restore", label: "Restore" },
   { id: "convert", label: "Convert" },
+  { id: "patch", label: "Patch" },
   { id: "master", label: "Master" },
   { id: "export", label: "Export" },
 ] as const;
@@ -248,6 +251,7 @@ const SIDE_PANEL_TAB_ICONS = {
   overlaps: AudioLines,
   restore: Gem,
   convert: ArrowRightLeft,
+  patch: Bandage,
   master: Wand2,
   export: Download,
 } as const;
@@ -2679,7 +2683,7 @@ function App() {
             showTimingHighlights: typeof saved.showTimingHighlights === "boolean" ? saved.showTimingHighlights : true,
             viewMode: saved.viewMode === "transcript" ? "transcript" : "subtitles",
             sidePanelTab:
-              saved.sidePanelTab === "jargon" || saved.sidePanelTab === "qa" || saved.sidePanelTab === "guide" || saved.sidePanelTab === "overlaps" || saved.sidePanelTab === "restore" || saved.sidePanelTab === "convert" || saved.sidePanelTab === "master" || saved.sidePanelTab === "export"
+              saved.sidePanelTab === "jargon" || saved.sidePanelTab === "qa" || saved.sidePanelTab === "guide" || saved.sidePanelTab === "overlaps" || saved.sidePanelTab === "restore" || saved.sidePanelTab === "convert" || saved.sidePanelTab === "patch" || saved.sidePanelTab === "master" || saved.sidePanelTab === "export"
                 ? saved.sidePanelTab
                 : "guide",
             isGuidePanelCollapsed: DEFAULT_GUIDE_PANEL_COLLAPSED,
@@ -3183,6 +3187,12 @@ function App() {
                 title: "Seed-VC voice conversion",
                 detail: "Re-voice with a reference clip",
               }
+          : sidePanelTab === "patch"
+            ? {
+                eyebrow: "Patch",
+                title: "F5-TTS speech editing",
+                detail: "Regenerate muffled words in place",
+              }
           : sidePanelTab === "master"
             ? {
                 eyebrow: "Master",
@@ -3213,6 +3223,8 @@ function App() {
             ? "Diamond restoration"
             : sidePanelTab === "convert"
               ? "Seed-VC conversion"
+            : sidePanelTab === "patch"
+              ? "F5-TTS patching"
             : sidePanelTab === "master"
             ? processedAudio
               ? "Processed audio loaded"
@@ -3617,7 +3629,7 @@ function App() {
     setShowTimingHighlights(Boolean(persisted.showTimingHighlights));
     setViewMode(persisted.viewMode === "transcript" ? "transcript" : "subtitles");
     setSidePanelTab(
-      persisted.sidePanelTab === "jargon" || persisted.sidePanelTab === "qa" || persisted.sidePanelTab === "guide" || persisted.sidePanelTab === "overlaps" || persisted.sidePanelTab === "restore" || persisted.sidePanelTab === "convert" || persisted.sidePanelTab === "master" || persisted.sidePanelTab === "export"
+      persisted.sidePanelTab === "jargon" || persisted.sidePanelTab === "qa" || persisted.sidePanelTab === "guide" || persisted.sidePanelTab === "overlaps" || persisted.sidePanelTab === "restore" || persisted.sidePanelTab === "convert" || persisted.sidePanelTab === "patch" || persisted.sidePanelTab === "master" || persisted.sidePanelTab === "export"
         ? persisted.sidePanelTab
         : "guide",
     );
@@ -5854,6 +5866,10 @@ function App() {
 
                 {sidePanelTab === "convert" ? (
                   <ConvertPanel apiBaseUrl={API_BASE_URL} audioFile={selectedFile} />
+                ) : null}
+
+                {sidePanelTab === "patch" ? (
+                  <PatchPanel apiBaseUrl={API_BASE_URL} audioFile={selectedFile} />
                 ) : null}
 
                 {sidePanelTab === "master" ? (

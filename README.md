@@ -208,6 +208,47 @@ Notes / caveats:
 - Seed-VC model code is vendored into `vendor/seed-vc/` (not pip-installable); checkpoints land in
   the repo's `models/` Hugging Face cache.
 
+## Speech editing ("Patch")
+
+[F5-TTS](https://github.com/SWivid/F5-TTS) (`F5TTS_v1_Base`) is a flow-matching TTS model that works
+in the mel domain, which unlocks two modes under one **Patch** tab:
+
+- **Patch words** (the headline feature): upload a full recording, mark one or more time spans whose
+  words are garbled or misspoken, type the replacement text per span, and F5-TTS regenerates *only*
+  those spans by mel-domain infilling conditioned on the surrounding audio — so the patch inherits
+  the surrounding voice and prosody. Audio outside the edited windows stays bit-identical.
+- **Generate speech**: zero-shot voice-cloned TTS — upload a reference clip (plus its transcript,
+  auto-transcribed with WhisperX if you leave it blank) and synthesize arbitrary text in that voice.
+
+Both modes emit 24 kHz mono. Install it first (python deps plus the checkpoint and vocoder):
+
+```bash
+./scripts/install-speechedit.sh        # macOS
+powershell -ExecutionPolicy Bypass -File .\scripts\install-speechedit.ps1   # Windows
+```
+
+Usage: one upload plus `params_json` (`POST /api/speech-edit`, polled like the other engines). The
+upload is the full recording in Patch mode and the reference clip in Generate mode; the output
+artifact is served/deleted like everything else.
+
+Notes / caveats:
+
+- Each edit span is patched inside a padded **window** (4 s of context each side, capped at 25 s
+  total; spans over 20 s are rejected). The recording is transcribed once with WhisperX; each
+  window's target transcript is built by swapping the edited span's words for your replacement text.
+  If degraded audio will not transcribe, supply a per-span **window text override**.
+- Edits are validated (non-overlapping, in-bounds, sorted) and spliced back-to-front with 0.15 s
+  crossfades so earlier patches never shift later timestamps. An optional per-span **target
+  duration** re-times a patch instead of matching the original span length.
+- Generate mode **requires** a reference transcript — F5-TTS has no x-vector fallback, so a failed
+  auto-transcription fails the job with a clear message. The reference is trimmed to 12 s (with a
+  warning) so the transcript matches what the model sees.
+- Device auto-policy is cuda → mps → cpu (MPS *is* auto-picked — this is a compute-bound
+  transformer); F5-TTS enforces fp32 off-cuda itself. Set `SPEECHEDIT_DEVICE` to override.
+- `f5-tts` is installed with `--no-deps` (its gradio/bitsandbytes pins would collide); `pip check`
+  will flag its own unmet pins, which is expected noise. Checkpoints land in the repo's `models/` HF
+  cache.
+
 ## Project layout
 
 - `backend/app/main.py`
@@ -216,15 +257,18 @@ Notes / caveats:
 - `backend/app/separation/` (UniSE overlap separation: engine, blending, overlap math)
 - `backend/app/restore/` (Diamond speech-restoration engine + job service)
 - `backend/app/conversion/` (Seed-VC voice-conversion engine + job service)
-- `backend/app/jobs.py` (in-process job registry shared by mastering, separation, restore, and conversion)
+- `backend/app/speechedit/` (F5-TTS speech-edit engine + windowing/job service)
+- `backend/app/jobs.py` (in-process job registry shared by mastering, separation, restore, conversion, and speech-edit)
 - `frontend/src/App.tsx`
 - `frontend/src/MasteringPanel.tsx`
 - `frontend/src/OverlapsPanel.tsx`
 - `frontend/src/ConvertPanel.tsx`
+- `frontend/src/PatchPanel.tsx`
 - `scripts/install.ps1` (Windows) / `scripts/install.sh` (macOS)
 - `scripts/install-unise.ps1` / `scripts/install-unise.sh` (optional overlap-separation engine)
 - `scripts/install-restore.ps1` / `scripts/install-restore.sh` (optional Diamond restore engine)
 - `scripts/install-convert.ps1` / `scripts/install-convert.sh` (optional Seed-VC voice-conversion engine)
+- `scripts/install-speechedit.ps1` / `scripts/install-speechedit.sh` (optional F5-TTS speech-edit engine)
 
 ## Configure
 

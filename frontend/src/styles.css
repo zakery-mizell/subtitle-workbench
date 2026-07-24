@@ -533,6 +533,18 @@ button.caption-event-badge {
   box-shadow: var(--shadow-sm);
 }
 
+/* One editable span in the Patch panel's edit list. */
+.patch-edit-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.7rem;
+  margin-bottom: 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-muted);
+}
+
 .panel-tabbar {
   width: 100%;
   display: grid;

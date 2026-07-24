@@ -30,6 +30,8 @@ from .restore.service import find_restore_artifact, run_restore
 from .separation.overlap import find_overlap_regions
 from .separation.schemas import SeparationParams, SeparationResult, SoloTracksParams, SoloTracksResult
 from .separation.service import find_separation_artifact, run_separation, run_solo_tracks
+from .speechedit.schemas import SpeechEditParams, SpeechEditResult
+from .speechedit.service import find_speechedit_artifact, run_speechedit
 from .text_processing import build_captions, build_guide_blocks, build_paragraphs, build_words, remove_disfluencies
 from .waveform_analysis import analyze_waveform
 from .whisperx_transcription import transcribe_with_whisperx
@@ -707,6 +709,72 @@ def converted_waveform(token: str) -> WaveformAnalysisResponse:
 @app.delete("/api/convert/{token}")
 def delete_converted(token: str) -> dict[str, str]:
     artifact = find_conversion_artifact(token)
+    if artifact:
+        delete_file_quietly(str(artifact))
+    return {"status": "deleted"}
+
+
+def parse_speechedit_params(params_json: str) -> SpeechEditParams:
+    try:
+        return SpeechEditParams.model_validate_json(params_json)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"params_json is not a valid speech-edit configuration. Details: {exc.error_count()} invalid field(s).") from exc
+
+
+@app.post("/api/speech-edit", response_model=MasterJobResponse)
+async def speech_edit_endpoint(
+    audio: UploadFile = File(...),
+    params_json: str = Form("{}"),
+) -> MasterJobResponse:
+    # The single upload is the reference clip in generate mode and the full
+    # recording to patch in edit mode.
+    params = parse_speechedit_params(params_json)
+    source_filename = audio.filename or "audio"
+    source_path = await save_upload_to_temp(audio)
+
+    job_registry.purge_expired(settings.mastering_job_ttl_seconds, delete_artifact=delete_file_quietly)
+
+    def run(job, reporter) -> SpeechEditResult:
+        try:
+            result = run_speechedit(source_path, source_filename, params, reporter)
+        finally:
+            delete_file_quietly(source_path)
+        artifact = find_speechedit_artifact(result.token)
+        if artifact:
+            job.artifacts.append(str(artifact))
+        return result
+
+    return MasterJobResponse(job_id=job_registry.submit(run))
+
+
+def resolve_speechedit_artifact(token: str) -> Path:
+    artifact = find_speechedit_artifact(token)
+    if artifact is None or not artifact.is_file():
+        raise HTTPException(status_code=404, detail="No patched audio was found for this token. It may have expired.")
+    return artifact
+
+
+@app.get("/api/speech-edit/{token}/audio")
+@app.head("/api/speech-edit/{token}/audio")  # reload revalidation probes artifacts with HEAD
+def speechedit_audio_file(token: str) -> FileResponse:
+    artifact = resolve_speechedit_artifact(token)
+    media_type = MASTER_MEDIA_TYPES.get(artifact.suffix.lower(), "application/octet-stream")
+    download_name = artifact.name.split("__", 1)[-1]
+    return FileResponse(str(artifact), media_type=media_type, filename=download_name)
+
+
+@app.get("/api/speech-edit/{token}/waveform", response_model=WaveformAnalysisResponse)
+def speechedit_waveform(token: str) -> WaveformAnalysisResponse:
+    artifact = resolve_speechedit_artifact(token)
+    try:
+        return analyze_waveform(str(artifact))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.delete("/api/speech-edit/{token}")
+def delete_speechedit(token: str) -> dict[str, str]:
+    artifact = find_speechedit_artifact(token)
     if artifact:
         delete_file_quietly(str(artifact))
     return {"status": "deleted"}

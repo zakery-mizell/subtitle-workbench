@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     # Seed-VC voice-conversion device (env CONVERSION_DEVICE). None = auto: cuda,
     # else mps, else cpu (mps IS auto-picked here; see conversion/engine.py notes).
     conversion_device: str | None = None
+    # F5-TTS speech-edit device (env SPEECHEDIT_DEVICE). None = auto: cuda, else
+    # mps, else cpu (mps IS auto-picked here; see speechedit/engine.py notes).
+    speechedit_device: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=str(ROOT_DIR / ".env"),
