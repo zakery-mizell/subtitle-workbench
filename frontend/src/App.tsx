@@ -1916,24 +1916,95 @@ function hasExplicitImportedSpeakerLabels(captions: Caption[]): boolean {
 }
 
 // Only-speaker playback gates on `word.speaker_id`, so speakers that come from SRT labels
-// have to be pushed down onto the words the captions matched. Unmatched words stay
-// unattributed, which the solo gate correctly treats as "not the soloed speaker".
+// have to be pushed down onto the words. Text-based caption<->word matching is too fragile
+// to carry that: the anchor pass runs on the `tiny` model, whose garbled text matches only
+// a fraction of the words (measured 244 of 3216 on a real 19-minute load), which left the
+// solo gate closed almost everywhere. The SRT's own clock is the ground truth here, so a
+// word belongs to the caption whose time range contains its midpoint. Words outside every
+// caption stay unattributed, which the solo gate correctly treats as "not the soloed
+// speaker". When captions overlap, the latest-starting one wins.
 function retagWordsFromCaptions(words: WordToken[], captions: Caption[]): WordToken[] {
-  const speakerByWordId = new Map<string, { speaker_id: number | null; speaker_name: string | null }>();
-  for (const caption of captions) {
-    for (const wordId of caption.word_ids) {
-      speakerByWordId.set(wordId, { speaker_id: caption.speaker_id, speaker_name: caption.speaker_name });
+  const ranges = [...captions].filter((caption) => caption.end > caption.start).sort((a, b) => a.start - b.start);
+  const starts = ranges.map((caption) => caption.start);
+  const maxDuration = ranges.reduce((max, caption) => Math.max(max, caption.end - caption.start), 0);
+
+  const captionAt = (time: number): Caption | null => {
+    let low = 0;
+    let high = starts.length - 1;
+    let latestStarted = -1;
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      if (starts[mid] <= time) {
+        latestStarted = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    for (let index = latestStarted; index >= 0 && starts[index] > time - maxDuration - 0.001; index--) {
+      if (time < ranges[index].end) {
+        return ranges[index];
+      }
+    }
+    return null;
+  };
+
+  return words.map((word) => {
+    const owner = captionAt((word.start + word.end) / 2);
+    return {
+      ...word,
+      speaker_id: owner?.speaker_id ?? null,
+      speaker_name: owner?.speaker_name ?? null,
+    };
+  });
+}
+
+// Diarization numbers its speaker slots by order of first appearance in the audio, which has
+// no relation to the SRT's label order. Each slot is majority-voted onto the SRT speaker who
+// owns most of the words diarization put in that slot, so speaker turns and overlap regions
+// (which the Overlaps panel names and separates by index) keep the SRT's identities. Slots
+// with no vote keep their index rather than guessing.
+function remapDiarizedSpeakerIndices(
+  baseSession: TranscriptResponse,
+  taggedWords: WordToken[],
+): Pick<TranscriptResponse, "speaker_turns" | "overlap_regions"> {
+  const votes = new Map<number, Map<number, number>>();
+  baseSession.words.forEach((word, index) => {
+    const slot = word.speaker_id;
+    const srtSpeaker = taggedWords[index]?.speaker_id;
+    if (slot === null || slot === undefined || srtSpeaker === null || srtSpeaker === undefined) {
+      return;
+    }
+    const tally = votes.get(slot) ?? new Map<number, number>();
+    tally.set(srtSpeaker, (tally.get(srtSpeaker) ?? 0) + 1);
+    votes.set(slot, tally);
+  });
+
+  const mapping = new Map<number, number>();
+  for (const [slot, tally] of votes) {
+    let best = -1;
+    let bestCount = 0;
+    for (const [speakerId, count] of tally) {
+      if (count > bestCount) {
+        best = speakerId;
+        bestCount = count;
+      }
+    }
+    if (best >= 0) {
+      mapping.set(slot, best);
     }
   }
 
-  return words.map((word) => {
-    const assigned = speakerByWordId.get(word.id);
-    return {
-      ...word,
-      speaker_id: assigned?.speaker_id ?? null,
-      speaker_name: assigned?.speaker_name ?? null,
-    };
-  });
+  return {
+    speaker_turns: baseSession.speaker_turns?.map((turn) => ({
+      ...turn,
+      speaker_index: mapping.get(turn.speaker_index) ?? turn.speaker_index,
+    })),
+    overlap_regions: baseSession.overlap_regions?.map((region) => ({
+      ...region,
+      speaker_indices: [...new Set(region.speaker_indices.map((index) => mapping.get(index) ?? index))],
+    })),
+  };
 }
 
 function buildRealignedImportedSession(
@@ -1956,9 +2027,11 @@ function buildRealignedImportedSession(
   const paragraphs = applyBlockSpeakers(buildParagraphsFromCaptions(alignedCaptions), baseSession.words);
   const matchedCaptionCount = alignedCaptions.filter((caption) => caption.word_ids.length > 0).length;
   const words = importedHasSpeakers ? retagWordsFromCaptions(baseSession.words, alignedCaptions) : cloneWords(baseSession.words);
+  const remappedIndices = importedHasSpeakers ? remapDiarizedSpeakerIndices(baseSession, words) : {};
 
   return {
     ...baseSession,
+    ...remappedIndices,
     audio_filename: audioFilename,
     duration: baseSession.duration ?? alignedCaptions[alignedCaptions.length - 1]?.end ?? null,
     speakers: speakerSource.map((speaker) => ({ ...speaker })),
@@ -4296,21 +4369,27 @@ function App() {
     }
 
     const importedHasSpeakers = hasExplicitImportedSpeakerLabels(captions);
+    const importedSpeakers = importedHasSpeakers ? normalizeImportedCaptions(captions).speakers : null;
+    const diarizingForOverlaps = Boolean(importedSpeakers && importedSpeakers.length > 1);
 
     setLoading(true);
     setStatusMessage(
       options?.retimeCaptions
         ? "Running a quick `tiny` word-timing pass on the uploaded audio and retiming the imported captions."
-        : "Running a quick `tiny` word-timing pass on the uploaded audio while preserving the imported SRT timing.",
+        : diarizingForOverlaps
+          ? "Running a `tiny` word-timing pass plus diarization (for overlap detection) while preserving the imported SRT timing."
+          : "Running a quick `tiny` word-timing pass on the uploaded audio while preserving the imported SRT timing.",
     );
     requestCompletionNotificationPermission();
     try {
       const payload = await requestTranscription(resumeAudioFile, {
         // Legacy loads only need word timings to match the imported text onto the audio;
         // no transcribed word is surfaced as content, so the smallest model is enough.
-        // A labeled SRT also makes diarization pointless — its labels re-tag the words.
+        // A labeled SRT supplies its own speakers, which the load sends along so
+        // diarization still runs (overlap detection needs its turns) — but the SRT's
+        // labels, not diarization's arbitrary slots, are what re-tag the words.
         model: "tiny",
-        speakers: importedHasSpeakers ? buildDefaultSpeakers() : undefined,
+        speakers: importedSpeakers ?? undefined,
       });
       const importedSession = buildRealignedImportedSession(resumeAudioFile.name, captions, payload, options);
       const normalizedImportedSession = {
