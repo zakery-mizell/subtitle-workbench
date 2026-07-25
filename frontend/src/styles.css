@@ -1636,9 +1636,22 @@ select.transport-speed {
   font-size: 0.8rem;
 }
 
-select.transport-solo {
-  max-width: 11rem;
+/* One mute toggle per speaker, in the same segmented control as the A/B switch.
+   The transport bar is tight, so names are clipped rather than allowed to push
+   the clock off the row. */
+.transport-speakers button {
+  max-width: 7.5rem;
+  overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.78rem;
+}
+
+.mode-toggle button.is-muted {
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+  text-decoration: line-through;
 }
 
 /* Side panel icon tabs */

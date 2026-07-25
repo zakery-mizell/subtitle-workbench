@@ -273,11 +273,11 @@ export function OverlapsPanel({
       {regions.length ? (
         <>
           <div className="panel-section-heading">
-            <p className="eyebrow">Only-speaker playback</p>
+            <p className="eyebrow">Per-speaker muting</p>
             <h3>Per-speaker solo tracks</h3>
           </div>
           <p className="helper-text">
-            The transport bar&apos;s Only-speaker selector plays each voice alone, isolating them inside overlaps.
+            The transport bar&apos;s speaker toggles mute one voice at a time, even inside overlaps.
             These tracks are prepared automatically.
           </p>
           <label className="mastering-toggle">

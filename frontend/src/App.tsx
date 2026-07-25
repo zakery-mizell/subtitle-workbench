@@ -39,12 +39,14 @@ import { remapCaptions, remapGuideBlocks, remapTime, remapWords, unremapTime } f
 import type { CutRegion, MasteringResult } from "./lib/mastering";
 import {
   MEDIA_HAVE_METADATA,
-  chooseAudibleTarget,
+  chooseAudibleSet,
   chooseClockSource,
   classifySoloTrack,
   followersShareClockTimeline,
   shouldCorrectFollower,
+  unionIntervals,
 } from "./lib/playbackSync";
+import type { SpeakerTrackInput } from "./lib/playbackSync";
 import { materializeRegions, regionsToSpeakerMap, sanitizeSpeakerRegions } from "./lib/regions";
 import type { RegionMarker } from "./lib/regions";
 import { parseSrt } from "./lib/srt";
@@ -174,9 +176,10 @@ const SPEAKER_ASSIGNMENT_OPTIONS: Array<{ value: SpeakerAssignmentMode; label: s
   { value: "word", label: "Word (tighter switches)" },
 ];
 
-// Solo-speaker playback: audio outside the soloed speaker's word spans is
-// muted. Spans get edge padding so word onsets are not clipped, and nearby
-// spans merge so playback does not stutter between words.
+// Fallback gate for muted-speaker playback before the rendered tracks exist:
+// audio outside the audible speakers' word spans is muted. Spans get edge padding
+// so word onsets are not clipped, and nearby spans merge so playback does not
+// stutter between words.
 const SOLO_SPAN_PADDING_S = 0.15;
 const SOLO_SPAN_MERGE_GAP_S = 0.6;
 
@@ -199,13 +202,9 @@ const SHARED_SPAN_MIN_MINORITY_S = 0.15;
 const REGION_EXTEND_S = 0.25;
 const REGION_SILENCE_MARGIN_S = 0.08;
 // The handful of shared-span splits do cut mid-speech; ramp the playback gate
-// there instead of stepping it, or the cut clicks.
+// there instead of stepping it, or the cut clicks. Only the fallback gate on the
+// clock uses this -- rendered speaker tracks arrive already faded server-side.
 const GATE_RAMP_S = 0.04;
-// One-shot resync of a newly audible speaker track: long enough for it to have
-// settled into steady playback, short enough that the nudge still lands inside
-// the change of voice.
-const AUDIBLE_SETTLE_DELAY_MS = 500;
-const AUDIBLE_SETTLE_TOLERANCE_S = 0.05;
 
 interface SoloInterval {
   start: number;
@@ -443,20 +442,6 @@ function regionsSignature(regions: { start: number; end: number; speaker_index: 
     }
   }
   return (hash >>> 0).toString(36);
-}
-
-function mergeIntervalLists(...lists: SoloInterval[][]): SoloInterval[] {
-  const spans = lists.flat().sort((a, b) => a.start - b.start);
-  const merged: SoloInterval[] = [];
-  for (const span of spans) {
-    const previous = merged[merged.length - 1];
-    if (previous && span.start - previous.end <= SOLO_SPAN_MERGE_GAP_S) {
-      previous.end = Math.max(previous.end, span.end);
-    } else {
-      merged.push({ ...span });
-    }
-  }
-  return merged;
 }
 
 /** Index of the interval containing `time`, or -1. Requires sorted intervals. */
@@ -2987,7 +2972,14 @@ function App() {
   const [audioDuration, setAudioDuration] = useState(0);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [userMuted, setUserMuted] = useState(false);
-  const [soloSpeakerId, setSoloSpeakerId] = useState<number | null>(null);
+  // Audibility is expressed as the set of muted speakers, not a soloed one: with
+  // the set empty the clock plays as it always did, and with anything in it every
+  // unmuted speaker's server-gated track plays instead. Session-only, never
+  // persisted.
+  const [mutedSpeakerIds, setMutedSpeakerIds] = useState<Set<number>>(() => new Set());
+  // Set by the audibility pass when no usable track set exists yet, so the clock
+  // has to stand in gated. The only state in which the frontend touches volume.
+  const [fallbackGateActive, setFallbackGateActive] = useState(false);
   // Auto-prepared per-speaker tracks whose overlap sections contain only that
   // speaker's separated voice; keyed by speaker index (appearance order).
   const [soloTracks, setSoloTracks] = useState<{
@@ -3015,18 +3007,18 @@ function App() {
   const [backendCapabilities, setBackendCapabilities] = useState<BackendCapabilities | null>(null);
 
   // The clock: the element whose currentTime is authoritative. Never repointed by
-  // the solo selector -- see the clock effect below.
+  // muting -- see the clock effect below.
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const originalAudioRef = useRef<HTMLAudioElement | null>(null);
   const masteredAudioRef = useRef<HTMLAudioElement | null>(null);
-  // Every rendered solo track stays mounted, so switching the soloed speaker is a
-  // mute swap rather than a media-element swap. Keyed by artifact token, not by
-  // speaker index: a re-render replaces one element with another for the same
-  // speaker, and the token tells the two apart during the swap.
+  // Every rendered solo track stays mounted, so muting a speaker is a mute swap
+  // rather than a media-element swap. Keyed by artifact token, not by speaker
+  // index: a re-render replaces one element with another for the same speaker,
+  // and the token tells the two apart during the swap.
   const soloTrackElementsRef = useRef(new Map<string, HTMLAudioElement>());
-  // Token of the solo track currently carrying the sound (null = the clock is).
-  const audibleSoloTokenRef = useRef<string | null>(null);
-  const audibleSettleTimerRef = useRef<number | null>(null);
+  // Tokens of the speaker tracks currently carrying the sound (empty = the clock
+  // is). Read back as the `alreadyAudible` hysteresis input per track.
+  const audibleTrackTokensRef = useRef<Set<string>>(new Set());
   const soloTracksAttemptRef = useRef<string | null>(null);
   const persistedSoloTokensRef = useRef<SoloTrackArtifacts | null>(null);
   const userScrollAtRef = useRef(0);
@@ -3042,12 +3034,17 @@ function App() {
   const currentAudioFilename = selectedFile?.name ?? session?.audio_filename ?? null;
   const overlapRegions = useMemo<OverlapRegion[]>(() => session?.overlap_regions ?? [], [session]);
   const speakerTurns = useMemo<SpeakerTurn[]>(() => session?.speaker_turns ?? [], [session]);
-  // Speaker indices are appearance order, which matches session.speakers order.
-  const soloSpeakerIndex = useMemo(
-    () => (soloSpeakerId === null ? -1 : (session?.speakers.findIndex((speaker) => speaker.id === soloSpeakerId) ?? -1)),
-    [session, soloSpeakerId],
-  );
-  const activeSoloTrack = soloSpeakerIndex >= 0 ? (soloTracks.tracks[soloSpeakerIndex] ?? null) : null;
+  const activeWords = activeWorkspace?.words ?? session?.words ?? [];
+  // The speakers the mute toggles cover. Only speakers that actually say
+  // something: a silent speaker has no regions, so nothing is ever rendered for
+  // it, and counting it as unmuted would strand playback on the fallback gate.
+  const soloableSpeakers = useMemo(() => {
+    if (!session || session.speakers.length < 2) {
+      return [];
+    }
+    const spokenIds = new Set(activeWords.map((word) => word.speaker_id));
+    return session.speakers.filter((speaker) => spokenIds.has(speaker.id));
+  }, [session, activeWords]);
   const soloTrackEntries = useMemo(
     () =>
       Object.entries(soloTracks.tracks)
@@ -3061,6 +3058,19 @@ function App() {
     () => soloTrackEntries.map((entry) => `${entry.speakerIndex}:${entry.token}`).join("|"),
     [soloTrackEntries],
   );
+  // Each mutable speaker paired with the artifact token of its rendered track
+  // (null while nothing has been rendered for it). Track records are keyed by
+  // speaker index, which is appearance order -- the order of session.speakers.
+  const speakerTrackTokens = useMemo(() => {
+    const speakers = session?.speakers ?? [];
+    return soloableSpeakers.map((speaker) => {
+      const index = speakers.findIndex((entry) => entry.id === speaker.id);
+      return {
+        speakerId: speaker.id,
+        token: (index >= 0 ? soloTracks.tracks[index]?.token : null) ?? null,
+      };
+    });
+  }, [session, soloableSpeakers, soloTracks]);
 
   useEffect(() => {
     let cancelled = false;
@@ -3331,67 +3341,83 @@ function App() {
     setIsPlaying(!clock.paused);
   }, [playbackSource, processedAudio, audioUrl]);
 
-  // Audibility is the whole of what the solo selector changes: no seek, no play(),
-  // no unmount. Everything keeps playing; the mute flags move.
+  // Audibility is the whole of what a mute toggle changes: no seek, no play(), no
+  // unmount, no volume automation on the tracks. Everything keeps playing; the
+  // mute flags move. Rendered tracks are already gated server-side, so the sum of
+  // the unmuted ones IS the mix minus the muted voices -- re-gating them here is
+  // what produced the jitter this replaces.
   const applyAudibility = useCallback(() => {
     const clock = audioRef.current;
     if (!clock) {
       return;
     }
-    const soloToken = activeSoloTrack?.token ?? null;
-    const soloElement = soloToken ? (soloTrackElementsRef.current.get(soloToken) ?? null) : null;
-    const alreadyAudible = soloElement !== null && audibleSoloTokenRef.current === soloToken;
-    // Nudging the candidate here is safe precisely because it is still muted; once
-    // it is audible the drift loop leaves it alone.
-    if (
-      soloElement &&
-      !alreadyAudible &&
-      shouldCorrectFollower({ clockTime: clock.currentTime, followerTime: soloElement.currentTime, isAudible: false })
-    ) {
-      seekWhenReady(soloElement, clock.currentTime);
+    const previouslyAudible = audibleTrackTokensRef.current;
+    const elementsByToken = new Map<string, HTMLAudioElement>();
+    const speakers: SpeakerTrackInput[] = [];
+    for (const entry of speakerTrackTokens) {
+      const element = entry.token ? (soloTrackElementsRef.current.get(entry.token) ?? null) : null;
+      const alreadyAudible = element !== null && entry.token !== null && previouslyAudible.has(entry.token);
+      if (element && entry.token) {
+        elementsByToken.set(entry.token, element);
+      }
+      // Nudging a candidate here is safe precisely because it is still muted; once
+      // it is audible nothing seeks it again.
+      if (
+        element &&
+        !alreadyAudible &&
+        shouldCorrectFollower({ clockTime: clock.currentTime, followerTime: element.currentTime, isAudible: false })
+      ) {
+        seekWhenReady(element, clock.currentTime);
+      }
+      speakers.push({
+        speakerId: entry.speakerId,
+        muted: mutedSpeakerIds.has(entry.speakerId),
+        track: classifySoloTrack({
+          hasTrack: element !== null,
+          readyState: element?.readyState ?? 0,
+          offsetFromClock: element ? element.currentTime - clock.currentTime : 0,
+          alreadyAudible,
+        }),
+      });
     }
-    const target = chooseAudibleTarget({
+
+    const decision = chooseAudibleSet({
       playbackSource,
       hasMastered: masteredAudioRef.current !== null,
       masterHasCutTimeline: processedAudio?.hasCutTimeline ?? false,
-      soloSpeakerIndex,
-      soloTrackState: classifySoloTrack({
-        hasTrack: soloElement !== null,
-        readyState: soloElement?.readyState ?? 0,
-        offsetFromClock: soloElement ? soloElement.currentTime - clock.currentTime : 0,
-        alreadyAudible,
-      }),
+      speakers,
     });
-    const audible = target.audible === "solo" && soloElement ? soloElement : clock;
-    const promoted = audible !== clock && audibleSoloTokenRef.current !== soloToken;
-    audibleSoloTokenRef.current = audible === soloElement ? soloToken : null;
+
+    const audibleTokens = new Set<string>();
+    for (const speakerId of decision.audibleSpeakerIds) {
+      const token = speakerTrackTokens.find((entry) => entry.speakerId === speakerId)?.token;
+      if (token) {
+        audibleTokens.add(token);
+      }
+    }
+    audibleTrackTokensRef.current = audibleTokens;
+
+    const audibleElements = new Set<HTMLAudioElement>();
+    for (const token of audibleTokens) {
+      const element = elementsByToken.get(token);
+      if (element) {
+        audibleElements.add(element);
+      }
+    }
+    if (decision.clockAudible) {
+      audibleElements.add(clock);
+    }
     for (const element of collectTransportElements()) {
-      element.muted = element !== audible;
+      element.muted = !audibleElements.has(element);
     }
+    // Same value re-set on every timeupdate in the steady state; React bails out
+    // of those, so this does not re-render per tick.
+    setFallbackGateActive(decision.gateClock);
+  }, [collectTransportElements, mutedSpeakerIds, playbackSource, processedAudio, speakerTrackTokens]);
 
-    // Starting playback on a follower costs it a beat, so a freshly promoted
-    // track settles a bit behind the clock and then runs parallel forever --
-    // measured ~170 ms on a 19-minute file. The clock drives the transcript, the
-    // playhead and the solo gate, so that offset reads as everything being early.
-    // Correct it once, shortly after the swap, where a sub-200 ms nudge hides
-    // inside the change of voice; steady-state playback is still never seeked.
-    if (promoted && audible !== clock) {
-      window.clearTimeout(audibleSettleTimerRef.current ?? undefined);
-      audibleSettleTimerRef.current = window.setTimeout(() => {
-        const settleClock = audioRef.current;
-        if (!settleClock || audible.muted || audible.readyState < HTMLMediaElement.HAVE_METADATA) {
-          return;
-        }
-        if (Math.abs(audible.currentTime - settleClock.currentTime) > AUDIBLE_SETTLE_TOLERANCE_S) {
-          audible.currentTime = settleClock.currentTime;
-        }
-      }, AUDIBLE_SETTLE_DELAY_MS);
-    }
-  }, [activeSoloTrack, collectTransportElements, playbackSource, processedAudio, soloSpeakerIndex]);
-
-  // Re-evaluate audibility when the selection changes and whenever a track
-  // finishes loading, so a speaker soloed before its track was ready switches
-  // over on its own instead of staying on the gated clock.
+  // Re-evaluate audibility when the muted set changes and whenever a track
+  // finishes loading, so speakers muted before the tracks were ready move off the
+  // gated clock on their own.
   useEffect(() => {
     applyAudibility();
     const elements = collectTransportElements();
@@ -3548,10 +3574,10 @@ function App() {
   ]);
 
   // While the timelines match, mirror play/pause/seek/rate from the clock onto
-  // every follower, so switching which element is audible -- Original vs Mastered,
-  // or All speakers vs any one speaker -- is a mute swap and nothing more. Solo
-  // followers are mirrored whether or not a master exists, which is why this no
-  // longer bails out without processedAudio.
+  // every follower, so switching which elements are audible -- Original vs
+  // Mastered, or the clock vs the unmuted speakers' tracks -- is a mute swap and
+  // nothing more. Speaker tracks are mirrored whether or not a master exists,
+  // which is why this no longer bails out without processedAudio.
   useEffect(() => {
     const clock = audioRef.current;
     if (!clock) {
@@ -3608,17 +3634,7 @@ function App() {
     };
   }, [collectClockFollowers, collectTransportElements, processedAudio, audioUrl, playbackSource, soloTrackMountKey]);
 
-  const activeWords = activeWorkspace?.words ?? session?.words ?? [];
-
-  // Solo-speaker playback: which speakers can be soloed, and when the soloed one is audible.
-  const soloableSpeakers = useMemo(() => {
-    if (!session || session.speakers.length < 2) {
-      return [];
-    }
-    const spokenIds = new Set(activeWords.map((word) => word.speaker_id));
-    return session.speakers.filter((speaker) => spokenIds.has(speaker.id));
-  }, [session, activeWords]);
-  // One shared derivation of the snapped regions: the solo gate and the solo-track
+  // One shared derivation of the snapped regions: the fallback gate and the solo-track
   // job must gate on exactly the same edges. Null means "not derivable" (no
   // waveform analysis yet, or no speaker-labelled captions) — then the legacy
   // word-span path applies.
@@ -3652,49 +3668,77 @@ function App() {
     () => regionOverrides ?? materializeRegions(derivedSpeakerRegions),
     [regionOverrides, derivedSpeakerRegions],
   );
-  const soloIntervals = useMemo(() => {
-    if (soloSpeakerId === null) {
+  // Envelope for the fallback gate only: the union of the regions belonging to the
+  // speakers that are still audible. It gates the CLOCK -- the full mixture --
+  // while the per-speaker tracks are missing or still catching up, so it is the
+  // one place volume automation is still correct. Deliberately not unioned with
+  // speakerTurns: diarized turn edges are not silence-aligned, and over the
+  // mixture they would let a muted voice back in.
+  const fallbackGateIntervals = useMemo(() => {
+    if (!mutedSpeakerIds.size) {
       return [];
     }
-    const snapped = speakerRegions?.get(soloSpeakerId);
-    if (snapped?.length) {
-      // Deliberately not unioned with speakerTurns: diarized turn edges are not
-      // silence-aligned and would drag the gate back over the other voice.
-      return snapped;
-    }
-    const wordIntervals = buildSpeakerIntervals(activeWords, soloSpeakerId);
-    if (!activeSoloTrack || soloSpeakerIndex < 0) {
-      return wordIntervals;
-    }
-    // The solo track already isolates this voice inside overlaps, so open the
-    // gate for every diarized turn — including overlap spans whose words never
-    // made it into the transcript.
-    const turnIntervals = speakerTurns
-      .filter((turn) => turn.speaker_index === soloSpeakerIndex)
-      .map((turn) => ({
-        start: Math.max(0, turn.start - SOLO_SPAN_PADDING_S),
-        end: turn.end + SOLO_SPAN_PADDING_S,
-      }));
-    return mergeIntervalLists(wordIntervals, turnIntervals);
-  }, [activeWords, soloSpeakerId, speakerRegions, activeSoloTrack, soloSpeakerIndex, speakerTurns]);
+    const lists = soloableSpeakers
+      .filter((speaker) => !mutedSpeakerIds.has(speaker.id))
+      .map((speaker) => {
+        const snapped = speakerRegions?.get(speaker.id);
+        return snapped?.length ? snapped : buildSpeakerIntervals(activeWords, speaker.id);
+      });
+    return unionIntervals(lists);
+  }, [activeWords, mutedSpeakerIds, soloableSpeakers, speakerRegions]);
 
+  // Speakers that no longer exist cannot be unmuted again, so drop them; a fresh
+  // speaker roster (new session, re-import, retag) starts everyone audible.
+  const soloableSpeakerKey = useMemo(() => soloableSpeakers.map((speaker) => speaker.id).join(","), [soloableSpeakers]);
+  const lastSoloableSpeakerKeyRef = useRef(soloableSpeakerKey);
   useEffect(() => {
-    if (soloSpeakerId !== null && !soloableSpeakers.some((speaker) => speaker.id === soloSpeakerId)) {
-      setSoloSpeakerId(null);
+    if (lastSoloableSpeakerKeyRef.current === soloableSpeakerKey) {
+      return;
     }
-  }, [soloSpeakerId, soloableSpeakers]);
+    lastSoloableSpeakerKeyRef.current = soloableSpeakerKey;
+    setMutedSpeakerIds((current) => (current.size ? new Set<number>() : current));
+  }, [soloableSpeakerKey]);
+
+  const toggleSpeakerMuted = useCallback((speakerId: number) => {
+    setMutedSpeakerIds((current) => {
+      const next = new Set(current);
+      if (!next.delete(speakerId)) {
+        next.add(speakerId);
+      }
+      return next;
+    });
+  }, []);
+
+  // The Regions panel still speaks in terms of one soloed lane: exactly one
+  // speaker left audible is that lane, anything else is no solo at all.
+  const soloSpeakerId = useMemo(() => {
+    const unmuted = soloableSpeakers.filter((speaker) => !mutedSpeakerIds.has(speaker.id));
+    return mutedSpeakerIds.size && unmuted.length === 1 ? unmuted[0].id : null;
+  }, [mutedSpeakerIds, soloableSpeakers]);
+  const handleSoloSpeakerChange = useCallback(
+    (speakerId: number | null) => {
+      setMutedSpeakerIds(
+        speakerId === null
+          ? new Set<number>()
+          : new Set(soloableSpeakers.filter((speaker) => speaker.id !== speakerId).map((speaker) => speaker.id)),
+      );
+    },
+    [soloableSpeakers],
+  );
 
   // The gate reads the clock, not whichever element happens to be audible: the
   // regions are on the clock's timeline, and the audible element can change under
   // it at any moment. Every element gets the same gain so a swap cannot step it.
+  // Outside the fallback the gain is a flat 1 (or 0 for the user's own mute):
+  // server-gated tracks must not be re-gated client-side.
   const applyPlaybackVolume = useCallback(() => {
-    const gateActive = soloSpeakerId !== null && soloIntervals.length > 0;
+    const gateActive = fallbackGateActive && fallbackGateIntervals.length > 0;
     const time = audioRef.current?.currentTime ?? 0;
-    const gain = userMuted ? 0 : gateActive ? intervalGainAt(time, soloIntervals, GATE_RAMP_S) : 1;
+    const gain = userMuted ? 0 : gateActive ? intervalGainAt(time, fallbackGateIntervals, GATE_RAMP_S) : 1;
     for (const element of collectTransportElements()) {
       element.volume = gain;
     }
-  }, [collectTransportElements, userMuted, soloSpeakerId, soloIntervals]);
+  }, [collectTransportElements, userMuted, fallbackGateActive, fallbackGateIntervals]);
 
   useEffect(() => {
     applyPlaybackVolume();
@@ -3749,8 +3793,8 @@ function App() {
   // overlap regions — or the captions yield snapped speaker regions — one
   // background job renders a per-speaker version of the recording whose overlaps
   // contain only that speaker's separated voice, gated to that speaker's regions.
-  // The "Only <name>" selector then just works — no extra buttons. Main playback
-  // (All speakers) never uses these tracks.
+  // The mute toggles then just work — no extra buttons. With nobody muted these
+  // tracks are never audible.
   useEffect(() => {
     const canSeparate = overlapRegions.length > 0 && speakerTurns.length > 0;
     if (!session || !selectedFile || (!canSeparate && !soloTrackRegionCount)) {
@@ -3859,11 +3903,13 @@ function App() {
     };
   }, [session, selectedFile, overlapRegions, speakerTurns, soloTrackRegionCount, restoreSoloTracks, trackRenderNonce]);
 
-  // While a speaker is soloed, also re-evaluate audibility every frame so the
-  // mute gate tracks playback more tightly than timeupdate's ~4 Hz. This loop
-  // pauses in hidden tabs, where the timeupdate listener above keeps gating.
+  // Only the fallback gate needs per-frame gain: it rides region edges on the
+  // clock, which timeupdate's ~4 Hz would step through audibly. Once the speaker
+  // tracks carry the sound there is no automation left to run, so the loop stops
+  // -- that steadiness is the point. It also pauses in hidden tabs, where the
+  // timeupdate listener above keeps gating.
   useEffect(() => {
-    if (soloSpeakerId === null) {
+    if (!fallbackGateActive) {
       return;
     }
     let frame = 0;
@@ -3873,7 +3919,7 @@ function App() {
     };
     frame = window.requestAnimationFrame(tick);
     return () => window.cancelAnimationFrame(frame);
-  }, [soloSpeakerId, applyPlaybackVolume]);
+  }, [fallbackGateActive, applyPlaybackVolume]);
 
   const transcriptWords = useMemo(() => new Map(activeWords.map((word) => [word.id, word])), [activeWords]);
   // Custom speaker names join the vocabulary sent to WhisperX so unusual or
@@ -4575,7 +4621,7 @@ function App() {
     setProcessedAudio(null);
     setPlaybackSource("original");
     setSoloTracks({ status: "idle", tracks: {} });
-    setSoloSpeakerId(null);
+    setMutedSpeakerIds(new Set());
     soloTracksAttemptRef.current = null;
     // persistedSoloTokensRef survives on purpose: re-loading the session's own
     // audio after a reload should adopt the finished tracks, and the session
@@ -4623,8 +4669,8 @@ function App() {
       // Not co-playing yet (or drifted); align before the swap.
       to.currentTime = from.currentTime;
     }
-    // Mute flags are not touched here: the audibility effect owns them, and a
-    // soloed speaker's track -- not the new clock -- may be the audible element.
+    // Mute flags are not touched here: the audibility effect owns them, and the
+    // unmuted speakers' tracks -- not the new clock -- may be carrying the sound.
     if (wasPlaying) {
       void to.play().catch(() => undefined);
     }
@@ -4850,7 +4896,7 @@ function App() {
     setSpeakerCount(1);
     setSpeakerInputs(buildDefaultSpeakers());
     setSpeakerAssignmentMode("word");
-    setSoloSpeakerId(null);
+    setMutedSpeakerIds(new Set());
     setGlossaryText("");
     setFindText("");
     setReplaceText("");
@@ -5913,19 +5959,24 @@ function App() {
                 {userMuted ? <VolumeX size={16} /> : <Volume2 size={16} />}
               </button>
               {soloableSpeakers.length ? (
-                <select
-                  className="transport-speed transport-solo"
-                  value={soloSpeakerId ?? "all"}
-                  onChange={(event) => setSoloSpeakerId(event.target.value === "all" ? null : Number(event.target.value))}
-                  disabled={!audioUrl}
-                  title="Listen to one speaker"
-                  aria-label="Listen to one speaker"
-                >
-                  <option value="all">All speakers</option>
-                  {soloableSpeakers.map((speaker) => (
-                    <option key={speaker.id} value={speaker.id}>Only {speaker.name}</option>
-                  ))}
-                </select>
+                <div className="mode-toggle transport-speakers" role="group" aria-label="Mute speakers">
+                  {soloableSpeakers.map((speaker) => {
+                    const speakerMuted = mutedSpeakerIds.has(speaker.id);
+                    return (
+                      <button
+                        key={speaker.id}
+                        type="button"
+                        className={speakerMuted ? "is-muted" : "is-active"}
+                        aria-pressed={!speakerMuted}
+                        disabled={!audioUrl}
+                        title={`${speakerMuted ? "Unmute" : "Mute"} ${speaker.name}`}
+                        onClick={() => toggleSpeakerMuted(speaker.id)}
+                      >
+                        {speaker.name}
+                      </button>
+                    );
+                  })}
+                </div>
               ) : null}
               <select
                 className="transport-speed"
@@ -6104,7 +6155,7 @@ function App() {
               </button>
             ) : null}
             {soloTracks.status === "running" ? (
-              <span className="metric-chip" title="Preparing per-speaker audio so the Only-speaker selector isolates voices inside overlaps">
+              <span className="metric-chip" title="Preparing per-speaker audio so the speaker mute toggles isolate voices inside overlaps">
                 <Loader2 size={12} className="spin" aria-hidden /> Isolating overlap voices…
               </span>
             ) : null}
@@ -6113,8 +6164,8 @@ function App() {
                 className="metric-chip"
                 title={
                   restoreSoloTracks
-                    ? "The Only-speaker selector plays each Diamond-restored voice alone, even through overlaps"
-                    : "The Only-speaker selector now plays each voice alone, even through overlaps"
+                    ? "Muting a speaker drops its Diamond-restored voice, even through overlaps"
+                    : "Muting a speaker drops that voice from playback, even through overlaps"
                 }
               >
                 {restoreSoloTracks ? "Solo voices ready · restored" : "Solo voices ready"}
@@ -6692,7 +6743,7 @@ function App() {
                     onChange={handleRegionsChange}
                     onReset={handleRegionsReset}
                     onRerenderTracks={() => setTrackRenderNonce((nonce) => nonce + 1)}
-                    onSoloSpeakerChange={setSoloSpeakerId}
+                    onSoloSpeakerChange={handleSoloSpeakerChange}
                     onSeek={seekAudio}
                   />
                 ) : null}
