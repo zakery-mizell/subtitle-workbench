@@ -37,6 +37,14 @@ import { buildQaReport, formatQaReport } from "./lib/qa";
 import { DEFAULT_LOW_CONFIDENCE_THRESHOLD, isLowConfidenceWord } from "./lib/confidence";
 import { remapCaptions, remapGuideBlocks, remapTime, remapWords, unremapTime } from "./lib/cuts";
 import type { CutRegion, MasteringResult } from "./lib/mastering";
+import {
+  MEDIA_HAVE_METADATA,
+  chooseAudibleTarget,
+  chooseClockSource,
+  classifySoloTrack,
+  followersShareClockTimeline,
+  shouldCorrectFollower,
+} from "./lib/playbackSync";
 import { materializeRegions, regionsToSpeakerMap, sanitizeSpeakerRegions } from "./lib/regions";
 import type { RegionMarker } from "./lib/regions";
 import { parseSrt } from "./lib/srt";
@@ -398,6 +406,11 @@ export function buildSpeakerRegionsFromSpeech(
   return bySpeaker;
 }
 
+// Bumped whenever the rendering itself changes in a way that makes older
+// artifacts unusable, so a reloaded session re-renders instead of adopting them.
+// v2: FLAC seektables (pre-v2 gated tracks seek tens of seconds off).
+const SOLO_TRACK_RENDER_VERSION = "v2";
+
 function soloTracksSessionKey(
   session: TranscriptResponse,
   restore: boolean,
@@ -410,7 +423,7 @@ function soloTracksSessionKey(
   // Hand edits that only move boundaries keep the count, so the nonce carries an
   // explicit re-render request -- rendering on every nudge would launch a
   // minutes-long job per keystroke.
-  return `${session.audio_filename}|${session.duration ?? 0}|${(session.overlap_regions ?? []).length}|${regionCount}|${restore ? "restore" : "raw"}|n${renderNonce}`;
+  return `${SOLO_TRACK_RENDER_VERSION}|${session.audio_filename}|${session.duration ?? 0}|${(session.overlap_regions ?? []).length}|${regionCount}|${restore ? "restore" : "raw"}|n${renderNonce}`;
 }
 
 // Cheap FNV-1a over the gating envelope, to tell whether the rendered tracks
@@ -481,6 +494,37 @@ export function intervalGainAt(time: number, intervals: SoloInterval[], rampSeco
   const distance = Math.min(time - interval.start, interval.end - time);
   return Math.max(0, Math.min(1, distance / ramp));
 }
+
+// A track that has not loaded metadata yet cannot be seeked -- the browser drops
+// the assignment -- and solo tracks are mounted the moment their render lands,
+// often mid-playback. The position is remembered and applied on loadedmetadata so
+// a follower is already time-locked by the time the selector can reach it. Only
+// the latest target is kept: an element that is seeked twice while loading must
+// not land on the older position.
+const pendingSeeks = new WeakMap<HTMLMediaElement, number>();
+
+function seekWhenReady(element: HTMLMediaElement, time: number) {
+  if (element.readyState >= MEDIA_HAVE_METADATA) {
+    pendingSeeks.delete(element);
+    element.currentTime = time;
+    return;
+  }
+  const alreadyWaiting = pendingSeeks.has(element);
+  pendingSeeks.set(element, time);
+  if (alreadyWaiting) {
+    return;
+  }
+  const onReady = () => {
+    element.removeEventListener("loadedmetadata", onReady);
+    const target = pendingSeeks.get(element);
+    pendingSeeks.delete(element);
+    if (target !== undefined) {
+      element.currentTime = target;
+    }
+  };
+  element.addEventListener("loadedmetadata", onReady);
+}
+
 const FOLLOW_SCROLL_SUSPEND_MS = 3000;
 const THEME_STORAGE_KEY = "subtitle-workbench:theme";
 const AUTOSAVE_STORAGE_KEY = "subtitle-workbench:autosave";
@@ -2965,10 +3009,18 @@ function App() {
   const [acknowledgedLowConfidenceWordIds, setAcknowledgedLowConfidenceWordIds] = useState<string[]>([]);
   const [backendCapabilities, setBackendCapabilities] = useState<BackendCapabilities | null>(null);
 
+  // The clock: the element whose currentTime is authoritative. Never repointed by
+  // the solo selector -- see the clock effect below.
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const originalAudioRef = useRef<HTMLAudioElement | null>(null);
   const masteredAudioRef = useRef<HTMLAudioElement | null>(null);
-  const soloAudioRef = useRef<HTMLAudioElement | null>(null);
+  // Every rendered solo track stays mounted, so switching the soloed speaker is a
+  // mute swap rather than a media-element swap. Keyed by artifact token, not by
+  // speaker index: a re-render replaces one element with another for the same
+  // speaker, and the token tells the two apart during the swap.
+  const soloTrackElementsRef = useRef(new Map<string, HTMLAudioElement>());
+  // Token of the solo track currently carrying the sound (null = the clock is).
+  const audibleSoloTokenRef = useRef<string | null>(null);
   const soloTracksAttemptRef = useRef<string | null>(null);
   const persistedSoloTokensRef = useRef<SoloTrackArtifacts | null>(null);
   const userScrollAtRef = useRef(0);
@@ -2990,6 +3042,19 @@ function App() {
     [session, soloSpeakerId],
   );
   const activeSoloTrack = soloSpeakerIndex >= 0 ? (soloTracks.tracks[soloSpeakerIndex] ?? null) : null;
+  const soloTrackEntries = useMemo(
+    () =>
+      Object.entries(soloTracks.tracks)
+        .map(([index, track]) => ({ speakerIndex: Number(index), ...track }))
+        .sort((a, b) => a.speakerIndex - b.speakerIndex),
+    [soloTracks],
+  );
+  // Identity of the mounted follower set: the audio effects re-attach their
+  // listeners when a track appears or its artifact changes, not on every render.
+  const soloTrackMountKey = useMemo(
+    () => soloTrackEntries.map((entry) => `${entry.speakerIndex}:${entry.token}`).join("|"),
+    [soloTrackEntries],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -3181,46 +3246,172 @@ function App() {
     };
   }, [acknowledgedLowConfidenceWordIds, activeWorkspace, clickToPlay, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, lowConfidenceThreshold, model, normalizeExportTimingTo30Fps, removeDisfluencies, restoreSoloTracks, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, soloTracks, speakerAssignmentMode, speakerCount, speakerInputs, trackRenderNonce, viewMode]);
 
-  // Keep audioRef pointing at the active element; only the active one is audible.
-  // A ready solo track outranks the A/B pair while a speaker is soloed.
+  // One stable ref callback per token. An inline arrow would be a fresh function
+  // on every render, and React detaches (null) then re-attaches a changed ref
+  // callback each time -- churning the element map under the audibility logic.
+  const soloTrackRefCallbacksRef = useRef(new Map<string, (element: HTMLAudioElement | null) => void>());
+  const soloTrackRefFor = useCallback((token: string) => {
+    const cache = soloTrackRefCallbacksRef.current;
+    const existing = cache.get(token);
+    if (existing) {
+      return existing;
+    }
+    const callback = (element: HTMLAudioElement | null) => {
+      if (element) {
+        soloTrackElementsRef.current.set(token, element);
+      } else {
+        soloTrackElementsRef.current.delete(token);
+      }
+    };
+    cache.set(token, callback);
+    return callback;
+  }, []);
+
+  // Every mounted element, in a stable order. Reads refs only, so it never has to
+  // be rebuilt: the effects below use it to attach and clean up listeners.
+  const collectTransportElements = useCallback(() => {
+    const elements: HTMLAudioElement[] = [];
+    if (originalAudioRef.current) {
+      elements.push(originalAudioRef.current);
+    }
+    if (masteredAudioRef.current) {
+      elements.push(masteredAudioRef.current);
+    }
+    for (const element of soloTrackElementsRef.current.values()) {
+      elements.push(element);
+    }
+    return elements;
+  }, []);
+
+  // The elements that co-play behind the clock. The A/B peer joins only while it
+  // shares the original timeline (a cut master has its own, and switchPlaybackSource
+  // remaps across it instead); solo tracks are always rendered on the original
+  // timeline, so they follow whenever the clock is on it too.
+  const collectClockFollowers = useCallback(
+    (clock: HTMLAudioElement) => {
+      const followers: HTMLAudioElement[] = [];
+      const abPeer = clock === originalAudioRef.current ? masteredAudioRef.current : originalAudioRef.current;
+      if (abPeer && abPeer !== clock && processedAudio && !processedAudio.hasCutTimeline) {
+        followers.push(abPeer);
+      }
+      const clockSource = clock === masteredAudioRef.current ? "mastered" : "original";
+      if (followersShareClockTimeline(clockSource, processedAudio?.hasCutTimeline ?? false)) {
+        for (const element of soloTrackElementsRef.current.values()) {
+          if (element !== clock) {
+            followers.push(element);
+          }
+        }
+      }
+      return followers;
+    },
+    [processedAudio],
+  );
+
+  // audioRef is the clock, and the A/B selection is the only thing that moves it.
+  // Soloing must not repoint it: the transcript highlighting, waveform playhead,
+  // skip-cuts logic and the solo gate all read audioRef.current.currentTime, so a
+  // repoint mid-playback resynchronises the whole UI onto a freshly loaded element
+  // -- the jump this design removes.
   useEffect(() => {
-    const original = originalAudioRef.current;
-    const mastered = masteredAudioRef.current;
-    const solo = soloAudioRef.current;
-    const active = solo ?? (playbackSource === "processed" && mastered ? mastered : original);
-    if (!active) {
+    const clockSource = chooseClockSource(playbackSource, masteredAudioRef.current !== null);
+    const clock = clockSource === "mastered" ? masteredAudioRef.current : originalAudioRef.current;
+    if (!clock) {
       return;
     }
-    const previous = audioRef.current;
-    audioRef.current = active;
-    // Entering/leaving solo playback swaps elements with different content, so
-    // carry the position and play state across the swap.
-    if (previous && previous !== active && (previous === solo || active === solo)) {
-      if (Math.abs(active.currentTime - previous.currentTime) > 0.05) {
-        active.currentTime = previous.currentTime;
-      }
-      if (!previous.paused) {
-        previous.pause();
-        void active.play().catch(() => undefined);
-      }
+    audioRef.current = clock;
+    if (Number.isFinite(clock.duration) && clock.duration > 0) {
+      setAudioDuration(clock.duration);
     }
-    active.muted = false;
-    for (const element of [original, mastered, solo]) {
-      if (element && element !== active) {
-        element.muted = true;
-      }
-    }
-    if (Number.isFinite(active.duration) && active.duration > 0) {
-      setAudioDuration(active.duration);
-    }
-    setIsPlaying(!active.paused);
-  }, [playbackSource, processedAudio, audioUrl, activeSoloTrack]);
+    setIsPlaying(!clock.paused);
+  }, [playbackSource, processedAudio, audioUrl]);
 
-  // Transport state: play/pause indicator, duration, speed, and user mute.
+  // Audibility is the whole of what the solo selector changes: no seek, no play(),
+  // no unmount. Everything keeps playing; the mute flags move.
+  const applyAudibility = useCallback(() => {
+    const clock = audioRef.current;
+    if (!clock) {
+      return;
+    }
+    const soloToken = activeSoloTrack?.token ?? null;
+    const soloElement = soloToken ? (soloTrackElementsRef.current.get(soloToken) ?? null) : null;
+    const alreadyAudible = soloElement !== null && audibleSoloTokenRef.current === soloToken;
+    // Nudging the candidate here is safe precisely because it is still muted; once
+    // it is audible the drift loop leaves it alone.
+    if (
+      soloElement &&
+      !alreadyAudible &&
+      shouldCorrectFollower({ clockTime: clock.currentTime, followerTime: soloElement.currentTime, isAudible: false })
+    ) {
+      seekWhenReady(soloElement, clock.currentTime);
+    }
+    const target = chooseAudibleTarget({
+      playbackSource,
+      hasMastered: masteredAudioRef.current !== null,
+      masterHasCutTimeline: processedAudio?.hasCutTimeline ?? false,
+      soloSpeakerIndex,
+      soloTrackState: classifySoloTrack({
+        hasTrack: soloElement !== null,
+        readyState: soloElement?.readyState ?? 0,
+        offsetFromClock: soloElement ? soloElement.currentTime - clock.currentTime : 0,
+        alreadyAudible,
+      }),
+    });
+    const audible = target.audible === "solo" && soloElement ? soloElement : clock;
+    audibleSoloTokenRef.current = audible === soloElement ? soloToken : null;
+    for (const element of collectTransportElements()) {
+      element.muted = element !== audible;
+    }
+  }, [activeSoloTrack, collectTransportElements, playbackSource, processedAudio, soloSpeakerIndex]);
+
+  // Re-evaluate audibility when the selection changes and whenever a track
+  // finishes loading, so a speaker soloed before its track was ready switches
+  // over on its own instead of staying on the gated clock.
   useEffect(() => {
-    const elements = [originalAudioRef.current, masteredAudioRef.current, soloAudioRef.current].filter(
-      (element): element is HTMLAudioElement => element !== null,
-    );
+    applyAudibility();
+    const elements = collectTransportElements();
+    const reapply = () => applyAudibility();
+    for (const element of elements) {
+      element.addEventListener("loadedmetadata", reapply);
+      element.addEventListener("canplay", reapply);
+    }
+    return () => {
+      for (const element of elements) {
+        element.removeEventListener("loadedmetadata", reapply);
+        element.removeEventListener("canplay", reapply);
+      }
+    };
+  }, [applyAudibility, collectTransportElements, audioUrl, processedAudio, playbackSource, soloTrackMountKey]);
+
+  // A track rendered mid-session mounts while the clock is already running, so it
+  // missed the play event: join it in flight, positioned and at the same rate, so
+  // it is swap-ready the moment the selector reaches it.
+  useEffect(() => {
+    const clock = audioRef.current;
+    if (!clock) {
+      return;
+    }
+    for (const follower of collectClockFollowers(clock)) {
+      if (
+        shouldCorrectFollower({
+          clockTime: clock.currentTime,
+          followerTime: follower.currentTime,
+          isAudible: false,
+        })
+      ) {
+        seekWhenReady(follower, clock.currentTime);
+      }
+      follower.playbackRate = clock.playbackRate;
+      if (!clock.paused && follower.paused) {
+        void follower.play().catch(() => undefined);
+      }
+    }
+  }, [collectClockFollowers, audioUrl, processedAudio, playbackSource, soloTrackMountKey]);
+
+  // Transport state: play/pause indicator, duration, speed, and user mute. Only
+  // the clock's events count -- followers start and stop a beat later and would
+  // otherwise flicker the button and the duration readout.
+  useEffect(() => {
+    const elements = collectTransportElements();
     if (!elements.length) {
       return;
     }
@@ -3250,15 +3441,13 @@ function App() {
         element.removeEventListener("durationchange", onMetadata);
       }
     };
-  }, [audioUrl, processedAudio, playbackSource, activeSoloTrack]);
+  }, [collectTransportElements, audioUrl, processedAudio, playbackSource, soloTrackMountKey]);
 
   useEffect(() => {
-    for (const element of [originalAudioRef.current, masteredAudioRef.current, soloAudioRef.current]) {
-      if (element) {
-        element.playbackRate = playbackRate;
-      }
+    for (const element of collectTransportElements()) {
+      element.playbackRate = playbackRate;
     }
-  }, [playbackRate, audioUrl, processedAudio, activeSoloTrack]);
+  }, [collectTransportElements, playbackRate, audioUrl, processedAudio, soloTrackMountKey]);
 
   function skipBy(seconds: number) {
     const audio = audioRef.current;
@@ -3269,9 +3458,7 @@ function App() {
   }
 
   useEffect(() => {
-    const elements = [originalAudioRef.current, masteredAudioRef.current, soloAudioRef.current].filter(
-      (element): element is HTMLAudioElement => element !== null,
-    );
+    const elements = collectTransportElements();
     if (!elements.length || !activeEditor) {
       return;
     }
@@ -3283,13 +3470,28 @@ function App() {
       }
       const time = audio.currentTime;
       setCurrentTime(time);
-      // Keep the muted co-playing peer within a frame of the active element.
-      if (processedAudio && !processedAudio.hasCutTimeline) {
-        const peer = audio === originalAudioRef.current ? masteredAudioRef.current : originalAudioRef.current;
-        if (peer && !peer.paused && Math.abs(peer.currentTime - time) > 0.25) {
-          peer.currentTime = time;
+      // Hold every co-playing follower on the clock's position, so making one
+      // audible needs no seek at all. The audible element is excluded on purpose:
+      // seeking what is being listened to is exactly the glitch being removed, and
+      // its own drift stays inaudible because nothing is cross-faded against it.
+      for (const follower of collectClockFollowers(audio)) {
+        if (
+          shouldCorrectFollower({
+            clockTime: time,
+            followerTime: follower.currentTime,
+            isAudible: !follower.muted,
+          })
+        ) {
+          seekWhenReady(follower, time);
+        }
+        // A follower that never got a play event (mounted mid-playback, or its
+        // play() was rejected) would sit still and be useless to swap to.
+        if (!audio.paused && follower.paused) {
+          void follower.play().catch(() => undefined);
         }
       }
+      // A track that has caught up can take over from the gated clock now.
+      applyAudibility();
       if (!skipCuts) {
         return;
       }
@@ -3307,47 +3509,78 @@ function App() {
         element.removeEventListener("timeupdate", onTimeUpdate);
       }
     };
-  }, [activeEditor, skipCuts, processedAudio, audioUrl, playbackSource, activeSoloTrack]);
+  }, [
+    activeEditor,
+    applyAudibility,
+    collectClockFollowers,
+    collectTransportElements,
+    skipCuts,
+    processedAudio,
+    audioUrl,
+    playbackSource,
+    soloTrackMountKey,
+  ]);
 
-  // While both timelines match, mirror play/pause/seek onto the muted peer so
-  // switching between Original and Mastered is a gapless mute swap.
+  // While the timelines match, mirror play/pause/seek/rate from the clock onto
+  // every follower, so switching which element is audible -- Original vs Mastered,
+  // or All speakers vs any one speaker -- is a mute swap and nothing more. Solo
+  // followers are mirrored whether or not a master exists, which is why this no
+  // longer bails out without processedAudio.
   useEffect(() => {
-    const original = originalAudioRef.current;
-    const mastered = masteredAudioRef.current;
-    if (!original || !mastered || !processedAudio || processedAudio.hasCutTimeline) {
+    const clock = audioRef.current;
+    if (!clock) {
       return;
     }
 
     const mirror = (event: Event) => {
       const source = event.target as HTMLAudioElement;
+      // Only the clock leads. Followers emit the same events as they are driven,
+      // and echoing those back would have them seek each other.
       if (source !== audioRef.current) {
         return;
       }
-      const peer = source === original ? mastered : original;
-      if (event.type === "play") {
-        peer.currentTime = source.currentTime;
-        void peer.play().catch(() => undefined);
-      } else if (event.type === "pause") {
-        peer.pause();
-      } else if (event.type === "seeked") {
-        peer.currentTime = source.currentTime;
+      for (const follower of collectClockFollowers(source)) {
+        if (event.type === "pause") {
+          follower.pause();
+          continue;
+        }
+        if (event.type === "ratechange") {
+          follower.playbackRate = source.playbackRate;
+          continue;
+        }
+        // play and seeked are deliberate transport changes, so realigning even the
+        // audible follower is correct here -- but only when it has actually drifted.
+        // A redundant seek on the element being heard clicks for no reason.
+        if (
+          shouldCorrectFollower({
+            clockTime: source.currentTime,
+            followerTime: follower.currentTime,
+            isAudible: false,
+          })
+        ) {
+          seekWhenReady(follower, source.currentTime);
+        }
+        if (event.type === "play") {
+          void follower.play().catch(() => undefined);
+        }
       }
     };
 
-    const events = ["play", "pause", "seeked"] as const;
-    for (const element of [original, mastered]) {
+    const events = ["play", "pause", "seeked", "ratechange"] as const;
+    const elements = collectTransportElements();
+    for (const element of elements) {
       for (const type of events) {
         element.addEventListener(type, mirror);
       }
     }
     return () => {
-      for (const element of [original, mastered]) {
+      for (const element of elements) {
         for (const type of events) {
           element.removeEventListener(type, mirror);
         }
       }
     };
-  }, [processedAudio, audioUrl]);
+  }, [collectClockFollowers, collectTransportElements, processedAudio, audioUrl, playbackSource, soloTrackMountKey]);
 
   const activeWords = activeWorkspace?.words ?? session?.words ?? [];
 
@@ -3425,22 +3658,21 @@ function App() {
     }
   }, [soloSpeakerId, soloableSpeakers]);
 
+  // The gate reads the clock, not whichever element happens to be audible: the
+  // regions are on the clock's timeline, and the audible element can change under
+  // it at any moment. Every element gets the same gain so a swap cannot step it.
   const applyPlaybackVolume = useCallback(() => {
     const gateActive = soloSpeakerId !== null && soloIntervals.length > 0;
     const time = audioRef.current?.currentTime ?? 0;
     const gain = userMuted ? 0 : gateActive ? intervalGainAt(time, soloIntervals, GATE_RAMP_S) : 1;
-    for (const element of [originalAudioRef.current, masteredAudioRef.current, soloAudioRef.current]) {
-      if (element) {
-        element.volume = gain;
-      }
+    for (const element of collectTransportElements()) {
+      element.volume = gain;
     }
-  }, [userMuted, soloSpeakerId, soloIntervals]);
+  }, [collectTransportElements, userMuted, soloSpeakerId, soloIntervals]);
 
   useEffect(() => {
     applyPlaybackVolume();
-    const elements = [originalAudioRef.current, masteredAudioRef.current, soloAudioRef.current].filter(
-      (element): element is HTMLAudioElement => element !== null,
-    );
+    const elements = collectTransportElements();
     const reapply = () => applyPlaybackVolume();
     for (const element of elements) {
       element.addEventListener("timeupdate", reapply);
@@ -3452,7 +3684,7 @@ function App() {
         element.removeEventListener("seeked", reapply);
       }
     };
-  }, [applyPlaybackVolume, audioUrl, processedAudio, playbackSource, activeSoloTrack]);
+  }, [applyPlaybackVolume, collectTransportElements, audioUrl, processedAudio, playbackSource, soloTrackMountKey]);
 
   // The same snapped regions, flattened for the backend: it silences everything
   // outside them so each exported per-speaker track stands alone on the original
@@ -4365,8 +4597,8 @@ function App() {
       // Not co-playing yet (or drifted); align before the swap.
       to.currentTime = from.currentTime;
     }
-    to.muted = false;
-    from.muted = true;
+    // Mute flags are not touched here: the audibility effect owns them, and a
+    // soloed speaker's track -- not the new clock -- may be the audible element.
     if (wasPlaying) {
       void to.play().catch(() => undefined);
     }
@@ -5784,11 +6016,18 @@ function App() {
           {processedAudio ? (
             <audio ref={masteredAudioRef} className="peer-audio-hidden" src={processedAudio.url} preload="auto" />
           ) : null}
-          {activeSoloTrack ? (
-            // Keyed by token so switching the soloed speaker remounts the
-            // element and playback position transfers instead of resetting.
-            <audio key={activeSoloTrack.token} ref={soloAudioRef} className="peer-audio-hidden" src={activeSoloTrack.url} preload="auto" />
-          ) : null}
+          {/* Every rendered solo track stays mounted and co-playing. Mounting only
+              the selected one would make each switch a load-seek-play cycle, which
+              is inherently gappy and lands the new element off position. */}
+          {soloTrackEntries.map((entry) => (
+            <audio
+              key={entry.token}
+              ref={soloTrackRefFor(entry.token)}
+              className="peer-audio-hidden"
+              src={entry.url}
+              preload="auto"
+            />
+          ))}
           <WaveformTimeline
             analysis={waveformAnalysis}
             captions={activeEditor?.captions ?? []}
