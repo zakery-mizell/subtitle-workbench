@@ -1636,15 +1636,33 @@ select.transport-speed {
   font-size: 0.8rem;
 }
 
-/* One mute toggle per speaker, in the same segmented control as the A/B switch.
-   The transport bar is tight, so names are clipped rather than allowed to push
-   the clock off the row. */
-.transport-speakers button {
-  max-width: 7.5rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
+/* Speaker audibility sits on its own full-width row under the transport bar:
+   inside the pill these were clipped to a few characters. Names stay on one
+   line and the row wraps instead. */
+.speaker-audibility-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem 0.8rem;
+  margin-top: 0.6rem;
+}
+
+.speaker-audibility-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.speaker-audibility-group .mode-toggle button {
   white-space: nowrap;
-  font-size: 0.78rem;
+}
+
+/* The narrow-screen rule below stretches segmented controls to full width, which
+   would stack one speaker per row; these stay side by side and wrap. */
+.speaker-audibility-group .mode-toggle {
+  width: auto;
+  grid-auto-flow: column;
+  grid-template-columns: none;
 }
 
 .mode-toggle button.is-muted {

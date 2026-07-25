@@ -43,14 +43,26 @@ export interface ConversionJobStatus {
   result: ConversionResult | null;
 }
 
+/**
+ * Either an uploaded file or an already-rendered isolated speaker track, which
+ * the backend reads in place from its own artifact store.
+ */
+export type ConversionSource = File | { token: string; label: string };
+
 export async function startConversionJob(
   apiBaseUrl: string,
-  sourceFile: File,
+  source: ConversionSource,
   referenceFile: File,
   params: ConversionParams,
 ): Promise<string> {
   const formData = new FormData();
-  formData.append("audio", sourceFile);
+  if (source instanceof File) {
+    formData.append("audio", source);
+  } else {
+    // No `audio` part at all: the endpoint ignores it when a token is present,
+    // and an empty part would still be a multi-megabyte no-op upload.
+    formData.append("source_token", source.token);
+  }
   formData.append("reference", referenceFile);
   formData.append("params_json", JSON.stringify(params));
   const response = await fetch(`${apiBaseUrl}/api/convert`, { method: "POST", body: formData });

@@ -1,10 +1,11 @@
 /**
  * Transport decisions for the multi-element player.
  *
- * Every track is mounted at once -- the original, the mastered A/B peer, and one
- * per rendered speaker -- and they all play together; only the mute flags move.
- * Muting a speaker must therefore be a mute swap and nothing else: unmounting an
- * element, seeking one that is audible, or automating its volume is what made
+ * Every track is mounted at once -- the original, the mastered A/B peer, one per
+ * rendered speaker, and one per converted voice -- and they all play together;
+ * only the mute flags move. Muting a speaker or switching it to its converted
+ * voice must therefore be a mute swap and nothing else: unmounting an element,
+ * seeking one that is audible, or automating its volume is what made
  * hot-swapping jump and jitter.
  *
  * Two constraints run through everything here:
@@ -58,11 +59,28 @@ export interface TimeInterval {
   end: number;
 }
 
+/** Which of a speaker's two tracks the listener asked for. */
+export type SpeakerVoice = "original" | "converted";
+
 /** One speaker's contribution to the audibility decision. */
 export interface SpeakerTrackInput {
   speakerId: number;
   muted: boolean;
+  /** The isolated (server-gated) track of this speaker's own voice. */
   track: SoloTrackState;
+  /** Which voice is selected; absent means the original. */
+  voice?: SpeakerVoice;
+  /**
+   * The converted re-voicing of `track`, classified the same way. Absent means
+   * nothing has been converted for this speaker.
+   */
+  converted?: SoloTrackState;
+}
+
+/** One audible speaker and which of its tracks is carrying the sound. */
+export interface AudibleTrackChoice {
+  speakerId: number;
+  voice: SpeakerVoice;
 }
 
 export interface AudibleSet {
@@ -70,7 +88,7 @@ export interface AudibleSet {
   /** The clock element carries the sound. */
   clockAudible: boolean;
   /** Speakers whose rendered track carries the sound, all at once. */
-  audibleSpeakerIds: number[];
+  audibleTracks: AudibleTrackChoice[];
   /**
    * The clock is standing in for tracks that are not usable yet, so it must be
    * gated to the union of the unmuted speakers' regions. The only case in which
@@ -135,14 +153,30 @@ export function classifySoloTrack(input: {
 }
 
 /**
- * Which of {clock, per-speaker tracks} are audible for a given muted set.
+ * Which of a speaker's tracks would actually carry the sound. A converted voice
+ * is only used once it can play: falling back to the speaker's own isolated
+ * track keeps that voice present (at the original timbre) instead of dropping it
+ * or handing the whole mix back to the clock while the artifact loads.
+ */
+function chosenVoice(speaker: SpeakerTrackInput): { voice: SpeakerVoice; state: SoloTrackState } {
+  if (speaker.voice === "converted" && speaker.converted === "ready") {
+    return { voice: "converted", state: "ready" };
+  }
+  return { voice: "original", state: speaker.track };
+}
+
+/**
+ * Which of {clock, per-speaker tracks} are audible for a given muted set and
+ * per-speaker voice choice.
  *
- * Nothing muted is the plain path: the clock alone, ungated. With anything
- * muted the clock goes silent and every unmuted speaker's track plays at once
- * -- their samples are already speaker-gated server-side, so their sum is the
- * mix minus the muted voices, with no client-side gain anywhere. Toggling a
- * speaker then changes `muted` flags and nothing else, which is what makes it
- * jitter-free.
+ * Nothing muted and everyone on their own voice is the plain path: the clock
+ * alone, ungated. Anything else -- a muted speaker, or a speaker switched to a
+ * converted voice -- silences the clock and plays every unmuted speaker's chosen
+ * track at once. Those samples are already speaker-gated server-side, and a
+ * conversion of such a track inherits that gating, so their sum is the mix with
+ * the muted voices dropped and the converted ones substituted, with no
+ * client-side gain anywhere. Toggling then changes mute flags and nothing else,
+ * which is what makes it jitter-free.
  *
  * Two fallbacks keep sound flowing instead of guessing:
  *   - any needed track missing/pending (still rendering, still loading, stalled)
@@ -151,7 +185,7 @@ export function classifySoloTrack(input: {
  *     timeline and cannot follow it, so the gated clock is the only option.
  *
  * Every speaker muted is silence, deliberately: that is what "mute everyone"
- * asks for.
+ * asks for -- a converted voice on a muted speaker stays silent too.
  */
 export function chooseAudibleSet(input: {
   playbackSource: "original" | "processed";
@@ -161,22 +195,26 @@ export function chooseAudibleSet(input: {
 }): AudibleSet {
   const clock = chooseClockSource(input.playbackSource, input.hasMastered);
   const unmuted = input.speakers.filter((speaker) => !speaker.muted);
-  if (unmuted.length === input.speakers.length) {
-    return { clock, clockAudible: true, audibleSpeakerIds: [], gateClock: false };
+  // A single speaker on a converted voice makes the track-sum the only mix that
+  // can express the request, however plain the mute state is.
+  const anyConverted = input.speakers.some((speaker) => speaker.voice === "converted");
+  if (unmuted.length === input.speakers.length && !anyConverted) {
+    return { clock, clockAudible: true, audibleTracks: [], gateClock: false };
   }
   if (!unmuted.length) {
-    return { clock, clockAudible: false, audibleSpeakerIds: [], gateClock: false };
+    return { clock, clockAudible: false, audibleTracks: [], gateClock: false };
   }
+  const chosen = unmuted.map((speaker) => ({ speakerId: speaker.speakerId, ...chosenVoice(speaker) }));
   const tracksUsable =
     followersShareClockTimeline(clock, input.masterHasCutTimeline) &&
-    unmuted.every((speaker) => speaker.track === "ready");
+    chosen.every((entry) => entry.state === "ready");
   if (!tracksUsable) {
-    return { clock, clockAudible: true, audibleSpeakerIds: [], gateClock: true };
+    return { clock, clockAudible: true, audibleTracks: [], gateClock: true };
   }
   return {
     clock,
     clockAudible: false,
-    audibleSpeakerIds: unmuted.map((speaker) => speaker.speakerId),
+    audibleTracks: chosen.map((entry) => ({ speakerId: entry.speakerId, voice: entry.voice })),
     gateClock: false,
   };
 }

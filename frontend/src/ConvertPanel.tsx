@@ -12,14 +12,25 @@ import type {
   ConversionOutputFormat,
   ConversionParams,
   ConversionResult,
+  ConversionSource,
 } from "./lib/conversion";
 
 const JOB_POLL_MS = 1000;
+
+interface IsolatedTrack {
+  speakerId: number;
+  name: string;
+  token: string;
+}
 
 interface ConvertPanelProps {
   apiBaseUrl: string;
   // The audio already loaded in the workspace, offered as the source default.
   audioFile: File | null;
+  // Rendered per-speaker tracks, offered as the one-click source. Full-length and
+  // timeline-preserving, so the conversion of one is a drop-in replacement voice.
+  isolatedTracks?: IsolatedTrack[];
+  onConvertedVoice?: (speakerId: number, result: { token: string; url: string; filename: string }) => void;
 }
 
 function formatDuration(seconds: number): string {
@@ -28,7 +39,7 @@ function formatDuration(seconds: number): string {
   return `${minutes}:${String(rest).padStart(2, "0")}`;
 }
 
-export function ConvertPanel({ apiBaseUrl, audioFile }: ConvertPanelProps) {
+export function ConvertPanel({ apiBaseUrl, audioFile, isolatedTracks, onConvertedVoice }: ConvertPanelProps) {
   const [sourceFile, setSourceFile] = useState<File | null>(audioFile);
   const [referenceFile, setReferenceFile] = useState<File | null>(null);
   const [params, setParams] = useState<ConversionParams>(() => defaultConversionParams());
@@ -39,6 +50,21 @@ export function ConvertPanel({ apiBaseUrl, audioFile }: ConvertPanelProps) {
   const [result, setResult] = useState<ConversionResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
+  // Null until the user picks a side, so tracks that finish rendering minutes
+  // after this panel opened still become the default without overriding a
+  // deliberate "Upload a file…".
+  const [sourceMode, setSourceMode] = useState<"isolated" | "upload" | null>(null);
+  const [selectedSpeakerId, setSelectedSpeakerId] = useState<number | null>(null);
+  // Which speaker the running job converts, so the finished artifact can be
+  // reported upward as that speaker's alternate voice.
+  const jobSpeakerRef = useRef<number | null>(null);
+  const onConvertedVoiceRef = useRef(onConvertedVoice);
+  onConvertedVoiceRef.current = onConvertedVoice;
+
+  const tracks = isolatedTracks ?? [];
+  const mode = sourceMode ?? (tracks.length ? "isolated" : "upload");
+  const selectedTrack = tracks.find((track) => track.speakerId === selectedSpeakerId) ?? tracks[0] ?? null;
+  const sourceReady = mode === "isolated" ? selectedTrack !== null : sourceFile !== null;
 
   const running = job !== null && (job.status === "queued" || job.status === "running");
 
@@ -58,6 +84,15 @@ export function ConvertPanel({ apiBaseUrl, audioFile }: ConvertPanelProps) {
         if (status.status === "done" && status.result) {
           setResult(status.result);
           setJobId(null);
+          const speakerId = jobSpeakerRef.current;
+          jobSpeakerRef.current = null;
+          if (speakerId !== null) {
+            onConvertedVoiceRef.current?.(speakerId, {
+              token: status.result.token,
+              url: conversionAudioUrl(apiBaseUrl, status.result.token),
+              filename: status.result.filename,
+            });
+          }
         } else if (status.status === "error") {
           setError(status.error ?? "Voice conversion failed.");
           setJobId(null);
@@ -90,14 +125,21 @@ export function ConvertPanel({ apiBaseUrl, audioFile }: ConvertPanelProps) {
   }
 
   async function handleRun() {
-    if (!sourceFile || !referenceFile) {
+    const source: ConversionSource | null =
+      mode === "isolated"
+        ? selectedTrack
+          ? { token: selectedTrack.token, label: selectedTrack.name }
+          : null
+        : sourceFile;
+    if (!source || !referenceFile) {
       return;
     }
     setError(null);
     setResult(null);
     setJob(null);
+    jobSpeakerRef.current = mode === "isolated" && selectedTrack ? selectedTrack.speakerId : null;
     try {
-      const id = await startConversionJob(apiBaseUrl, sourceFile, referenceFile, params);
+      const id = await startConversionJob(apiBaseUrl, source, referenceFile, params);
       setJobId(id);
       setJob({ id, status: "queued", stage: "queued", progress: 0, message: null, error: null, result: null });
     } catch (startError) {
@@ -130,31 +172,66 @@ export function ConvertPanel({ apiBaseUrl, audioFile }: ConvertPanelProps) {
         Zero-shot and fully local — both clips stay on this machine. Speech only; 22.05 kHz output.
       </p>
 
-      <label
-        className={`dropzone ${sourceDragActive ? "is-dragging" : ""}`}
-        onDragOver={(event) => {
-          event.preventDefault();
-          setSourceDragActive(true);
-        }}
-        onDragLeave={() => setSourceDragActive(false)}
-        onDrop={(event) => {
-          // preventDefault marks the drop as consumed; the window-level handler
-          // still clears the global overlay but leaves the workspace file alone.
-          event.preventDefault();
-          setSourceDragActive(false);
-          const dropped = event.dataTransfer.files?.[0];
-          if (dropped) {
-            setSourceFile(dropped);
-          }
-        }}
-      >
-        <input
-          type="file"
-          accept="audio/*,video/*"
-          onChange={(event) => setSourceFile(event.target.files?.[0] ?? null)}
-        />
-        <span>{sourceFile ? sourceFile.name : "Source recording — drag it here or click to choose."}</span>
-      </label>
+      <div className="mode-toggle" role="group" aria-label="Conversion source">
+        <button type="button" className={mode === "isolated" ? "is-active" : ""} onClick={() => setSourceMode("isolated")}>
+          Isolated track
+        </button>
+        <button type="button" className={mode === "upload" ? "is-active" : ""} onClick={() => setSourceMode("upload")}>
+          Upload a file…
+        </button>
+      </div>
+
+      {mode === "isolated" ? (
+        tracks.length ? (
+          <>
+            <label>
+              Source voice
+              <select
+                value={selectedTrack ? String(selectedTrack.speakerId) : ""}
+                onChange={(event) => setSelectedSpeakerId(Number(event.target.value))}
+              >
+                {tracks.map((track) => (
+                  <option key={track.speakerId} value={track.speakerId}>
+                    {track.name} — isolated track
+                  </option>
+                ))}
+              </select>
+            </label>
+            <p className="helper-text">
+              The result joins playback as that speaker's alternate voice — switch Original / Converted under the
+              transport bar.
+            </p>
+          </>
+        ) : (
+          <p className="helper-text">Load audio with speakers to get isolated tracks, or upload a file.</p>
+        )
+      ) : (
+        <label
+          className={`dropzone ${sourceDragActive ? "is-dragging" : ""}`}
+          onDragOver={(event) => {
+            event.preventDefault();
+            setSourceDragActive(true);
+          }}
+          onDragLeave={() => setSourceDragActive(false)}
+          onDrop={(event) => {
+            // preventDefault marks the drop as consumed; the window-level handler
+            // still clears the global overlay but leaves the workspace file alone.
+            event.preventDefault();
+            setSourceDragActive(false);
+            const dropped = event.dataTransfer.files?.[0];
+            if (dropped) {
+              setSourceFile(dropped);
+            }
+          }}
+        >
+          <input
+            type="file"
+            accept="audio/*,video/*"
+            onChange={(event) => setSourceFile(event.target.files?.[0] ?? null)}
+          />
+          <span>{sourceFile ? sourceFile.name : "Source recording — drag it here or click to choose."}</span>
+        </label>
+      )}
 
       <label
         className={`dropzone ${referenceDragActive ? "is-dragging" : ""}`}
@@ -255,11 +332,11 @@ export function ConvertPanel({ apiBaseUrl, audioFile }: ConvertPanelProps) {
       </details>
 
       <div className="inline-actions">
-        <button disabled={!sourceFile || !referenceFile || running} onClick={() => void handleRun()}>
+        <button disabled={!sourceReady || !referenceFile || running} onClick={() => void handleRun()}>
           {running ? "Converting..." : "Convert voice"}
         </button>
       </div>
-      {!sourceFile || !referenceFile ? (
+      {!sourceReady || !referenceFile ? (
         <p className="helper-text">Choose both a source recording and a target voice reference first.</p>
       ) : null}
 

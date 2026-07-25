@@ -656,13 +656,31 @@ def parse_conversion_params(params_json: str) -> ConversionParams:
 
 @app.post("/api/convert", response_model=MasterJobResponse)
 async def convert_voice_endpoint(
-    audio: UploadFile = File(...),
+    audio: UploadFile | None = File(None),
     reference: UploadFile = File(...),
     params_json: str = Form("{}"),
+    source_token: str = Form(""),
 ) -> MasterJobResponse:
     params = parse_conversion_params(params_json)
-    source_filename = audio.filename or "audio"
-    source_path = await save_upload_to_temp(audio)
+    if source_token:
+        # An already-rendered speaker track as the source. It is a cached
+        # artifact, not an upload: read in place, never deleted afterwards -- the
+        # player is still pointed at it and a re-render is minutes of work.
+        artifact = find_separation_artifact(source_token)
+        if artifact is None or not artifact.is_file():
+            raise HTTPException(
+                status_code=404,
+                detail="The isolated track for this conversion has expired. Re-render the speaker tracks and try again.",
+            )
+        source_path = str(artifact)
+        source_filename = artifact.name.split("__", 1)[-1]
+        source_is_upload = False
+    elif audio is not None:
+        source_filename = audio.filename or "audio"
+        source_path = await save_upload_to_temp(audio)
+        source_is_upload = True
+    else:
+        raise HTTPException(status_code=422, detail="A source recording or a source_token is required.")
     ref_path = await save_upload_to_temp(reference)
 
     job_registry.purge_expired(settings.mastering_job_ttl_seconds, delete_artifact=delete_file_quietly)
@@ -671,7 +689,8 @@ async def convert_voice_endpoint(
         try:
             result = run_conversion(source_path, source_filename, ref_path, params, reporter)
         finally:
-            delete_file_quietly(source_path)
+            if source_is_upload:
+                delete_file_quietly(source_path)
             delete_file_quietly(ref_path)
         artifact = find_conversion_artifact(result.token)
         if artifact:

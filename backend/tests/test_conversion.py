@@ -1,3 +1,4 @@
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -10,6 +11,7 @@ from backend.app import main
 from backend.app.conversion import service as conversion_service
 from backend.app.conversion.engine import expected_chunks
 from backend.app.conversion.schemas import ConversionParams
+from backend.app.separation import service as separation_service
 
 
 class ConversionParamsTests(unittest.TestCase):
@@ -167,6 +169,68 @@ class ConversionEndpointTests(unittest.TestCase):
     def test_unknown_conversion_token_returns_404(self) -> None:
         self.assertEqual(self.client.get("/api/convert/vc_missing/audio").status_code, 404)
         self.assertEqual(self.client.get("/api/convert/vc_missing/waveform").status_code, 404)
+
+    def test_neither_audio_nor_source_token_is_rejected(self) -> None:
+        response = self.client.post(
+            "/api/convert",
+            files={"reference": ("ref.wav", b"RIFF0000WAVE", "audio/wav")},
+            data={"params_json": "{}"},
+        )
+        self.assertEqual(response.status_code, 422)
+
+    def test_malformed_source_token_is_rejected(self) -> None:
+        response = self.client.post(
+            "/api/convert",
+            files={"reference": ("ref.wav", b"RIFF0000WAVE", "audio/wav")},
+            data={"params_json": "{}", "source_token": "s_../etc/passwd"},
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_expired_source_token_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            mastering = Path(tmp) / "mastering"
+            (Path(tmp) / "separation").mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(separation_service.settings, "mastering_output_dir", str(mastering)):
+                response = self.client.post(
+                    "/api/convert",
+                    files={"reference": ("ref.wav", b"RIFF0000WAVE", "audio/wav")},
+                    data={"params_json": "{}", "source_token": "s_abc123"},
+                )
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("expired", response.json()["detail"])
+
+    def test_source_token_accepted_without_an_audio_upload(self) -> None:
+        # The engine is never loaded here: run_conversion is stubbed, so this
+        # covers the endpoint's source resolution only.
+        with TemporaryDirectory() as tmp:
+            mastering = Path(tmp) / "mastering"
+            separated = Path(tmp) / "separation"
+            separated.mkdir(parents=True, exist_ok=True)
+            artifact = separated / "s_abc123__clip.speaker1.flac"
+            artifact.write_bytes(b"x")
+            calls: list[tuple[str, str]] = []
+
+            def fake_run_conversion(source_path, source_filename, ref_path, params, reporter):
+                calls.append((source_path, source_filename))
+                raise RuntimeError("stubbed")
+
+            with mock.patch.object(separation_service.settings, "mastering_output_dir", str(mastering)):
+                with mock.patch.object(main, "run_conversion", fake_run_conversion):
+                    response = self.client.post(
+                        "/api/convert",
+                        files={"reference": ("ref.wav", b"RIFF0000WAVE", "audio/wav")},
+                        data={"params_json": "{}", "source_token": "s_abc123"},
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    job_id = response.json()["job_id"]
+                    for _ in range(200):
+                        if main.job_registry.get(job_id).status in ("done", "error"):
+                            break
+                        time.sleep(0.01)
+
+            self.assertEqual(calls, [(str(artifact), "clip.speaker1.flac")])
+            # The cached artifact outlives the job; only uploads are deleted.
+            self.assertTrue(artifact.is_file())
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import {
   AlertTriangle,
   ArrowLeftRight,
@@ -35,6 +35,7 @@ import {
 } from "./lib/glossary";
 import { buildQaReport, formatQaReport } from "./lib/qa";
 import { DEFAULT_LOW_CONFIDENCE_THRESHOLD, isLowConfidenceWord } from "./lib/confidence";
+import { conversionAudioUrl } from "./lib/conversion";
 import { remapCaptions, remapGuideBlocks, remapTime, remapWords, unremapTime } from "./lib/cuts";
 import type { CutRegion, MasteringResult } from "./lib/mastering";
 import {
@@ -46,7 +47,7 @@ import {
   shouldCorrectFollower,
   unionIntervals,
 } from "./lib/playbackSync";
-import type { SpeakerTrackInput } from "./lib/playbackSync";
+import type { SoloTrackState, SpeakerTrackInput, SpeakerVoice } from "./lib/playbackSync";
 import { materializeRegions, regionsToSpeakerMap, sanitizeSpeakerRegions } from "./lib/regions";
 import type { RegionMarker } from "./lib/regions";
 import { parseSrt } from "./lib/srt";
@@ -605,6 +606,13 @@ interface SoloTrackArtifacts {
   regionsSignature?: string;
 }
 
+// Converted voices survive a reload the way solo tracks do: server tokens only,
+// revalidated with HEAD before anything is mounted, plus which voice was playing.
+interface ConvertedVoiceArtifacts {
+  tokens: Record<number, string>;
+  active: Record<number, SpeakerVoice>;
+}
+
 interface PersistedWorkspace {
   version: number;
   session: TranscriptResponse | null;
@@ -639,6 +647,9 @@ interface PersistedWorkspace {
   // it has to survive a reload -- otherwise the restored key can never match the
   // one the render effect recomputes and every reload re-renders from scratch.
   soloTrackRenderNonce?: number;
+  // Converted voices (speaker id -> conversion token) and the voice each speaker
+  // was last heard in.
+  convertedVoices?: ConvertedVoiceArtifacts | null;
 }
 
 interface ProjectAudioPayload {
@@ -2984,8 +2995,16 @@ function App() {
   // speaker's separated voice; keyed by speaker index (appearance order).
   const [soloTracks, setSoloTracks] = useState<{
     status: "idle" | "running" | "done" | "error";
-    tracks: Record<number, { url: string; token: string }>;
+    tracks: Record<number, { url: string; token: string; filename?: string }>;
   }>({ status: "idle", tracks: {} });
+  // Conversions of the isolated tracks, by speaker id. A conversion of a
+  // server-gated full-length track is itself gated and full-length, so it drops
+  // into the mix in that speaker's place with no client-side work.
+  const [convertedVoices, setConvertedVoices] = useState<Map<number, { token: string; url: string; filename?: string }>>(
+    () => new Map(),
+  );
+  // Which voice each speaker is heard in. Absent means the original.
+  const [activeVoice, setActiveVoice] = useState<Map<number, SpeakerVoice>>(() => new Map());
   // Exported per-speaker tracks are gated to the regions as they were when the
   // render ran; hand edits afterwards leave them stale until re-rendered. The
   // nonce carries an explicit re-render request into the cache key -- rendering
@@ -3021,6 +3040,9 @@ function App() {
   const audibleTrackTokensRef = useRef<Set<string>>(new Set());
   const soloTracksAttemptRef = useRef<string | null>(null);
   const persistedSoloTokensRef = useRef<SoloTrackArtifacts | null>(null);
+  // Restored converted-voice records, waiting for the HEAD revalidation below.
+  const persistedConvertedVoicesRef = useRef<ConvertedVoiceArtifacts | null>(null);
+  const [convertedRestoreNonce, setConvertedRestoreNonce] = useState(0);
   const userScrollAtRef = useRef(0);
   const viewOptionsRef = useRef<HTMLDivElement | null>(null);
   const paragraphRefs = useRef<Array<HTMLElement | null>>([]);
@@ -3058,17 +3080,69 @@ function App() {
     () => soloTrackEntries.map((entry) => `${entry.speakerIndex}:${entry.token}`).join("|"),
     [soloTrackEntries],
   );
-  // Each mutable speaker paired with the artifact token of its rendered track
-  // (null while nothing has been rendered for it). Track records are keyed by
-  // speaker index, which is appearance order -- the order of session.speakers.
+  // Converted voices in a stable order, for mounting and for the mount key.
+  const convertedVoiceEntries = useMemo(
+    () =>
+      Array.from(convertedVoices.entries())
+        .map(([speakerId, voice]) => ({ speakerId, ...voice }))
+        .sort((a, b) => a.speakerId - b.speakerId),
+    [convertedVoices],
+  );
+  // Identity of every mounted follower, solo tracks and converted voices alike:
+  // a converted voice arriving mid-session has to re-attach the same listeners a
+  // new solo track does, or it never joins the clock.
+  const trackMountKey = useMemo(
+    () => `${soloTrackMountKey}#${convertedVoiceEntries.map((entry) => `${entry.speakerId}:${entry.token}`).join("|")}`,
+    [soloTrackMountKey, convertedVoiceEntries],
+  );
+  // Each mutable speaker paired with the artifact tokens of its rendered track
+  // and its converted voice (null while nothing has been rendered for it), plus
+  // which of the two is selected. Track records are keyed by speaker index,
+  // which is appearance order -- the order of session.speakers.
   const speakerTrackTokens = useMemo(() => {
     const speakers = session?.speakers ?? [];
     return soloableSpeakers.map((speaker) => {
       const index = speakers.findIndex((entry) => entry.id === speaker.id);
+      const converted = convertedVoices.get(speaker.id) ?? null;
       return {
         speakerId: speaker.id,
         token: (index >= 0 ? soloTracks.tracks[index]?.token : null) ?? null,
+        convertedToken: converted?.token ?? null,
+        // A selection with nothing converted behind it means the original: the
+        // toggle only exists once an artifact does.
+        voice: (converted && activeVoice.get(speaker.id) === "converted" ? "converted" : "original") as SpeakerVoice,
       };
+    });
+  }, [activeVoice, convertedVoices, session, soloableSpeakers, soloTracks]);
+  // Download links for the per-speaker artifacts. The artifact GET routes already
+  // set a Content-Disposition name; `download` only makes it a friendly one.
+  const speakerAudioExports = useMemo(() => {
+    const speakers = session?.speakers ?? [];
+    const basename = (currentAudioFilename ?? "audio").replace(/\.[^.]+$/, "");
+    const extensionOf = (filename: string | undefined) => /\.([A-Za-z0-9]+)$/.exec(filename ?? "")?.[1] ?? "flac";
+    return soloableSpeakers.map((speaker) => {
+      const index = speakers.findIndex((entry) => entry.id === speaker.id);
+      const isolated = (index >= 0 ? soloTracks.tracks[index] : null) ?? null;
+      const converted = convertedVoices.get(speaker.id) ?? null;
+      return {
+        speakerId: speaker.id,
+        name: speaker.name,
+        isolated: isolated
+          ? { url: isolated.url, download: `${basename} — ${speaker.name}.isolated.${extensionOf(isolated.filename)}` }
+          : null,
+        converted: converted
+          ? { url: converted.url, download: `${basename} — ${speaker.name}.converted.${extensionOf(converted.filename)}` }
+          : null,
+      };
+    });
+  }, [convertedVoices, currentAudioFilename, session, soloableSpeakers, soloTracks]);
+  // The isolated tracks offered to the Convert panel as one-click sources.
+  const isolatedTrackChoices = useMemo(() => {
+    const speakers = session?.speakers ?? [];
+    return soloableSpeakers.flatMap((speaker) => {
+      const index = speakers.findIndex((entry) => entry.id === speaker.id);
+      const track = index >= 0 ? soloTracks.tracks[index] : null;
+      return track ? [{ speakerId: speaker.id, name: speaker.name, token: track.token }] : [];
     });
   }, [session, soloableSpeakers, soloTracks]);
 
@@ -3171,6 +3245,7 @@ function App() {
               saved.soloTracks && typeof saved.soloTracks.key === "string" && saved.soloTracks.tokens
                 ? saved.soloTracks
                 : null,
+            convertedVoices: saved.convertedVoices?.tokens ? saved.convertedVoices : null,
           },
           {
             statusMessage: "Restored the last autosaved workspace. Reattach the audio file if you need playback.",
@@ -3260,7 +3335,7 @@ function App() {
         autosaveTimerRef.current = null;
       }
     };
-  }, [acknowledgedLowConfidenceWordIds, activeWorkspace, clickToPlay, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, lowConfidenceThreshold, model, normalizeExportTimingTo30Fps, removeDisfluencies, restoreSoloTracks, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, soloTracks, speakerAssignmentMode, speakerCount, speakerInputs, trackRenderNonce, viewMode]);
+  }, [acknowledgedLowConfidenceWordIds, activeVoice, activeWorkspace, clickToPlay, convertedVoices, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, lowConfidenceThreshold, model, normalizeExportTimingTo30Fps, removeDisfluencies, restoreSoloTracks, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, soloTracks, speakerAssignmentMode, speakerCount, speakerInputs, trackRenderNonce, viewMode]);
 
   // One stable ref callback per token. An inline arrow would be a fresh function
   // on every render, and React detaches (null) then re-attaches a changed ref
@@ -3352,14 +3427,11 @@ function App() {
       return;
     }
     const previouslyAudible = audibleTrackTokensRef.current;
-    const elementsByToken = new Map<string, HTMLAudioElement>();
-    const speakers: SpeakerTrackInput[] = [];
-    for (const entry of speakerTrackTokens) {
-      const element = entry.token ? (soloTrackElementsRef.current.get(entry.token) ?? null) : null;
-      const alreadyAudible = element !== null && entry.token !== null && previouslyAudible.has(entry.token);
-      if (element && entry.token) {
-        elementsByToken.set(entry.token, element);
-      }
+    // Both of a speaker's tracks are classified the same way -- a converted voice
+    // is just another server-gated follower -- so this runs over either token.
+    const classifyToken = (token: string | null): SoloTrackState => {
+      const element = token ? (soloTrackElementsRef.current.get(token) ?? null) : null;
+      const alreadyAudible = element !== null && token !== null && previouslyAudible.has(token);
       // Nudging a candidate here is safe precisely because it is still muted; once
       // it is audible nothing seeks it again.
       if (
@@ -3369,17 +3441,21 @@ function App() {
       ) {
         seekWhenReady(element, clock.currentTime);
       }
-      speakers.push({
-        speakerId: entry.speakerId,
-        muted: mutedSpeakerIds.has(entry.speakerId),
-        track: classifySoloTrack({
-          hasTrack: element !== null,
-          readyState: element?.readyState ?? 0,
-          offsetFromClock: element ? element.currentTime - clock.currentTime : 0,
-          alreadyAudible,
-        }),
+      return classifySoloTrack({
+        hasTrack: element !== null,
+        readyState: element?.readyState ?? 0,
+        offsetFromClock: element ? element.currentTime - clock.currentTime : 0,
+        alreadyAudible,
       });
-    }
+    };
+
+    const speakers: SpeakerTrackInput[] = speakerTrackTokens.map((entry) => ({
+      speakerId: entry.speakerId,
+      muted: mutedSpeakerIds.has(entry.speakerId),
+      track: classifyToken(entry.token),
+      voice: entry.voice,
+      converted: classifyToken(entry.convertedToken),
+    }));
 
     const decision = chooseAudibleSet({
       playbackSource,
@@ -3389,8 +3465,9 @@ function App() {
     });
 
     const audibleTokens = new Set<string>();
-    for (const speakerId of decision.audibleSpeakerIds) {
-      const token = speakerTrackTokens.find((entry) => entry.speakerId === speakerId)?.token;
+    for (const choice of decision.audibleTracks) {
+      const entry = speakerTrackTokens.find((item) => item.speakerId === choice.speakerId);
+      const token = choice.voice === "converted" ? entry?.convertedToken : entry?.token;
       if (token) {
         audibleTokens.add(token);
       }
@@ -3399,7 +3476,7 @@ function App() {
 
     const audibleElements = new Set<HTMLAudioElement>();
     for (const token of audibleTokens) {
-      const element = elementsByToken.get(token);
+      const element = soloTrackElementsRef.current.get(token);
       if (element) {
         audibleElements.add(element);
       }
@@ -3432,7 +3509,7 @@ function App() {
         element.removeEventListener("canplay", reapply);
       }
     };
-  }, [applyAudibility, collectTransportElements, audioUrl, processedAudio, playbackSource, soloTrackMountKey]);
+  }, [applyAudibility, collectTransportElements, audioUrl, processedAudio, playbackSource, trackMountKey]);
 
   // A track rendered mid-session mounts while the clock is already running, so it
   // missed the play event: join it in flight, positioned and at the same rate, so
@@ -3457,7 +3534,7 @@ function App() {
         void follower.play().catch(() => undefined);
       }
     }
-  }, [collectClockFollowers, audioUrl, processedAudio, playbackSource, soloTrackMountKey]);
+  }, [collectClockFollowers, audioUrl, processedAudio, playbackSource, trackMountKey]);
 
   // Transport state: play/pause indicator, duration, speed, and user mute. Only
   // the clock's events count -- followers start and stop a beat later and would
@@ -3493,13 +3570,13 @@ function App() {
         element.removeEventListener("durationchange", onMetadata);
       }
     };
-  }, [collectTransportElements, audioUrl, processedAudio, playbackSource, soloTrackMountKey]);
+  }, [collectTransportElements, audioUrl, processedAudio, playbackSource, trackMountKey]);
 
   useEffect(() => {
     for (const element of collectTransportElements()) {
       element.playbackRate = playbackRate;
     }
-  }, [collectTransportElements, playbackRate, audioUrl, processedAudio, soloTrackMountKey]);
+  }, [collectTransportElements, playbackRate, audioUrl, processedAudio, trackMountKey]);
 
   function skipBy(seconds: number) {
     const audio = audioRef.current;
@@ -3570,7 +3647,7 @@ function App() {
     processedAudio,
     audioUrl,
     playbackSource,
-    soloTrackMountKey,
+    trackMountKey,
   ]);
 
   // While the timelines match, mirror play/pause/seek/rate from the clock onto
@@ -3632,7 +3709,7 @@ function App() {
         }
       }
     };
-  }, [collectClockFollowers, collectTransportElements, processedAudio, audioUrl, playbackSource, soloTrackMountKey]);
+  }, [collectClockFollowers, collectTransportElements, processedAudio, audioUrl, playbackSource, trackMountKey]);
 
   // One shared derivation of the snapped regions: the fallback gate and the solo-track
   // job must gate on exactly the same edges. Null means "not derivable" (no
@@ -3709,6 +3786,80 @@ function App() {
     });
   }, []);
 
+  const setSpeakerVoice = useCallback((speakerId: number, voice: SpeakerVoice) => {
+    setActiveVoice((current) => {
+      if ((current.get(speakerId) ?? "original") === voice) {
+        return current;
+      }
+      const next = new Map(current);
+      next.set(speakerId, voice);
+      return next;
+    });
+  }, []);
+
+  // A finished conversion of an isolated track registers as that speaker's
+  // alternate voice and starts playing straight away -- the toggle is how the
+  // user gets back to the original.
+  const handleConvertedVoice = useCallback(
+    (speakerId: number, result: { token: string; url: string; filename: string }) => {
+      setConvertedVoices((current) => {
+        const next = new Map(current);
+        next.set(speakerId, { token: result.token, url: result.url, filename: result.filename });
+        return next;
+      });
+      setSpeakerVoice(speakerId, "converted");
+    },
+    [setSpeakerVoice],
+  );
+
+  // Restored converted voices are adopted only while their artifacts are still on
+  // the server: mounting a 404 would leave a permanently pending element that the
+  // audibility pass keeps waiting for.
+  useEffect(() => {
+    const pending = persistedConvertedVoicesRef.current;
+    if (!pending) {
+      return;
+    }
+    persistedConvertedVoicesRef.current = null;
+    let cancelled = false;
+
+    const revalidate = async () => {
+      const entries = Object.entries(pending.tokens);
+      const alive = await Promise.all(
+        entries.map(async ([, token]) => {
+          try {
+            const response = await fetch(conversionAudioUrl(API_BASE_URL, token), { method: "HEAD" });
+            return response.ok;
+          } catch {
+            return false;
+          }
+        }),
+      );
+      if (cancelled) {
+        return;
+      }
+      const voices = new Map<number, { token: string; url: string; filename?: string }>();
+      const active = new Map<number, SpeakerVoice>();
+      entries.forEach(([key, token], index) => {
+        if (!alive[index]) {
+          return;
+        }
+        const speakerId = Number(key);
+        voices.set(speakerId, { token, url: conversionAudioUrl(API_BASE_URL, token) });
+        if (pending.active[speakerId] === "converted") {
+          active.set(speakerId, "converted");
+        }
+      });
+      setConvertedVoices(voices);
+      setActiveVoice(active);
+    };
+
+    void revalidate();
+    return () => {
+      cancelled = true;
+    };
+  }, [convertedRestoreNonce]);
+
   // The Regions panel still speaks in terms of one soloed lane: exactly one
   // speaker left audible is that lane, anything else is no solo at all.
   const soloSpeakerId = useMemo(() => {
@@ -3754,7 +3905,7 @@ function App() {
         element.removeEventListener("seeked", reapply);
       }
     };
-  }, [applyPlaybackVolume, collectTransportElements, audioUrl, processedAudio, playbackSource, soloTrackMountKey]);
+  }, [applyPlaybackVolume, collectTransportElements, audioUrl, processedAudio, playbackSource, trackMountKey]);
 
   // The same snapped regions, flattened for the backend: it silences everything
   // outside them so each exported per-speaker track stands alone on the original
@@ -3859,11 +4010,14 @@ function App() {
         while (!cancelled) {
           const status = await fetchSoloTracksJob(API_BASE_URL, jobId);
           if (status.status === "done" && status.result) {
-            const tracks: Record<number, { url: string; token: string }> = {};
+            const tracks: Record<number, { url: string; token: string; filename?: string }> = {};
             for (const track of status.result.tracks) {
               tracks[track.speaker_index] = {
                 url: separatedAudioUrl(API_BASE_URL, track.token),
                 token: track.token,
+                // Kept for the export tab's download name only; a reload adopts
+                // tokens alone and falls back to the rendered format there.
+                filename: track.output_filename,
               };
             }
             if (!cancelled) {
@@ -4386,6 +4540,14 @@ function App() {
       // matches means every reload re-renders.
       soloTracks: persistedSoloTokensRef.current ?? null,
       soloTrackRenderNonce: trackRenderNonce,
+      convertedVoices: convertedVoiceEntries.length
+        ? {
+            tokens: Object.fromEntries(convertedVoiceEntries.map((entry) => [entry.speakerId, entry.token])),
+            active: Object.fromEntries(
+              convertedVoiceEntries.map((entry) => [entry.speakerId, activeVoice.get(entry.speakerId) ?? "original"]),
+            ),
+          }
+        : null,
     };
   }
 
@@ -4478,6 +4640,17 @@ function App() {
     setRenderedRegionsSignature(persistedSoloTokensRef.current?.regionsSignature ?? null);
     soloTracksAttemptRef.current = null;
     setSoloTracks({ status: "idle", tracks: {} });
+    // Same deal for the converted voices, minus the render key: they are keyed by
+    // speaker id and revalidated one artifact at a time by the effect the nonce
+    // wakes up.
+    const restoredConvertedVoices =
+      "convertedVoices" in persisted && persisted.convertedVoices?.tokens ? persisted.convertedVoices : null;
+    persistedConvertedVoicesRef.current = restoredConvertedVoices
+      ? { tokens: restoredConvertedVoices.tokens, active: restoredConvertedVoices.active ?? {} }
+      : null;
+    setConvertedVoices(new Map());
+    setActiveVoice(new Map());
+    setConvertedRestoreNonce((nonce) => nonce + 1);
 
     const restoredEditor =
       persisted.editor ??
@@ -4622,6 +4795,10 @@ function App() {
     setPlaybackSource("original");
     setSoloTracks({ status: "idle", tracks: {} });
     setMutedSpeakerIds(new Set());
+    // A converted voice is a conversion of one recording's isolated track, so it
+    // means nothing against different audio.
+    setConvertedVoices(new Map());
+    setActiveVoice(new Map());
     soloTracksAttemptRef.current = null;
     // persistedSoloTokensRef survives on purpose: re-loading the session's own
     // audio after a reload should adopt the finished tracks, and the session
@@ -5958,26 +6135,6 @@ function App() {
               >
                 {userMuted ? <VolumeX size={16} /> : <Volume2 size={16} />}
               </button>
-              {soloableSpeakers.length ? (
-                <div className="mode-toggle transport-speakers" role="group" aria-label="Mute speakers">
-                  {soloableSpeakers.map((speaker) => {
-                    const speakerMuted = mutedSpeakerIds.has(speaker.id);
-                    return (
-                      <button
-                        key={speaker.id}
-                        type="button"
-                        className={speakerMuted ? "is-muted" : "is-active"}
-                        aria-pressed={!speakerMuted}
-                        disabled={!audioUrl}
-                        title={`${speakerMuted ? "Unmute" : "Mute"} ${speaker.name}`}
-                        onClick={() => toggleSpeakerMuted(speaker.id)}
-                      >
-                        {speaker.name}
-                      </button>
-                    );
-                  })}
-                </div>
-              ) : null}
               <select
                 className="transport-speed"
                 value={playbackRate}
@@ -6089,6 +6246,55 @@ function App() {
               </div>
             </div>
           </div>
+          {/* Speaker audibility has its own row: inside the transport pill the
+              names were squeezed to a few characters, and a converted voice adds
+              a second control per speaker. */}
+          {soloableSpeakers.length ? (
+            <div className="speaker-audibility-row">
+              {soloableSpeakers.map((speaker) => {
+                const speakerMuted = mutedSpeakerIds.has(speaker.id);
+                const converted = convertedVoices.get(speaker.id) ?? null;
+                const voice = activeVoice.get(speaker.id) === "converted" ? "converted" : "original";
+                return (
+                  <div key={speaker.id} className="speaker-audibility-group">
+                    <div className="mode-toggle" role="group" aria-label={`Mute ${speaker.name}`}>
+                      <button
+                        type="button"
+                        className={speakerMuted ? "is-muted" : "is-active"}
+                        aria-pressed={!speakerMuted}
+                        disabled={!audioUrl}
+                        title={`${speakerMuted ? "Unmute" : "Mute"} ${speaker.name}`}
+                        onClick={() => toggleSpeakerMuted(speaker.id)}
+                      >
+                        {speaker.name}
+                      </button>
+                    </div>
+                    {converted ? (
+                      <div className="mode-toggle" role="group" aria-label={`${speaker.name} voice`}>
+                        <button
+                          type="button"
+                          className={voice === "original" ? "is-active" : ""}
+                          disabled={!audioUrl}
+                          onClick={() => setSpeakerVoice(speaker.id, "original")}
+                        >
+                          Original
+                        </button>
+                        <button
+                          type="button"
+                          className={voice === "converted" ? "is-active" : ""}
+                          disabled={!audioUrl}
+                          title="Play the converted voice in this speaker's place"
+                          onClick={() => setSpeakerVoice(speaker.id, "converted")}
+                        >
+                          Converted
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
           <audio ref={originalAudioRef} className="peer-audio-hidden" src={audioUrl ?? undefined} preload="auto" />
           {processedAudio ? (
             <audio ref={masteredAudioRef} className="peer-audio-hidden" src={processedAudio.url} preload="auto" />
@@ -6097,6 +6303,18 @@ function App() {
               the selected one would make each switch a load-seek-play cycle, which
               is inherently gappy and lands the new element off position. */}
           {soloTrackEntries.map((entry) => (
+            <audio
+              key={entry.token}
+              ref={soloTrackRefFor(entry.token)}
+              className="peer-audio-hidden"
+              src={entry.url}
+              preload="auto"
+            />
+          ))}
+          {/* Converted voices join the same element map, keyed by their own token:
+              to the transport they are followers like any other track, so the
+              Original/Converted switch is a mute swap too. */}
+          {convertedVoiceEntries.map((entry) => (
             <audio
               key={entry.token}
               ref={soloTrackRefFor(entry.token)}
@@ -6753,7 +6971,12 @@ function App() {
                 ) : null}
 
                 {sidePanelTab === "convert" ? (
-                  <ConvertPanel apiBaseUrl={API_BASE_URL} audioFile={selectedFile} />
+                  <ConvertPanel
+                    apiBaseUrl={API_BASE_URL}
+                    audioFile={selectedFile}
+                    isolatedTracks={isolatedTrackChoices}
+                    onConvertedVoice={handleConvertedVoice}
+                  />
                 ) : null}
 
                 {sidePanelTab === "patch" ? (
@@ -6855,6 +7078,39 @@ function App() {
                         Download edit guide (.srt)
                       </button>
                     </div>
+
+                    <div className="panel-section-heading">
+                      <p className="eyebrow">Speaker audio</p>
+                      <h3>Isolated tracks</h3>
+                    </div>
+                    {speakerAudioExports.some((entry) => entry.isolated || entry.converted) ? (
+                      <>
+                        <p className="helper-text">
+                          Full-length, timeline-preserving audio: each track carries one voice and silence elsewhere.
+                        </p>
+                        <div className="inline-actions">
+                          {speakerAudioExports.map((entry) => (
+                            <Fragment key={entry.speakerId}>
+                              {entry.isolated ? (
+                                <a className="button-link" href={entry.isolated.url} download={entry.isolated.download}>
+                                  {entry.name} — isolated
+                                </a>
+                              ) : null}
+                              {entry.converted ? (
+                                <a className="button-link" href={entry.converted.url} download={entry.converted.download}>
+                                  {entry.name} — converted
+                                </a>
+                              ) : null}
+                            </Fragment>
+                          ))}
+                        </div>
+                      </>
+                    ) : (
+                      <p className="helper-text">
+                        No speaker tracks yet. They render automatically once the audio has speakers; a converted voice
+                        shows up here after a conversion in the Convert tab.
+                      </p>
+                    )}
                   </section>
                 ) : null}
 
