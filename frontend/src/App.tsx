@@ -3812,6 +3812,28 @@ function App() {
     [setSpeakerVoice],
   );
 
+  // A discarded conversion is deleted server-side, so its registration has to go
+  // too: dropping both entries collapses the voice toggle back to nothing and
+  // unmounts the element rather than leaving it pending on a 404 URL.
+  const handleConvertedVoiceRemoved = useCallback((speakerId: number) => {
+    setConvertedVoices((current) => {
+      if (!current.has(speakerId)) {
+        return current;
+      }
+      const next = new Map(current);
+      next.delete(speakerId);
+      return next;
+    });
+    setActiveVoice((current) => {
+      if (!current.has(speakerId)) {
+        return current;
+      }
+      const next = new Map(current);
+      next.delete(speakerId);
+      return next;
+    });
+  }, []);
+
   // Restored converted voices are adopted only while their artifacts are still on
   // the server: mounting a 404 would leave a permanently pending element that the
   // audibility pass keeps waiting for.
@@ -6976,6 +6998,7 @@ function App() {
                     audioFile={selectedFile}
                     isolatedTracks={isolatedTrackChoices}
                     onConvertedVoice={handleConvertedVoice}
+                    onConvertedVoiceRemoved={handleConvertedVoiceRemoved}
                   />
                 ) : null}
 
