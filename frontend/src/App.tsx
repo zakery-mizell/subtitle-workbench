@@ -201,6 +201,11 @@ const REGION_SILENCE_MARGIN_S = 0.08;
 // The handful of shared-span splits do cut mid-speech; ramp the playback gate
 // there instead of stepping it, or the cut clicks.
 const GATE_RAMP_S = 0.04;
+// One-shot resync of a newly audible speaker track: long enough for it to have
+// settled into steady playback, short enough that the nudge still lands inside
+// the change of voice.
+const AUDIBLE_SETTLE_DELAY_MS = 500;
+const AUDIBLE_SETTLE_TOLERANCE_S = 0.05;
 
 interface SoloInterval {
   start: number;
@@ -3021,6 +3026,7 @@ function App() {
   const soloTrackElementsRef = useRef(new Map<string, HTMLAudioElement>());
   // Token of the solo track currently carrying the sound (null = the clock is).
   const audibleSoloTokenRef = useRef<string | null>(null);
+  const audibleSettleTimerRef = useRef<number | null>(null);
   const soloTracksAttemptRef = useRef<string | null>(null);
   const persistedSoloTokensRef = useRef<SoloTrackArtifacts | null>(null);
   const userScrollAtRef = useRef(0);
@@ -3357,9 +3363,29 @@ function App() {
       }),
     });
     const audible = target.audible === "solo" && soloElement ? soloElement : clock;
+    const promoted = audible !== clock && audibleSoloTokenRef.current !== soloToken;
     audibleSoloTokenRef.current = audible === soloElement ? soloToken : null;
     for (const element of collectTransportElements()) {
       element.muted = element !== audible;
+    }
+
+    // Starting playback on a follower costs it a beat, so a freshly promoted
+    // track settles a bit behind the clock and then runs parallel forever --
+    // measured ~170 ms on a 19-minute file. The clock drives the transcript, the
+    // playhead and the solo gate, so that offset reads as everything being early.
+    // Correct it once, shortly after the swap, where a sub-200 ms nudge hides
+    // inside the change of voice; steady-state playback is still never seeked.
+    if (promoted && audible !== clock) {
+      window.clearTimeout(audibleSettleTimerRef.current ?? undefined);
+      audibleSettleTimerRef.current = window.setTimeout(() => {
+        const settleClock = audioRef.current;
+        if (!settleClock || audible.muted || audible.readyState < HTMLMediaElement.HAVE_METADATA) {
+          return;
+        }
+        if (Math.abs(audible.currentTime - settleClock.currentTime) > AUDIBLE_SETTLE_TOLERANCE_S) {
+          audible.currentTime = settleClock.currentTime;
+        }
+      }, AUDIBLE_SETTLE_DELAY_MS);
     }
   }, [activeSoloTrack, collectTransportElements, playbackSource, processedAudio, soloSpeakerIndex]);
 
