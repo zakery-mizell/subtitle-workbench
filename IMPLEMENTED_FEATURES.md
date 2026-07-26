@@ -291,6 +291,44 @@ Local Auphonic-style post production implemented in `backend/app/mastering/` and
 - Convert side-panel tab: separate source and target-voice dropzones (source defaults to the workspace audio), a "convert style/accent too" checkbox, output-format select, Advanced settings (diffusion steps, length adjust, similarity CFG, intelligibility CFG), progress bar, result chips (rate, duration, format, device, diffusion steps), inline player, download, and discard.
 - Seed-VC model code is vendored into `vendor/seed-vc/` (not pip-installable, gitignored). Install via `scripts/install-convert.sh` / `.ps1`: clone the repo, install only the two missing deps (`hydra-core`, `munch`) — never the upstream `requirements.txt`, which pins torch 2.4 / transformers 4.46 / numpy 1.26 — then download the ~1.6 GB checkpoints (Seed-VC V2, ASTRAL quantizers, campplus, hubert, bigvgan, whisper-small tokenizer) into the `models/` HF cache; missing pieces surface as `ConversionUnavailable` errors that point at the install script.
 
+### Known limitation: conversion is not audio upscaling, and it needs *machine*-intelligible input
+
+Conversion replaces timbre; it does not repair a source. Its content path is entirely
+audio-derived — HuBERT features quantized to ASTRAL tokens — so **the transcript cannot be fed
+to it** and there is no text to fall back on when the audio is ambiguous. The failure mode that
+matters in practice: a band-limited phone recording can be perfectly intelligible to a human
+listener and still be too degraded for the content encoder, because the cues the encoder leans
+on (fricative/sibilant energy above the phone band, crisp stop releases) were never recorded.
+The output is then fluent but wrong — words smeared or replaced — and turning intelligibility
+CFG up only sharpens articulation of tokens that were already wrong.
+
+Human intelligibility and encoder intelligibility are therefore different thresholds, and
+clearing the first does not clear the second. Restoration/denoise (§14) helps when the problem
+is noise or reverb; it does not synthesize a missing top octave, so it does not move the needle
+on a truly narrowband source. What does work is replacing the *performance* with a clean one
+before converting — see the overdub route below — because that makes the phonetics real rather
+than inferred.
+
+Overdub-first pipeline (the reliable route for unusable sources), in increasing automation:
+1. **Re-perform (ADR).** Speak the lines again against the original for timing and feeling. The
+   re-performance carries emotion natively, and being already the target voice it makes
+   conversion optional (use it only to polish timbre toward a reference).
+2. **Synthesize per caption, timing locked.** Patch/generate each caption's text in the target
+   voice with `fix_duration_s` set from the SRT so the original rhythm is preserved. Clean
+   phonetics, original timing — but the emotional contour is the TTS model's invention, not the
+   source's.
+3. **Transfer the contour with DSP.** After (2), force the synthesized audio's F0 and energy
+   envelopes onto the measured contours of the original (word-aligned via the WhisperX word
+   timings the legacy load already produces, F0 via pyworld/torchcrepe, pitch rescaled into the
+   target speaker's range). This is what recovers "the same delivery" without a human take, and
+   it is buildable on what is already installed. Not implemented yet.
+
+Also worth one cheap experiment before any of that: run a dedicated **bandwidth-extension**
+model (audio super-resolution, e.g. AudioSR-class) over the source and re-run conversion. If the
+content encoder's problem really is the missing high band, restoring plausible high-frequency
+detail may lift the source over the encoder's threshold. Unproven here; the engines in this repo
+do not do it.
+
 ## 17. F5-TTS speech editing (Patch tab)
 
 - Two modes under one **Patch** tab, backed by F5-TTS (`F5TTS_v1_Base`, a mel-domain flow-matching TTS model) in `backend/app/speechedit/` and `frontend/src/PatchPanel.tsx`; both modes emit 24 kHz mono and run fully locally. `POST /api/speech-edit` is one upload plus `params_json` on the shared job registry/polling; artifacts land under `tmp/speechedit/` (token prefix `se_`, filename suffix `.f5tts.<fmt>`) with audio (`GET`/`HEAD /api/speech-edit/{token}/audio`), waveform, and delete endpoints.

@@ -182,6 +182,19 @@ the source, the voice from the reference. Unlike restoration (which regenerates 
 conversion *swaps* the voice — useful for re-voicing a rough phone recording with a clean clip of
 the target speaker. It is zero-shot and speech-only (no singing/f0 mode); output is 22.05 kHz mono.
 
+**It is not audio upscaling, and its input threshold is stricter than your ears.** What it
+re-voices is read from the audio (HuBERT features → ASTRAL tokens), never from the transcript, so
+there is nothing to fall back on when the audio is ambiguous. A narrowband phone recording can be
+perfectly understandable to you and still be unusable here, because the encoder relies on cues
+that were never recorded (fricative energy above the phone band, crisp stop releases); the result
+is fluent but wrong words, and raising intelligibility CFG only articulates the wrong tokens more
+clearly. Denoise/restoration helps with noise and reverb, not with a missing top octave. When a
+source is that far gone, replace the *performance* before converting — re-speak it (ADR), or
+synthesize each caption in **Patch** with its SRT duration so the original timing survives. See
+"Known limitation" under §16 of `IMPLEMENTED_FEATURES.md` for the full pipeline, including the
+not-yet-implemented F0/energy contour transfer that would carry the original delivery onto a
+synthesized take.
+
 Install it first (the two missing python deps plus the model checkpoints, downloaded on install or
 lazily on first use):
 

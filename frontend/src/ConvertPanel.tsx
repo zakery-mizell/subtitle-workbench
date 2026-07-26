@@ -171,6 +171,13 @@ export function ConvertPanel({ apiBaseUrl, audioFile, isolatedTracks, onConverte
       <p className="helper-text">
         Zero-shot and fully local — both clips stay on this machine. Speech only; 22.05 kHz output.
       </p>
+      <p className="helper-text">
+        This swaps timbre; it does not repair the source. The content it re-voices is read from the
+        audio, never from the transcript, so a narrowband recording that you can still understand
+        may already be too degraded for it — expect smeared or invented words. For a source that
+        far gone, replace the performance first (re-speak it, or synthesize each caption in Patch
+        with its SRT duration), then convert.
+      </p>
 
       <div className="mode-toggle" role="group" aria-label="Conversion source">
         <button type="button" className={mode === "isolated" ? "is-active" : ""} onClick={() => setSourceMode("isolated")}>
