@@ -15,8 +15,11 @@ from ..config import settings
 from ..jobs import ProgressReporter
 from ..mastering.audio_io import MasterAudio, encode_master
 from ..schemas import WarningItem
+from . import sidon_engine
 from .engine import RESTORE_INPUT_RATE, RestoreUnavailable, load_engine, restore_waveform
 from .schemas import RestoreParams, RestoreResult
+
+ENGINE_LABELS = {"diamond": "Diamond", "sidon": "Sidon"}
 
 
 def restore_output_dir() -> Path:
@@ -39,11 +42,11 @@ def _output_paths(source_filename: str, fmt: str) -> tuple[str, Path]:
     return token, output_dir / f"{token}__{stem}.restored.{fmt}"
 
 
-def decode_mono_24k(source_path: str) -> np.ndarray:
-    """Decode any audio/video file to mono float32 at 24 kHz (Diamond's input rate)."""
+def decode_mono(source_path: str, rate: int) -> np.ndarray:
+    """Decode any audio/video file to mono float32 at the engine's input rate."""
     command = [
         "ffmpeg", "-v", "error", "-i", source_path, "-vn", "-ac", "1",
-        "-ar", str(RESTORE_INPUT_RATE), "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1",
+        "-ar", str(rate), "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1",
     ]
     try:
         completed = subprocess.run(command, check=True, capture_output=True)
@@ -64,27 +67,39 @@ def run_restore(
     params: RestoreParams,
     reporter: ProgressReporter,
 ) -> RestoreResult:
-    """Restore a single audio file end to end with the Diamond model."""
+    """Restore a single audio file end to end with the selected model."""
     warnings: list[WarningItem] = []
+    label = ENGINE_LABELS[params.engine]
+    input_rate = (
+        sidon_engine.SIDON_INPUT_RATE if params.engine == "sidon" else RESTORE_INPUT_RATE
+    )
 
     reporter.stage("decode", 0.0, 0.06, "Decoding audio")
-    wav = decode_mono_24k(source_path)
+    wav = decode_mono(source_path, input_rate)
 
-    reporter.stage("load_model", 0.06, 0.16, "Loading Diamond restoration model")
+    reporter.stage("load_model", 0.06, 0.16, f"Loading {label} restoration model")
     try:
-        engine = load_engine()
+        engine = sidon_engine.load_engine() if params.engine == "sidon" else load_engine()
     except RestoreUnavailable as exc:
         raise RuntimeError(str(exc)) from exc
 
     reporter.stage("restore", 0.16, 0.92, "Restoring speech")
-    restored, out_sr = restore_waveform(
-        wav,
-        RESTORE_INPUT_RATE,
-        chunk_sec=params.chunk_sec,
-        overlap_sec=params.overlap_sec,
-        rep_penalty=params.rep_penalty,
-        progress=reporter.tick,
-    )
+    if params.engine == "sidon":
+        restored, out_sr = sidon_engine.restore_waveform(
+            wav,
+            input_rate,
+            chunk_sec=params.sidon_chunk_sec,
+            progress=reporter.tick,
+        )
+    else:
+        restored, out_sr = restore_waveform(
+            wav,
+            input_rate,
+            chunk_sec=params.chunk_sec,
+            overlap_sec=params.overlap_sec,
+            rep_penalty=params.rep_penalty,
+            progress=reporter.tick,
+        )
 
     reporter.stage("encode", 0.92, 1.0, f"Encoding {params.output_format}")
     token, output_path = _output_paths(source_filename, params.output_format)
@@ -97,6 +112,7 @@ def run_restore(
     return RestoreResult(
         token=token,
         filename=output_path.name.split("__", 1)[1],
+        engine=params.engine,
         output_format=params.output_format,
         sample_rate=out_sr,
         duration_sec=round(restored.size / out_sr, 3),

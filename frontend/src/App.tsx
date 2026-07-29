@@ -38,6 +38,7 @@ import { DEFAULT_LOW_CONFIDENCE_THRESHOLD, isLowConfidenceWord } from "./lib/con
 import { conversionAudioUrl } from "./lib/conversion";
 import { remapCaptions, remapGuideBlocks, remapTime, remapWords, unremapTime } from "./lib/cuts";
 import type { CutRegion, MasteringResult } from "./lib/mastering";
+import type { RestoreEngineName } from "./lib/restore";
 import {
   MEDIA_HAVE_METADATA,
   chooseAudibleSet,
@@ -419,16 +420,18 @@ const SOLO_TRACK_RENDER_VERSION = "v2";
 function soloTracksSessionKey(
   session: TranscriptResponse,
   restore: boolean,
+  restoreEngine: RestoreEngineName,
   regionCount: number,
   renderNonce: number,
 ): string {
-  // The restore flag is part of the key so Diamond-restored tokens are never
-  // reused for a raw run (or vice versa) after a reload. The region count stands
+  // The restore flag AND the engine are part of the key so restored tokens are
+  // never reused for a raw run, or across engines (they differ in sample rate
+  // as well as sound), after a reload. The region count stands
   // in for the gating envelope: re-derived regions must re-render the tracks.
   // Hand edits that only move boundaries keep the count, so the nonce carries an
   // explicit re-render request -- rendering on every nudge would launch a
   // minutes-long job per keystroke.
-  return `${SOLO_TRACK_RENDER_VERSION}|${session.audio_filename}|${session.duration ?? 0}|${(session.overlap_regions ?? []).length}|${regionCount}|${restore ? "restore" : "raw"}|n${renderNonce}`;
+  return `${SOLO_TRACK_RENDER_VERSION}|${session.audio_filename}|${session.duration ?? 0}|${(session.overlap_regions ?? []).length}|${regionCount}|${restore ? `restore-${restoreEngine}` : "raw"}|n${renderNonce}`;
 }
 
 // Cheap FNV-1a over the gating envelope, to tell whether the rendered tracks
@@ -638,6 +641,7 @@ interface PersistedWorkspace {
   lowConfidenceThreshold: number;
   // Whether the auto solo-tracks were (or should be) Diamond-restored.
   restoreSoloTracks?: boolean;
+  restoreEngine?: RestoreEngineName;
   // Finished auto solo-track artifacts (speaker index -> server token), keyed
   // to the session so a reload can revalidate them instead of re-running UniSE.
   // regionsSignature is the gating envelope the artifacts were actually rendered
@@ -3012,10 +3016,11 @@ function App() {
   // here because the autosave effect below persists them.
   const [trackRenderNonce, setTrackRenderNonce] = useState(0);
   const [renderedRegionsSignature, setRenderedRegionsSignature] = useState<string | null>(null);
-  // When on, the auto-prepared solo tracks are regenerated at 44.1 kHz studio
-  // quality (Diamond) after voice isolation. Baked into the solo-tracks cache
-  // key so raw and restored renders never share tokens.
+  // When on, the auto-prepared solo tracks are restored after voice isolation.
+  // Both the flag and the engine are baked into the solo-tracks cache key so
+  // raw and restored renders never share tokens.
   const [restoreSoloTracks, setRestoreSoloTracks] = useState(false);
+  const [restoreEngine, setRestoreEngine] = useState<RestoreEngineName>("sidon");
   const [themeDark, setThemeDark] = useState(() => window.localStorage.getItem(THEME_STORAGE_KEY) === "dark");
   const [resumeProjectFile, setResumeProjectFile] = useState<File | null>(null);
   const [resumeAudioFile, setResumeAudioFile] = useState<File | null>(null);
@@ -3241,6 +3246,7 @@ function App() {
                 ? saved.lowConfidenceThreshold
                 : DEFAULT_LOW_CONFIDENCE_THRESHOLD,
             restoreSoloTracks: typeof saved.restoreSoloTracks === "boolean" ? saved.restoreSoloTracks : false,
+            restoreEngine: saved.restoreEngine === "diamond" ? "diamond" : "sidon",
             soloTracks:
               saved.soloTracks && typeof saved.soloTracks.key === "string" && saved.soloTracks.tokens
                 ? saved.soloTracks
@@ -3335,7 +3341,7 @@ function App() {
         autosaveTimerRef.current = null;
       }
     };
-  }, [acknowledgedLowConfidenceWordIds, activeVoice, activeWorkspace, clickToPlay, convertedVoices, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, lowConfidenceThreshold, model, normalizeExportTimingTo30Fps, removeDisfluencies, restoreSoloTracks, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, soloTracks, speakerAssignmentMode, speakerCount, speakerInputs, trackRenderNonce, viewMode]);
+  }, [acknowledgedLowConfidenceWordIds, activeVoice, activeWorkspace, clickToPlay, convertedVoices, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, lowConfidenceThreshold, model, normalizeExportTimingTo30Fps, removeDisfluencies, restoreEngine, restoreSoloTracks, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, soloTracks, speakerAssignmentMode, speakerCount, speakerInputs, trackRenderNonce, viewMode]);
 
   // One stable ref callback per token. An inline arrow would be a fresh function
   // on every render, and React detaches (null) then re-attaches a changed ref
@@ -3951,7 +3957,13 @@ function App() {
     if (!session || !selectedFile || (!canSeparate && !soloTrackRegionCount)) {
       return;
     }
-    const attemptKey = soloTracksSessionKey(session, restoreSoloTracks, soloTrackRegionCount, trackRenderNonce);
+    const attemptKey = soloTracksSessionKey(
+      session,
+      restoreSoloTracks,
+      restoreEngine,
+      soloTrackRegionCount,
+      trackRenderNonce,
+    );
     if (soloTracksAttemptRef.current === attemptKey) {
       return;
     }
@@ -4006,6 +4018,7 @@ function App() {
           speakerTurns,
           renderedRegions,
           restoreSoloTracks,
+          restoreEngine,
         );
         while (!cancelled) {
           const status = await fetchSoloTracksJob(API_BASE_URL, jobId);
@@ -4055,7 +4068,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [session, selectedFile, overlapRegions, speakerTurns, soloTrackRegionCount, restoreSoloTracks, trackRenderNonce]);
+  }, [session, selectedFile, overlapRegions, speakerTurns, soloTrackRegionCount, restoreSoloTracks, restoreEngine, trackRenderNonce]);
 
   // Only the fallback gate needs per-frame gain: it rides region edges on the
   // clock, which timeupdate's ~4 Hz would step through audibly. Once the speaker
@@ -4129,8 +4142,8 @@ function App() {
           : sidePanelTab === "restore"
             ? {
                 eyebrow: "Restore",
-                title: "Diamond speech restoration",
-                detail: "Studio-quality 44.1 kHz",
+                title: "Speech restoration",
+                detail: "Sidon or Diamond",
               }
           : sidePanelTab === "convert"
             ? {
@@ -4534,6 +4547,7 @@ function App() {
       acknowledgedLowConfidenceWordIds,
       lowConfidenceThreshold,
       restoreSoloTracks,
+      restoreEngine,
       // Written by the solo-track effect when a render lands, so this is the
       // exact key that effect computed. Rebuilding the key here instead is how
       // the persisted and recomputed keys drift apart -- and a key that never
@@ -4620,6 +4634,7 @@ function App() {
       setAudioFile(options.audioFile ?? null);
     }
     setRestoreSoloTracks(Boolean(persisted.restoreSoloTracks));
+    setRestoreEngine(persisted.restoreEngine === "diamond" ? "diamond" : "sidon");
     // Adopt previously rendered solo tracks (revalidated by the auto-solo
     // effect) instead of re-running separation after every reload.
     persistedSoloTokensRef.current =
@@ -6936,6 +6951,8 @@ function App() {
                     language={activeWorkspace?.language ?? session?.language ?? null}
                     restoreSoloTracks={restoreSoloTracks}
                     onRestoreSoloTracksChange={setRestoreSoloTracks}
+                    restoreEngine={restoreEngine}
+                    onRestoreEngineChange={setRestoreEngine}
                     onProcessed={handleSeparationProcessed}
                     onApplyWords={applySeparatedWords}
                     onSeek={seekAudio}

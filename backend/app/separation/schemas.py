@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from ..restore.schemas import RestoreEngineName
 from ..schemas import WarningItem
 
 SeparationMode = Literal["spotlight", "mute"]
@@ -102,8 +103,9 @@ class SoloTracksParams(BaseModel):
     turns: list[TurnInput] = []
     speaker_regions: list[SpeakerRegionIn] = []
     output: SeparationOutputParams = SeparationOutputParams()
-    # Restore each assembled per-speaker track with Diamond (44.1 kHz output).
+    # Restore each assembled per-speaker track (Sidon -> 48 kHz, Diamond -> 44.1 kHz).
     restore: bool = False
+    restore_engine: RestoreEngineName = "sidon"
 
 
 class SoloTrackOut(BaseModel):
