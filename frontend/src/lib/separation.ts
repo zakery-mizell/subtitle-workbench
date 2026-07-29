@@ -1,4 +1,5 @@
 import type { OverlapRegion, SpeakerTurn, WarningItem } from "../types";
+import type { RestoreEngineName } from "./restore";
 
 export type SeparationMode = "spotlight" | "mute";
 
@@ -146,6 +147,7 @@ export async function startSoloTracksJob(
   turns: SpeakerTurn[],
   speakerRegions: SpeakerRegionParams[] = [],
   restore = false,
+  restoreEngine: RestoreEngineName = "sidon",
 ): Promise<string> {
   const params = {
     regions,
@@ -153,9 +155,10 @@ export async function startSoloTracksJob(
     // Silence-snapped regions per speaker: the backend mutes everything outside
     // them, so each track is timeline-preserving but carries one voice only.
     speaker_regions: speakerRegions,
-    // When set, each per-speaker track is regenerated at 44.1 kHz studio quality
-    // (Diamond) after isolation; default keeps the raw separated stems.
+    // When set, each per-speaker track is restored after isolation (Sidon at
+    // 48 kHz or Diamond at 44.1 kHz); default keeps the raw separated stems.
     restore,
+    restore_engine: restoreEngine,
     // FLAC halves the disk footprint of these full-length per-speaker tracks
     // (a 1 h recording is ~600 MB as 48 kHz WAV) and <audio> plays it fine.
     output: { format: "flac", bitrate_kbps: null },

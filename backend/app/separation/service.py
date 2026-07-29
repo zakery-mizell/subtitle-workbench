@@ -18,6 +18,7 @@ from ..config import settings
 from ..diarization import SpeakerTurn
 from ..jobs import ProgressReporter
 from ..mastering.audio_io import MasterAudio, decode_master, encode_master
+from ..restore import sidon_engine
 from ..restore.engine import RestoreUnavailable, restore_waveform
 from ..schemas import WarningItem
 from . import blend
@@ -280,10 +281,15 @@ def run_solo_tracks(
                     label = f"Restoring speaker {position} — {message.removeprefix('Restoring ').strip()}"
                 reporter.tick(fraction, label)
 
-            # The assembled track can be stereo (channels, n); Diamond is mono.
+            # The assembled track can be stereo (channels, n); both engines are mono.
             mono = samples.mean(axis=0).astype(np.float32) if samples.shape[0] > 1 else samples[0]
+            engine_restore = (
+                sidon_engine.restore_waveform
+                if params.restore_engine == "sidon"
+                else restore_waveform
+            )
             try:
-                restored, out_sr = restore_waveform(mono, original.sample_rate, progress=restore_progress)
+                restored, out_sr = engine_restore(mono, original.sample_rate, progress=restore_progress)
                 track_samples = restored[None, :]
                 track_sr = out_sr
             except RestoreUnavailable as exc:

@@ -13,6 +13,7 @@ import type {
   SeparationRegionParams,
   SeparationResult,
 } from "./lib/separation";
+import type { RestoreEngineName } from "./lib/restore";
 import { formatClock } from "./lib/time";
 import type { OverlapRegion, Speaker, SpeakerTurn } from "./types";
 
@@ -33,6 +34,8 @@ interface OverlapsPanelProps {
   language: string | null;
   restoreSoloTracks: boolean;
   onRestoreSoloTracksChange: (value: boolean) => void;
+  restoreEngine: RestoreEngineName;
+  onRestoreEngineChange: (value: RestoreEngineName) => void;
   onProcessed: (result: SeparationResult, audioUrl: string) => void;
   onApplyWords: (report: RegionReport) => void;
   onSeek: (time: number, options?: { play?: boolean }) => void;
@@ -55,6 +58,8 @@ export function OverlapsPanel({
   language,
   restoreSoloTracks,
   onRestoreSoloTracksChange,
+  restoreEngine,
+  onRestoreEngineChange,
   onProcessed,
   onApplyWords,
   onSeek,
@@ -286,11 +291,25 @@ export function OverlapsPanel({
               checked={restoreSoloTracks}
               onChange={(event) => onRestoreSoloTracksChange(event.target.checked)}
             />
-            <span>Restore voices (Diamond)</span>
+            <span>Restore voices</span>
           </label>
+          {restoreSoloTracks ? (
+            <label>
+              Engine
+              <select
+                value={restoreEngine}
+                onChange={(event) => onRestoreEngineChange(event.target.value as RestoreEngineName)}
+              >
+                <option value="sidon">Sidon — multilingual, 48 kHz</option>
+                <option value="diamond">Diamond — English, 44.1 kHz</option>
+              </select>
+            </label>
+          ) : null}
           <p className="helper-text">
-            Regenerates each solo track as studio-quality 44.1 kHz speech after isolation. English-trained and roughly
-            10× slower than real-time on this Mac; changing this re-renders the solo tracks.
+            {restoreEngine === "sidon"
+              ? "Cleans each solo track after isolation and returns 48 kHz. Multilingual, and about 4× faster than real-time on this Mac."
+              : "Regenerates each solo track as 44.1 kHz speech after isolation. English-trained and roughly 10× slower than real-time on this Mac."}{" "}
+            Changing either setting re-renders the solo tracks.
           </p>
 
           <label className="mastering-toggle">

@@ -7,7 +7,13 @@ import {
   restoreAudioUrl,
   startRestoreJob,
 } from "./lib/restore";
-import type { RestoreJobStatus, RestoreOutputFormat, RestoreParams, RestoreResult } from "./lib/restore";
+import type {
+  RestoreEngineName,
+  RestoreJobStatus,
+  RestoreOutputFormat,
+  RestoreParams,
+  RestoreResult,
+} from "./lib/restore";
 
 const JOB_POLL_MS = 1000;
 
@@ -113,14 +119,25 @@ export function RestorePanel({ apiBaseUrl, audioFile }: RestorePanelProps) {
     <section className="selection-panel mastering-panel restore-panel">
       <div className="panel-section-heading">
         <p className="eyebrow">Restore</p>
-        <h3>Diamond speech restoration</h3>
+        <h3>Speech restoration</h3>
       </div>
       <p className="helper-text">
-        Regenerates degraded, muffled, or low-bitrate speech as studio-quality 44.1 kHz audio. No transcription or
-        splitting — just pick a file and run.
+        Repairs degraded, muffled, or low-bitrate speech. No transcription or splitting — just pick a file and run.
       </p>
+      <label>
+        Engine
+        <select
+          value={params.engine}
+          onChange={(event) => update((draft) => void (draft.engine = event.target.value as RestoreEngineName))}
+        >
+          <option value="sidon">Sidon — multilingual, 48 kHz</option>
+          <option value="diamond">Diamond — English, 44.1 kHz</option>
+        </select>
+      </label>
       <p className="helper-text">
-        Diamond regenerates speech (English-trained) — roughly 10× slower than real-time on this Mac.
+        {params.engine === "sidon"
+          ? "Cleans up the voice you have: noise, reverb, and codec damage. Multilingual, and about 4× faster than real-time on this Mac."
+          : "Regenerates the voice from scratch, so it can repair damage Sidon can only clean around — but it is English-only, can invent words on badly clipped audio, and runs roughly 10× slower than real-time on this Mac."}
       </p>
 
       <label
@@ -165,41 +182,63 @@ export function RestorePanel({ apiBaseUrl, audioFile }: RestorePanelProps) {
 
       <details className="restore-advanced">
         <summary>Advanced settings</summary>
-        <div className="mastering-grid-2">
-          <label>
-            Chunk length (s)
-            <input
-              type="number"
-              step={0.1}
-              min={1}
-              max={10}
-              value={params.chunk_sec}
-              onChange={(event) => update((draft) => void (draft.chunk_sec = Number(event.target.value)))}
-            />
-          </label>
-          <label>
-            Overlap (s)
-            <input
-              type="number"
-              step={0.1}
-              min={0}
-              max={2}
-              value={params.overlap_sec}
-              onChange={(event) => update((draft) => void (draft.overlap_sec = Number(event.target.value)))}
-            />
-          </label>
-          <label>
-            Repetition penalty
-            <input
-              type="number"
-              step={0.05}
-              min={1}
-              max={2}
-              value={params.rep_penalty}
-              onChange={(event) => update((draft) => void (draft.rep_penalty = Number(event.target.value)))}
-            />
-          </label>
-        </div>
+        {params.engine === "sidon" ? (
+          <>
+            <div className="mastering-grid-2">
+              <label>
+                Context window (s)
+                <input
+                  type="number"
+                  step={1}
+                  min={5}
+                  max={96}
+                  value={params.sidon_chunk_sec}
+                  onChange={(event) => update((draft) => void (draft.sidon_chunk_sec = Number(event.target.value)))}
+                />
+              </label>
+            </div>
+            <p className="helper-text">
+              How much audio the model attends to at once. Longer windows sound slightly better but cost memory
+              quadratically: 15 s needs about 6 GB, 30 s about 12 GB, 96 s about 24 GB. On a GPU this is VRAM.
+            </p>
+          </>
+        ) : (
+          <div className="mastering-grid-2">
+            <label>
+              Chunk length (s)
+              <input
+                type="number"
+                step={0.1}
+                min={1}
+                max={10}
+                value={params.chunk_sec}
+                onChange={(event) => update((draft) => void (draft.chunk_sec = Number(event.target.value)))}
+              />
+            </label>
+            <label>
+              Overlap (s)
+              <input
+                type="number"
+                step={0.1}
+                min={0}
+                max={2}
+                value={params.overlap_sec}
+                onChange={(event) => update((draft) => void (draft.overlap_sec = Number(event.target.value)))}
+              />
+            </label>
+            <label>
+              Repetition penalty
+              <input
+                type="number"
+                step={0.05}
+                min={1}
+                max={2}
+                value={params.rep_penalty}
+                onChange={(event) => update((draft) => void (draft.rep_penalty = Number(event.target.value)))}
+              />
+            </label>
+          </div>
+        )}
       </details>
 
       <div className="inline-actions">
@@ -229,6 +268,7 @@ export function RestorePanel({ apiBaseUrl, audioFile }: RestorePanelProps) {
             <h3>Restored audio</h3>
           </div>
           <div className="chip-row">
+            <span className="metric-chip">{result.engine === "sidon" ? "Sidon" : "Diamond"}</span>
             <span className="metric-chip">{(result.sample_rate / 1000).toFixed(1)} kHz</span>
             <span className="metric-chip">{formatDuration(result.duration_sec)}</span>
             <span className="metric-chip">{result.output_format.toUpperCase()}</span>

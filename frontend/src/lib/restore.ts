@@ -1,19 +1,30 @@
 export type RestoreOutputFormat = "flac" | "wav" | "mp3" | "aac" | "opus";
+export type RestoreEngineName = "sidon" | "diamond";
 
 export interface RestoreParams {
+  engine: RestoreEngineName;
   output_format: RestoreOutputFormat;
   chunk_sec: number;
   overlap_sec: number;
   rep_penalty: number;
+  sidon_chunk_sec: number;
 }
 
 export function defaultRestoreParams(): RestoreParams {
-  return { output_format: "flac", chunk_sec: 2.5, overlap_sec: 0.4, rep_penalty: 1.3 };
+  return {
+    engine: "sidon",
+    output_format: "flac",
+    chunk_sec: 2.5,
+    overlap_sec: 0.4,
+    rep_penalty: 1.3,
+    sidon_chunk_sec: 15,
+  };
 }
 
 export interface RestoreResult {
   token: string;
   filename: string;
+  engine: RestoreEngineName;
   output_format: string;
   sample_rate: number;
   duration_sec: number;

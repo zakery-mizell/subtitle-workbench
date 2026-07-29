@@ -141,38 +141,66 @@ Notes:
 
 ## Speech restoration ("Restore")
 
-[Diamond](https://huggingface.co/nineninesix/diamond-1.0) (`nineninesix/diamond-1.0`) is a
-sequence-to-sequence model that resynthesizes clean speech from degraded input. Unlike the
-mastering denoiser, it regenerates the voice rather than filtering it, so it can repair heavy
-codec artefacts, clipping, and muffling that subtractive tools cannot.
+Two engines sit behind one panel. Both go further than the mastering denoiser, which only
+filters the signal it is given.
 
-Install it first (python deps plus the model checkpoint, downloaded on install or lazily on first
-use):
+- **Sidon** ([sarulab-speech/sidon-v0.1](https://huggingface.co/sarulab-speech/sidon-v0.1),
+  ICASSP 2026) — the default. A LoRA-adapted w2v-BERT 2.0 predictor cleanses the SSL features of
+  the noisy input and a decoder vocoder resynthesises 48 kHz audio from them. Multilingual,
+  identity-preserving, and ~5x FASTER than real time on CPU.
+- **Diamond** ([nineninesix/diamond-1.0](https://huggingface.co/nineninesix/diamond-1.0)) — a
+  sequence-to-sequence RQ-Transformer that regenerates the voice outright at 44.1 kHz. The more
+  aggressive repair, and the more expensive one.
+
+Reach for Sidon first. It handles noise, reverb, and codec damage on any language and is fast
+enough to iterate with. Reach for Diamond when the source is damaged past what cleaning can fix
+and you are willing to accept invented detail in exchange — it is English-only and roughly 50x
+slower.
+
+Install whichever you need (checkpoints download on install, or lazily on first use):
 
 ```bash
-./scripts/install-restore.sh        # macOS
+./scripts/install-sidon.sh          # macOS — no new packages, just ~1 GB of weights
+./scripts/install-restore.sh        # macOS — Diamond, plus its python deps
+```
+
+```bash
+powershell -ExecutionPolicy Bypass -File .\scripts\install-sidon.ps1     # Windows
 powershell -ExecutionPolicy Bypass -File .\scripts\install-restore.ps1   # Windows
 ```
 
-Two usage modes:
+Two usage modes, each taking an engine:
 
-- **Standalone restore** — a background job that restores a whole uploaded file end to end and
-  returns a 44.1 kHz artifact (`POST /api/restore`, polled like mastering/separation). No
-  transcription or diarization is involved.
-- **Restored solo tracks** — pass `"restore": true` in the automatic solo-tracks job and each
-  assembled per-speaker track is run through Diamond after the overlaps are stitched in. If the
-  engine is unavailable the job degrades gracefully: it keeps the unrestored track and adds a
-  warning.
+- **Standalone restore** — a background job that restores a whole uploaded file end to end
+  (`POST /api/restore` with `"engine": "sidon" | "diamond"`, polled like mastering/separation).
+  No transcription or diarization is involved.
+- **Restored solo tracks** — pass `"restore": true` (plus an optional `"restore_engine"`) in the
+  automatic solo-tracks job and each assembled per-speaker track is restored after the overlaps
+  are stitched in. If the engine is unavailable the job degrades gracefully: it keeps the
+  unrestored track and adds a warning.
 
 Notes / caveats:
 
+- Sidon **preserves the speaker**, which is why it also suits cleaning a voice-cloning reference
+  before Convert or Patch — a generic noise suppressor scrubs away the cues a cloner needs.
+- Sidon's memory scales with its context window, measured over a 150 s clip: 15 s of context
+  needs ~6 GB, 30 s ~12 GB, 96 s ~24 GB. On CUDA that is VRAM, so the default is 15 s. Longer
+  windows sound slightly better (log-mel cosine 0.989 at 15 s, 0.993 at 30 s, against a 96 s
+  render). Chunk seams do not accumulate timing drift — measured envelope lag against the input
+  stays within 10 ms — so restored audio remains aligned to the workspace timeline.
+- Sidon's device policy is cuda if available else cpu, set via `SIDON_DEVICE`. **MPS is not
+  supported**: the published checkpoints are `torch.jit.trace` exports with device-pinned
+  constants, so `map_location='mps'` hits a float64 constant and moving a CPU-loaded module fails
+  with "Passed CPU tensor to MPS op". CPU is fast enough that this costs little.
 - Diamond is **generative resynthesis**: content above ~8 kHz is generated, not recovered. Treat
   the output as a repair/listening aid rather than a faithful capture.
-- It is **English-trained** and can occasionally smear or invent words on badly clipped audio —
-  listen before trusting it.
-- Slow on CPU (~11x real-time on Apple Silicon; much faster on CUDA). The device auto-policy is
-  cuda if available else cpu — it never auto-picks MPS, which measured *slower* than CPU here
+- Diamond is **English-trained** and can occasionally smear or invent words on badly clipped
+  audio — listen before trusting it.
+- Diamond is slow on CPU (~11x real-time on Apple Silicon; much faster on CUDA). Its auto-policy
+  is cuda if available else cpu — it never auto-picks MPS, which measured *slower* than CPU here
   because the tiny autoregressive kernels are launch-bound. Set `RESTORE_DEVICE` to override.
+- Comparing two restored renders by waveform correlation is meaningless — both vocoders
+  regenerate phase, so perceptually identical renders can correlate near zero. Compare log-mels.
 
 ## Voice conversion ("Convert")
 
@@ -268,7 +296,7 @@ Notes / caveats:
 - `backend/app/text_processing.py`
 - `backend/app/mastering/` (audio post production pipeline)
 - `backend/app/separation/` (UniSE overlap separation: engine, blending, overlap math)
-- `backend/app/restore/` (Diamond speech-restoration engine + job service)
+- `backend/app/restore/` (Sidon + Diamond speech-restoration engines + job service)
 - `backend/app/conversion/` (Seed-VC voice-conversion engine + job service)
 - `backend/app/speechedit/` (F5-TTS speech-edit engine + windowing/job service)
 - `backend/app/jobs.py` (in-process job registry shared by mastering, separation, restore, conversion, and speech-edit)
@@ -279,6 +307,7 @@ Notes / caveats:
 - `frontend/src/PatchPanel.tsx`
 - `scripts/install.ps1` (Windows) / `scripts/install.sh` (macOS)
 - `scripts/install-unise.ps1` / `scripts/install-unise.sh` (optional overlap-separation engine)
+- `scripts/install-sidon.ps1` / `scripts/install-sidon.sh` (Sidon restore engine)
 - `scripts/install-restore.ps1` / `scripts/install-restore.sh` (optional Diamond restore engine)
 - `scripts/install-convert.ps1` / `scripts/install-convert.sh` (optional Seed-VC voice-conversion engine)
 - `scripts/install-speechedit.ps1` / `scripts/install-speechedit.sh` (optional F5-TTS speech-edit engine)
