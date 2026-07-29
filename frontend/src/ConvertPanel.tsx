@@ -31,6 +31,9 @@ interface ConvertPanelProps {
   // timeline-preserving, so the conversion of one is a drop-in replacement voice.
   isolatedTracks?: IsolatedTrack[];
   onConvertedVoice?: (speakerId: number, result: { token: string; url: string; filename: string }) => void;
+  // Discarding deletes the artifact server-side, so anything registered via
+  // onConvertedVoice must be unregistered too or it points at a 404.
+  onConvertedVoiceRemoved?: (speakerId: number) => void;
 }
 
 function formatDuration(seconds: number): string {
@@ -39,7 +42,7 @@ function formatDuration(seconds: number): string {
   return `${minutes}:${String(rest).padStart(2, "0")}`;
 }
 
-export function ConvertPanel({ apiBaseUrl, audioFile, isolatedTracks, onConvertedVoice }: ConvertPanelProps) {
+export function ConvertPanel({ apiBaseUrl, audioFile, isolatedTracks, onConvertedVoice, onConvertedVoiceRemoved }: ConvertPanelProps) {
   const [sourceFile, setSourceFile] = useState<File | null>(audioFile);
   const [referenceFile, setReferenceFile] = useState<File | null>(null);
   const [params, setParams] = useState<ConversionParams>(() => defaultConversionParams());
@@ -58,6 +61,9 @@ export function ConvertPanel({ apiBaseUrl, audioFile, isolatedTracks, onConverte
   // Which speaker the running job converts, so the finished artifact can be
   // reported upward as that speaker's alternate voice.
   const jobSpeakerRef = useRef<number | null>(null);
+  // Which speaker the displayed result was reported for, so a discard can
+  // unregister exactly that alternate voice.
+  const resultSpeakerRef = useRef<number | null>(null);
   const onConvertedVoiceRef = useRef(onConvertedVoice);
   onConvertedVoiceRef.current = onConvertedVoice;
 
@@ -86,6 +92,7 @@ export function ConvertPanel({ apiBaseUrl, audioFile, isolatedTracks, onConverte
           setJobId(null);
           const speakerId = jobSpeakerRef.current;
           jobSpeakerRef.current = null;
+          resultSpeakerRef.current = speakerId;
           if (speakerId !== null) {
             onConvertedVoiceRef.current?.(speakerId, {
               token: status.result.token,
@@ -137,6 +144,7 @@ export function ConvertPanel({ apiBaseUrl, audioFile, isolatedTracks, onConverte
     setError(null);
     setResult(null);
     setJob(null);
+    resultSpeakerRef.current = null;
     jobSpeakerRef.current = mode === "isolated" && selectedTrack ? selectedTrack.speakerId : null;
     try {
       const id = await startConversionJob(apiBaseUrl, source, referenceFile, params);
@@ -152,9 +160,14 @@ export function ConvertPanel({ apiBaseUrl, audioFile, isolatedTracks, onConverte
       return;
     }
     const token = result.token;
+    const speakerId = resultSpeakerRef.current;
+    resultSpeakerRef.current = null;
     setResult(null);
     setJob(null);
     setError(null);
+    if (speakerId !== null) {
+      onConvertedVoiceRemoved?.(speakerId);
+    }
     await deleteConversion(apiBaseUrl, token);
   }
 
