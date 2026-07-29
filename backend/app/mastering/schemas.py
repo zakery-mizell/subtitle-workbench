@@ -9,6 +9,7 @@ from ..restore.schemas import RestoreResult
 from ..schemas import WarningItem
 from ..separation.schemas import SeparationResult, SoloTracksResult
 from ..speechedit.schemas import SpeechEditResult
+from ..tts.schemas import TtsResult
 
 LevelerStrength = Literal["tight", "moderate", "soft"]
 CutApplyMode = Literal["apply", "silence", "list_only"]
@@ -157,5 +158,5 @@ class JobStatusResponse(BaseModel):
     progress: float
     message: str | None = None
     error: str | None = None
-    # Mastering, separation, restore, conversion, and speech-edit jobs share the registry and shape.
-    result: "MasteringResult | SeparationResult | SoloTracksResult | RestoreResult | ConversionResult | SpeechEditResult | None" = None
+    # Mastering, separation, restore, conversion, speech-edit, and TTS jobs share the registry and shape.
+    result: "MasteringResult | SeparationResult | SoloTracksResult | RestoreResult | ConversionResult | SpeechEditResult | TtsResult | None" = None

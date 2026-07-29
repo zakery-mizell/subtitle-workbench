@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     # F5-TTS speech-edit device (env SPEECHEDIT_DEVICE). None = auto: cuda, else
     # mps, else cpu (mps IS auto-picked here; see speechedit/engine.py notes).
     speechedit_device: str | None = None
+    # Qwen3-TTS voice-clone device (env TTS_DEVICE). None = auto: cuda, else
+    # mps, else cpu (mps IS auto-picked here; see tts/engine.py device notes).
+    tts_device: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=str(ROOT_DIR / ".env"),

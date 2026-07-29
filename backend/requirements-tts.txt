@@ -1,0 +1,31 @@
+# Runtime dependencies for the Qwen3-TTS voice-cloning engine
+# (Qwen/Qwen3-TTS-12Hz-*-Base, pip package qwen-tts).
+#
+# This is NOT a plain `pip install -r` file: qwen-tts must be installed with
+# --no-deps, so use scripts/install-tts.sh (or .ps1) which runs the exact dance
+# below. It is documented here for reference.
+#
+# The catch: qwen-tts's normal install pins transformers==4.57.3 and
+# accelerate==1.12.0 and drags in gradio, but this venv already runs
+# transformers 4.57.6 (which works). So install qwen-tts WITHOUT its deps, then
+# add accelerate unpinned:
+#
+#   pip install --no-deps qwen-tts==0.1.1
+#   pip install accelerate sox      # unpinned; accelerate brings psutil
+#
+# The pip sox package (pysox) is an import-time dependency: qwen_tts's core
+# package imports the 25 Hz tokenizer unconditionally, which imports sox at
+# module level. Only the python package is needed -- the 12 Hz models we use
+# never invoke the sox BINARY, so pysox's "SoX could not be found" stderr
+# notice on import is harmless.
+#
+# Not needed: gradio (demo UI only). librosa, onnxruntime, einops, soundfile,
+# and torch/torchaudio already arrive via the base + denoise + separation
+# requirement sets, so they are not repeated here.
+#
+# flash-attn is optional and CUDA-only; without it the engine uses the "sdpa"
+# attention path. Importing qwen_tts prints a harmless flash-attn warning.
+#
+# The default checkpoint (Qwen/Qwen3-TTS-12Hz-1.7B-Base, ~4.5 GB) downloads from
+# Hugging Face into the repo's models/ cache on install; the 0.6B variant
+# (~2.5 GB) downloads lazily on first use if selected. Only Base models clone.

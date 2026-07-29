@@ -12,6 +12,7 @@ import {
   Gem,
   Info,
   Loader2,
+  Mic,
   Pause,
   Play,
   Redo2,
@@ -59,6 +60,7 @@ import RegionsPanel from "./RegionsPanel";
 import RestorePanel from "./RestorePanel";
 import ConvertPanel from "./ConvertPanel";
 import PatchPanel from "./PatchPanel";
+import VoicePanel from "./VoicePanel";
 import type { RegionReport, SeparationResult } from "./lib/separation";
 import { fetchSoloTracksJob, separatedAudioUrl, startSoloTracksJob } from "./lib/separation";
 import type {
@@ -536,6 +538,7 @@ const SIDE_PANEL_TABS = [
   { id: "restore", label: "Restore" },
   { id: "convert", label: "Convert" },
   { id: "patch", label: "Patch" },
+  { id: "voice", label: "Voice" },
   { id: "master", label: "Master" },
   { id: "export", label: "Export" },
 ] as const;
@@ -548,6 +551,7 @@ const SIDE_PANEL_TAB_ICONS = {
   restore: Gem,
   convert: ArrowRightLeft,
   patch: Bandage,
+  voice: Mic,
   master: Wand2,
   export: Download,
 } as const;
@@ -4157,6 +4161,12 @@ function App() {
                 title: "F5-TTS speech editing",
                 detail: "Regenerate muffled words in place",
               }
+            : sidePanelTab === "voice"
+              ? {
+                  eyebrow: "Voice",
+                  title: "Qwen3-TTS voice cloning",
+                  detail: "Clone any uploaded voice",
+                }
           : sidePanelTab === "master"
             ? {
                 eyebrow: "Master",
@@ -4191,6 +4201,8 @@ function App() {
               ? "Seed-VC conversion"
             : sidePanelTab === "patch"
               ? "F5-TTS patching"
+            : sidePanelTab === "voice"
+              ? "Qwen3-TTS cloning"
             : sidePanelTab === "master"
             ? processedAudio
               ? "Processed audio loaded"
@@ -6998,6 +7010,10 @@ function App() {
 
                 {sidePanelTab === "patch" ? (
                   <PatchPanel apiBaseUrl={API_BASE_URL} audioFile={selectedFile} />
+                ) : null}
+
+                {sidePanelTab === "voice" ? (
+                  <VoicePanel apiBaseUrl={API_BASE_URL} />
                 ) : null}
 
                 {sidePanelTab === "master" ? (
