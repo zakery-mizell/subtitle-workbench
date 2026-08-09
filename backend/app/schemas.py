@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 
 GuideLabel = Literal["SILENT", "CUT", "REPEAT"]
-SpeakerAssignmentMode = Literal["segment", "word"]
+SpeakerAssignmentMode = Literal["hybrid"]
 
 
 class SpeakerInput(BaseModel):
@@ -75,9 +75,15 @@ class SpeechSpan(BaseModel):
 
 class CapabilitiesResponse(BaseModel):
     diarization_configured: bool
+    speaker_profiles: list[str] = Field(default_factory=list)
     # Changes every time the backend process starts; the frontend uses it to
     # discard stale autosaved sessions after a server restart.
     instance_id: str
+
+
+class SpeakerProfileResponse(BaseModel):
+    name: str
+    speaker_profiles: list[str] = Field(default_factory=list)
 
 
 class WaveformAnalysisResponse(BaseModel):
@@ -114,8 +120,8 @@ class TranscriptResponse(BaseModel):
     guide_blocks: list[GuideBlock]
     warnings: list[WarningItem] = Field(default_factory=list)
     model: str
-    speaker_assignment_mode: SpeakerAssignmentMode = "word"
-    language: str | None = None
+    speaker_assignment_mode: SpeakerAssignmentMode = "hybrid"
+    language: Literal["en"] = "en"
     gpu_enabled: bool
     speaker_turns: list[SpeakerTurnOut] = Field(default_factory=list)
     overlap_regions: list[OverlapRegionOut] = Field(default_factory=list)
@@ -129,5 +135,5 @@ class RetranscribeRangeResponse(BaseModel):
     captions: list[Caption]
     warnings: list[WarningItem] = Field(default_factory=list)
     model: str
-    language: str | None = None
+    language: Literal["en"] = "en"
     gpu_enabled: bool

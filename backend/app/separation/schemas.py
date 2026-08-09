@@ -33,10 +33,10 @@ class SeparationOutputParams(BaseModel):
 class SeparationParams(BaseModel):
     regions: list[SeparationRegionParams] = Field(min_length=1)
     turns: list[TurnInput] = Field(min_length=1)
-    duck_db: float = Field(default=-11.0, ge=-40.0, le=0.0)
+    duck_db: float = Field(default=-16.0, ge=-40.0, le=0.0)
     transcribe_stems: bool = False
     transcribe_model: str = "small"
-    language: str | None = None
+    language: Literal["en"] = "en"
     output: SeparationOutputParams = SeparationOutputParams()
 
 
@@ -44,6 +44,25 @@ class StemWord(BaseModel):
     text: str
     start: float
     end: float
+    confidence: float | None = None
+
+
+class AuditWordInput(BaseModel):
+    """One mixture-transcript word expressed in diarization speaker indices."""
+
+    id: str
+    text: str
+    start: float = Field(ge=0)
+    end: float = Field(ge=0)
+    speaker_index: int = Field(ge=0)
+
+
+class HandoffCorrection(BaseModel):
+    word_id: str
+    from_speaker_index: int
+    to_speaker_index: int
+    confidence: float = Field(ge=0, le=1)
+    boundary_time: float = Field(ge=0)
 
 
 class RegionReport(BaseModel):
@@ -88,15 +107,26 @@ class SpeakerRegionIn(BaseModel):
     speaker_index: int = Field(ge=0)
 
 
-class SoloTracksParams(BaseModel):
-    """Auto-prepared per-speaker playback tracks: every overlap region is
-    replaced by that speaker's isolated voice, the rest stays original.
+SoloTracksMode = Literal["gated", "targeted"]
 
-    With `speaker_regions` the track is also gated to that speaker — silent
+
+class SoloTracksParams(BaseModel):
+    """Auto-prepared per-speaker playback tracks.
+
+    mode="gated" (the original behaviour): every overlap region is replaced by
+    that speaker's isolated voice, the rest stays original. With
+    `speaker_regions` the track is also gated to that speaker — silent
     everywhere else, same length and timings as the original — which makes it
     usable as a standalone stem, not just as playback for the frontend gate.
+
+    mode="targeted": UniSE target-speaker extraction inspects short, merged
+    windows around detected overlaps and rapid speaker handoffs. It replaces
+    audio only inside true overlaps; clean turn-taking keeps the original audio.
+    Ungated window transcripts audit speaker assignment before the assembled
+    playback track is safely gated.
     """
 
+    mode: SoloTracksMode = "gated"
     # Either list may be empty: overlap-free recordings still yield gated tracks,
     # and gating-free ones still yield overlap replacements.
     regions: list[OverlapRegionIn] = []
@@ -106,12 +136,27 @@ class SoloTracksParams(BaseModel):
     # Restore each assembled per-speaker track (Sidon -> 48 kHz, Diamond -> 44.1 kHz).
     restore: bool = False
     restore_engine: RestoreEngineName = "sidon"
+    # Transcribe each finished stem with WhisperX and return its words. This is
+    # the "speaker-based" transcript, independent of the mixture transcript.
+    transcribe: bool = False
+    transcribe_model: str = "small"
+    language: Literal["en"] = "en"
+    # The mixture transcript is optional so older clients keep working. When
+    # supplied, raw targeted-window transcripts audit rapid speaker boundaries.
+    audit_handoffs: bool = True
+    audit_words: list[AuditWordInput] = []
 
 
 class SoloTrackOut(BaseModel):
     speaker_index: int
     token: str
     output_filename: str
+    # True when the track is a genuine UniSE stem; False when it fell back to
+    # the gated original (e.g. the speaker never speaks alone to enroll from).
+    separated: bool = True
+    # Word-level transcript of this speaker's finished stem (transcribe=True).
+    words: list[StemWord] | None = None
+    detail: str | None = None
 
 
 class SoloRegionReport(BaseModel):
@@ -128,3 +173,5 @@ class SoloTracksResult(BaseModel):
     output_format: str
     device_used: str
     warnings: list[WarningItem] = []
+    handoff_corrections: list[HandoffCorrection] = []
+    handoffs_audited: int = 0

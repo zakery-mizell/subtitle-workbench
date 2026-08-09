@@ -4,14 +4,21 @@ from unittest import mock
 
 import numpy as np
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from backend.app import main
 from backend.app.tts import engine as tts_engine
 from backend.app.tts import service as tts_service
 from backend.app.tts.engine import max_new_tokens_for, split_text_into_chunks
+from backend.app.tts.schemas import TtsParams
 
 
 class SplitTextTests(unittest.TestCase):
+    def test_tts_language_is_english_only(self) -> None:
+        self.assertEqual(TtsParams(text="Hello").language, "English")
+        with self.assertRaises(ValidationError):
+            TtsParams(text="Hola", language="Spanish")
+
     def test_single_chunk_when_under_limit(self) -> None:
         self.assertEqual(
             split_text_into_chunks("Hi there. How are you?", max_chars=300),

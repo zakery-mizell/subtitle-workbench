@@ -65,6 +65,8 @@ CAPTION_SHORT_SENTENCE_GAP_S = 0.5  # and this close together
 CAPTION_MIN_CHUNK_CHARS = 12  # no orphan fragments when splitting long sentences
 
 INITIAL_RE = re.compile(r"^[A-Z]\.$")
+HYBRID_EDGE_REPAIR_SECONDS = 0.75
+HYBRID_SEGMENT_DOMINANCE = 1.5
 
 WEAK_LINE_ENDS = {
     "a",
@@ -103,8 +105,15 @@ WEAK_LINE_ENDS = {
 def build_words(
     segments: list[dict],
     speaker_lookup: Callable[[float, float], tuple[int | None, str | None]],
-    speaker_assignment_mode: SpeakerAssignmentMode = "segment",
+    speaker_assignment_mode: SpeakerAssignmentMode | str = "hybrid",
 ) -> list[WordToken]:
+    """Build words with one fixed hybrid speaker policy.
+
+    Segment attribution supplies the stable context/fallback. Word attribution
+    supplies the precise handoff boundary whenever diarization covers the word.
+    ``speaker_assignment_mode`` remains accepted only so older API callers and
+    saved projects do not fail; its value no longer changes behaviour.
+    """
     words: list[WordToken] = []
     for segment_index, segment in enumerate(segments):
         segment_start = _coerce_float(segment.get("start"), 0.0)
@@ -114,6 +123,7 @@ def build_words(
         if not segment_words:
             continue
 
+        segment_tokens: list[WordToken] = []
         for word_index, word in enumerate(segment_words):
             text = str(word.get("word", "")).strip()
             if not text:
@@ -124,13 +134,10 @@ def build_words(
                 word.get("probability"),
                 _coerce_float(word.get("score"), _segment_confidence(segment)),
             )
-            if speaker_assignment_mode == "word":
-                speaker_id, speaker_name = speaker_lookup(start, end)
-                if speaker_id is None:
-                    speaker_id, speaker_name = segment_speaker_id, segment_speaker_name
-            else:
+            speaker_id, speaker_name = speaker_lookup(start, end)
+            if speaker_id is None:
                 speaker_id, speaker_name = segment_speaker_id, segment_speaker_name
-            words.append(
+            segment_tokens.append(
                 WordToken(
                     id=f"{segment_index}-{word_index}",
                     text=text,
@@ -142,6 +149,55 @@ def build_words(
                     speaker_name=speaker_name,
                 )
             )
+        if segment_speaker_id is not None and len(segment_tokens) > 1:
+            # Word timing can put the first or last few words of one coherent
+            # ASR segment on the neighbouring speaker when diarization changes
+            # a fraction of a second late. Let the segment-level result repair
+            # only a short edge run, and only when its speaker clearly dominates
+            # the aligned speech inside the segment. A balanced segment keeps
+            # the word-level switch, preserving genuine mid-segment handoffs.
+            primary_weight = sum(
+                max(0.02, token.end - token.start)
+                for token in segment_tokens
+                if token.speaker_id == segment_speaker_id
+            )
+            other_weight = sum(
+                max(0.02, token.end - token.start)
+                for token in segment_tokens
+                if token.speaker_id is not None and token.speaker_id != segment_speaker_id
+            )
+            if other_weight > 0 and primary_weight >= other_weight * HYBRID_SEGMENT_DOMINANCE:
+                prefix_end = 0
+                while (
+                    prefix_end < len(segment_tokens)
+                    and segment_tokens[prefix_end].speaker_id != segment_speaker_id
+                ):
+                    prefix_end += 1
+                suffix_start = len(segment_tokens)
+                while (
+                    suffix_start > 0
+                    and segment_tokens[suffix_start - 1].speaker_id != segment_speaker_id
+                ):
+                    suffix_start -= 1
+
+                repair_indexes: set[int] = set()
+                if 0 < prefix_end < len(segment_tokens):
+                    prefix_duration = segment_tokens[prefix_end - 1].end - segment_tokens[0].start
+                    if prefix_duration <= HYBRID_EDGE_REPAIR_SECONDS:
+                        repair_indexes.update(range(prefix_end))
+                if 0 < suffix_start < len(segment_tokens):
+                    suffix_duration = segment_tokens[-1].end - segment_tokens[suffix_start].start
+                    if suffix_duration <= HYBRID_EDGE_REPAIR_SECONDS:
+                        repair_indexes.update(range(suffix_start, len(segment_tokens)))
+
+                for index in repair_indexes:
+                    segment_tokens[index] = segment_tokens[index].model_copy(
+                        update={
+                            "speaker_id": segment_speaker_id,
+                            "speaker_name": segment_speaker_name,
+                        }
+                    )
+        words.extend(segment_tokens)
     return words
 
 

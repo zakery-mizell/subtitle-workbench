@@ -2,32 +2,7 @@ import type { WarningItem } from "../types";
 
 export type SpeechEditMode = "edit" | "generate";
 export type SpeechEditOutputFormat = "wav" | "flac" | "mp3" | "aac" | "opus";
-export type SpeechEditLanguage =
-  | "Auto"
-  | "Chinese"
-  | "English"
-  | "German"
-  | "Italian"
-  | "Portuguese"
-  | "Spanish"
-  | "Japanese"
-  | "Korean"
-  | "French"
-  | "Russian";
-
-export const SPEECHEDIT_LANGUAGES: SpeechEditLanguage[] = [
-  "Auto",
-  "Chinese",
-  "English",
-  "German",
-  "Italian",
-  "Portuguese",
-  "Spanish",
-  "Japanese",
-  "Korean",
-  "French",
-  "Russian",
-];
+export type SpeechEditLanguage = "English";
 
 export interface PatchEdit {
   start_s: number;
@@ -64,7 +39,7 @@ export function defaultSpeechEditParams(): SpeechEditParams {
     ref_text: "",
     auto_ref_text: true,
     whisper_model: "small",
-    language: "Auto",
+    language: "English",
     nfe_step: 32,
     speed: 1.0,
     seed: null,

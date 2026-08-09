@@ -1,33 +1,8 @@
 import type { WarningItem } from "../types";
 
-export type TtsLanguage =
-  | "Auto"
-  | "Chinese"
-  | "English"
-  | "German"
-  | "Italian"
-  | "Portuguese"
-  | "Spanish"
-  | "Japanese"
-  | "Korean"
-  | "French"
-  | "Russian";
+export type TtsLanguage = "English";
 export type TtsModelSize = "1.7b" | "0.6b";
 export type TtsOutputFormat = "wav" | "flac" | "mp3" | "aac" | "opus";
-
-export const TTS_LANGUAGES: TtsLanguage[] = [
-  "Auto",
-  "Chinese",
-  "English",
-  "German",
-  "Italian",
-  "Portuguese",
-  "Spanish",
-  "Japanese",
-  "Korean",
-  "French",
-  "Russian",
-];
 
 export interface TtsParams {
   text: string;
@@ -42,7 +17,7 @@ export interface TtsParams {
 export function defaultTtsParams(): TtsParams {
   return {
     text: "",
-    language: "Auto",
+    language: "English",
     ref_text: null,
     auto_ref_text: true,
     whisper_model: "small",

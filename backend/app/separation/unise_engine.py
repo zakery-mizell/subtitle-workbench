@@ -27,6 +27,11 @@ from ..device import select_device
 UNISE_SAMPLE_RATE = 16000
 WINDOW_SECONDS = 5.0
 WINDOW_SAMPLES = int(WINDOW_SECONDS * UNISE_SAMPLE_RATE)
+# Consecutive windows are generated independently, so their seams need a
+# crossfade; without the overlap a hard concatenation clicks every 5 s.
+WINDOW_OVERLAP_SECONDS = 0.5
+WINDOW_OVERLAP_SAMPLES = int(WINDOW_OVERLAP_SECONDS * UNISE_SAMPLE_RATE)
+WINDOW_HOP_SAMPLES = WINDOW_SAMPLES - WINDOW_OVERLAP_SAMPLES
 ENROLL_SECONDS = 5.0
 ENROLL_SAMPLES = int(ENROLL_SECONDS * UNISE_SAMPLE_RATE)
 
@@ -143,12 +148,46 @@ class UniSEEngine:
             tensor = tensor[None, :]
         return tensor.to(self._torch.device(self.device))
 
-    def _windows(self, mix: np.ndarray):
-        """Wrap-pad the mixture to whole 5 s windows, shaped (n_windows, WINDOW_SAMPLES)."""
+    @staticmethod
+    def _window_starts(length: int) -> list[int]:
+        """Offsets of the overlapping 5 s windows that cover `length` samples."""
+        starts = [0]
+        while starts[-1] + WINDOW_SAMPLES < length:
+            starts.append(starts[-1] + WINDOW_HOP_SAMPLES)
+        return starts
+
+    def _windows(self, mix: np.ndarray) -> np.ndarray:
+        """Overlapping 5 s windows, shaped (n_windows, WINDOW_SAMPLES).
+
+        The last window is wrap-padded from the start of the region; only its
+        non-padded part is kept when the outputs are reassembled. Kept as a
+        numpy array on the host: a full-length recording has hundreds of
+        windows, and they are uploaded to the device one at a time.
+        """
         n = mix.shape[-1]
-        pad = math.ceil(n / WINDOW_SAMPLES) * WINDOW_SAMPLES - n
-        padded = np.pad(mix, (0, pad), mode="wrap")
-        return self._to_tensor(padded).reshape(-1, WINDOW_SAMPLES)
+        starts = self._window_starts(n)
+        padded = np.pad(mix, (0, starts[-1] + WINDOW_SAMPLES - n), mode="wrap")
+        return np.stack([padded[start : start + WINDOW_SAMPLES] for start in starts])
+
+    @staticmethod
+    def _reassemble(pieces: list[np.ndarray], starts: list[int], length: int) -> np.ndarray:
+        """Lay the window outputs back on the timeline, crossfading their seams."""
+        out = np.zeros(length, dtype=np.float32)
+        for index, (start, piece) in enumerate(zip(starts, pieces)):
+            valid = min(WINDOW_SAMPLES, length - start)
+            if valid <= 0:
+                break
+            # The generator's output length can drift from the window it was given.
+            window = np.zeros(WINDOW_SAMPLES, dtype=np.float32)
+            usable = min(WINDOW_SAMPLES, piece.shape[-1])
+            window[:usable] = piece[:usable]
+            fade = min(WINDOW_OVERLAP_SAMPLES, valid) if index else 0
+            if fade:
+                theta = np.linspace(0.0, np.pi / 2.0, fade, dtype=np.float32)
+                out[start : start + fade] *= np.cos(theta)
+                out[start : start + fade] += window[:fade] * np.sin(theta)
+            out[start + fade : start + valid] = window[fade:valid]
+        return out
 
     @staticmethod
     def _peak_normalize(wav: np.ndarray, peak: float = 0.95) -> np.ndarray:
@@ -194,6 +233,7 @@ class UniSEEngine:
         mix = np.asarray(mix, dtype=np.float32).reshape(-1)
         length = mix.shape[-1]
         normalized = self._peak_normalize(mix)
+        starts = self._window_starts(length)
         windows = self._windows(normalized)
 
         enroll_mel = enroll_feats = None
@@ -203,10 +243,10 @@ class UniSEEngine:
                 enroll_mel = self.model.stft_logmel(enroll)
                 enroll_feats = self.model.extract_semantic_features(enroll)
 
-        outputs = []
+        outputs: list[np.ndarray] = []
         with torch.no_grad():
-            for index in range(windows.size(0)):
-                window = windows[index : index + 1]
+            for index in range(windows.shape[0]):
+                window = self._to_tensor(windows[index])
                 mix_mel = self.model.stft_logmel(window)
                 mix_feats = self.model.extract_semantic_features(window)
                 global_ids, semantic_ids = self.model.dnn.generate(
@@ -219,9 +259,9 @@ class UniSEEngine:
                 )
                 estimate = self.model.tokenizer.detokenize(global_ids.unsqueeze(1), semantic_ids)
                 outputs.append(estimate.reshape(-1).cpu().numpy())
-                self._report(progress, (index + 1) / windows.size(0))
+                self._report(progress, (index + 1) / windows.shape[0])
 
-        return np.concatenate(outputs)[:length].astype(np.float32)
+        return self._reassemble(outputs, starts, length)
 
 
 def load_engine(device_preference: str | None = None) -> UniSEEngine:

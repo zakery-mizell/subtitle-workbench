@@ -6,19 +6,7 @@ from pydantic import BaseModel, Field
 
 from ..schemas import WarningItem
 
-TtsLanguage = Literal[
-    "Auto",
-    "Chinese",
-    "English",
-    "German",
-    "Italian",
-    "Portuguese",
-    "Spanish",
-    "Japanese",
-    "Korean",
-    "French",
-    "Russian",
-]
+TtsLanguage = Literal["English"]
 TtsModelSize = Literal["1.7b", "0.6b"]
 TtsOutputFormat = Literal["wav", "flac", "mp3", "aac", "opus"]
 
@@ -27,7 +15,7 @@ class TtsParams(BaseModel):
     """Parameters for a Qwen3-TTS voice-cloning synthesis job."""
 
     text: str = Field(min_length=1, max_length=20000)
-    language: TtsLanguage = "Auto"
+    language: TtsLanguage = "English"
     # A reference transcript unlocks the higher-fidelity ICL clone. When blank,
     # `auto_ref_text` lets the server transcribe the clip for you; when that is
     # off too, the voice is cloned from its speaker signature alone.

@@ -31,6 +31,7 @@
   --wave-played: #1d9e75;
   --wave-rest: #c4c9d4;
   --overlap-band: rgba(216, 90, 48, 0.16);
+  --overlap-band-active: rgba(216, 90, 48, 0.32);
   --radius: 8px;
   --radius-sm: 6px;
   --rail-width: 348px;
@@ -364,9 +365,104 @@ label {
 }
 
 .waveform-timeline {
+  position: relative;
   width: 100%;
   margin-top: 0.72rem;
   overflow: hidden;
+}
+
+/* Floats over the canvas, so only its button may take the pointer — otherwise
+   it swallows seeks in the top-right corner of the waveform. */
+.waveform-zoom-badge {
+  position: absolute;
+  pointer-events: none;
+  top: 4px;
+  right: 6px;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.1rem 0.15rem 0.1rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.waveform-zoom-badge button {
+  pointer-events: auto;
+  min-height: 0;
+  padding: 0.12rem 0.5rem;
+  font-size: 0.72rem;
+  border-radius: 999px;
+  box-shadow: none;
+}
+
+/* Overlap controls that appear under the waveform when a band is clicked. */
+.overlap-dock {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.55rem;
+}
+
+/* Every detected overlap at a glance: selection opens it in the dock, the tint
+   says whether it is part of the next run. */
+.overlap-chip-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+button.overlap-chip {
+  gap: 0.28rem;
+  min-height: 26px;
+  padding: 0.2rem 0.5rem;
+  border-radius: 999px;
+  box-shadow: none;
+  font-size: 0.74rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+button.overlap-chip.is-enabled {
+  border-color: #fdba74;
+  background: #fff7ed;
+  color: var(--danger);
+}
+
+button.overlap-chip.is-selected {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
+
+.overlap-dock-hint {
+  flex: 1 0 100%;
+}
+
+.overlap-card-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-shrink: 0;
+}
+
+.overlap-dock-run {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.overlap-dock-run .helper-text,
+.overlap-dock-run .status-text {
+  margin: 0;
+}
+
+.overlap-dock-progress {
+  flex: 1 1 220px;
+  min-width: 180px;
 }
 
 .waveform-canvas {
@@ -1907,6 +2003,7 @@ button.toast-dismiss {
   --wave-played: #2fbd8f;
   --wave-rest: #39445a;
   --overlap-band: rgba(232, 130, 95, 0.2);
+  --overlap-band-active: rgba(232, 130, 95, 0.38);
 }
 
 :root[data-theme="dark"] body {
@@ -2003,7 +2100,8 @@ button.toast-dismiss {
 }
 
 :root[data-theme="dark"] .waveform-event-chip.event-tight_handoff,
-:root[data-theme="dark"] .waveform-event-chip.event-overlap {
+:root[data-theme="dark"] .waveform-event-chip.event-overlap,
+:root[data-theme="dark"] button.overlap-chip.is-enabled {
   border-color: #6b4a23;
   background: #33251a;
   color: #e8b382;

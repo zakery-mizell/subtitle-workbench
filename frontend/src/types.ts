@@ -1,5 +1,5 @@
 export type GuideLabel = "SILENT" | "CUT" | "REPEAT";
-export type SpeakerAssignmentMode = "segment" | "word";
+export type SpeakerAssignmentMode = "hybrid";
 
 export interface Speaker {
   id: number;
@@ -69,6 +69,7 @@ export interface SpeechSpan {
 
 export interface BackendCapabilities {
   diarization_configured: boolean;
+  speaker_profiles: string[];
   instance_id?: string;
 }
 
@@ -116,7 +117,7 @@ export interface TranscriptResponse {
   warnings: WarningItem[];
   model: string;
   speaker_assignment_mode: SpeakerAssignmentMode;
-  language: string | null;
+  language: "en";
   gpu_enabled: boolean;
   // Optional: absent in sessions saved before overlap separation existed.
   speaker_turns?: SpeakerTurn[];
@@ -131,6 +132,6 @@ export interface RetranscribeRangeResponse {
   captions: Caption[];
   warnings: WarningItem[];
   model: string;
-  language: string | null;
+  language: "en";
   gpu_enabled: boolean;
 }

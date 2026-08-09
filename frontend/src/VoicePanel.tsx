@@ -6,9 +6,8 @@ import {
   fetchTtsJob,
   startTtsJob,
   ttsAudioUrl,
-  TTS_LANGUAGES,
 } from "./lib/tts";
-import type { TtsJobStatus, TtsLanguage, TtsModelSize, TtsOutputFormat, TtsParams, TtsResult } from "./lib/tts";
+import type { TtsJobStatus, TtsModelSize, TtsOutputFormat, TtsParams, TtsResult } from "./lib/tts";
 
 const JOB_POLL_MS = 1000;
 
@@ -188,20 +187,6 @@ export function VoicePanel({ apiBaseUrl }: VoicePanelProps) {
         />
       </label>
       {params.text.length > 0 ? <p className="helper-text">{params.text.length} characters</p> : null}
-
-      <label>
-        Language
-        <select
-          value={params.language}
-          onChange={(event) => update((draft) => void (draft.language = event.target.value as TtsLanguage))}
-        >
-          {TTS_LANGUAGES.map((language) => (
-            <option key={language} value={language}>
-              {language}
-            </option>
-          ))}
-        </select>
-      </label>
 
       <label>
         Output format

@@ -16,7 +16,7 @@ export interface SeparationParams {
   duck_db: number;
   transcribe_stems: boolean;
   transcribe_model: string;
-  language: string | null;
+  language: "en";
   output: { format: "wav" | "flac" | "mp3" | "aac" | "opus"; bitrate_kbps: number | null };
 }
 
@@ -24,6 +24,23 @@ export interface StemWord {
   text: string;
   start: number;
   end: number;
+  confidence?: number | null;
+}
+
+export interface HandoffAuditWord {
+  id: string;
+  text: string;
+  start: number;
+  end: number;
+  speaker_index: number;
+}
+
+export interface HandoffCorrection {
+  word_id: string;
+  from_speaker_index: number;
+  to_speaker_index: number;
+  confidence: number;
+  boundary_time: number;
 }
 
 export interface RegionReport {
@@ -60,15 +77,15 @@ export interface SeparationJobStatus {
 export function buildSeparationParams(
   regions: SeparationRegionParams[],
   turns: SpeakerTurn[],
-  options?: Partial<Pick<SeparationParams, "duck_db" | "transcribe_stems" | "transcribe_model" | "language">>,
+  options?: Partial<Pick<SeparationParams, "duck_db" | "transcribe_stems" | "transcribe_model">>,
 ): SeparationParams {
   return {
     regions,
     turns: turns.map((turn) => ({ start: turn.start, end: turn.end, speaker_index: turn.speaker_index })),
-    duck_db: options?.duck_db ?? -11,
+    duck_db: options?.duck_db ?? -16,
     transcribe_stems: options?.transcribe_stems ?? true,
     transcribe_model: options?.transcribe_model ?? "small",
-    language: options?.language ?? null,
+    language: "en",
     output: { format: "wav", bitrate_kbps: null },
   };
 }
@@ -106,6 +123,11 @@ export interface SoloTrackOut {
   speaker_index: number;
   token: string;
   output_filename: string;
+  /** False when the track fell back to the gated original (no solo speech to enroll from). */
+  separated: boolean;
+  /** Word-level transcript of the finished stem (the "speaker-based" transcript). */
+  words: StemWord[] | null;
+  detail: string | null;
 }
 
 export interface SoloRegionReport {
@@ -122,6 +144,8 @@ export interface SoloTracksResult {
   output_format: string;
   device_used: string;
   warnings: WarningItem[];
+  handoff_corrections: HandoffCorrection[];
+  handoffs_audited: number;
 }
 
 export interface SoloTracksJobStatus {
@@ -140,6 +164,21 @@ export interface SpeakerRegionParams {
   speaker_index: number;
 }
 
+export type SoloTracksMode = "gated" | "targeted";
+
+export interface SoloTracksOptions {
+  /**
+   * "targeted" runs UniSE only in merged windows around overlaps and rapid
+   * handoffs. "gated" is the legacy overlap-only mode.
+   */
+  mode?: SoloTracksMode;
+  /** Transcribe each finished stem and return its words (speaker-based transcript). */
+  transcribe?: boolean;
+  transcribeModel?: string;
+  /** Mixture words used to find and verify rapid target-speaker windows. */
+  auditWords?: HandoffAuditWord[];
+}
+
 export async function startSoloTracksJob(
   apiBaseUrl: string,
   audioFile: File,
@@ -148,19 +187,26 @@ export async function startSoloTracksJob(
   speakerRegions: SpeakerRegionParams[] = [],
   restore = false,
   restoreEngine: RestoreEngineName = "sidon",
+  options: SoloTracksOptions = {},
 ): Promise<string> {
   const params = {
+    mode: options.mode ?? "gated",
     regions,
     turns: turns.map((turn) => ({ start: turn.start, end: turn.end, speaker_index: turn.speaker_index })),
     // Silence-snapped regions per speaker: the backend mutes everything outside
     // them, so each track is timeline-preserving but carries one voice only.
+    // Targeted mode uses these to keep each assembled playback track speaker-only.
     speaker_regions: speakerRegions,
     // When set, each per-speaker track is restored after isolation (Sidon at
     // 48 kHz or Diamond at 44.1 kHz); default keeps the raw separated stems.
     restore,
     restore_engine: restoreEngine,
-    // FLAC halves the disk footprint of these full-length per-speaker tracks
-    // (a 1 h recording is ~600 MB as 48 kHz WAV) and <audio> plays it fine.
+    transcribe: options.transcribe ?? false,
+    transcribe_model: options.transcribeModel ?? "small",
+    language: "en",
+    audit_handoffs: true,
+    audit_words: options.auditWords ?? [],
+    // FLAC halves the disk footprint of the timeline-preserving speaker tracks.
     output: { format: "flac", bitrate_kbps: null },
   };
   const formData = new FormData();

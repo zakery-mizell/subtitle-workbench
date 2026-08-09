@@ -224,6 +224,11 @@ class ParamsTests(unittest.TestCase):
         self.assertEqual(params.mode, "edit")
         self.assertEqual(params.nfe_step, 32)
         self.assertEqual(params.output_format, "flac")
+        self.assertEqual(params.language, "English")
+
+    def test_language_is_english_only(self) -> None:
+        with self.assertRaises(ValidationError):
+            SpeechEditParams(language="Spanish")
 
     def test_nfe_step_bounds(self) -> None:
         with self.assertRaises(ValidationError):
