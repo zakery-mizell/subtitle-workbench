@@ -22,7 +22,9 @@ from .jobs import registry as job_registry
 from .mastering.cutting import CutRegion, export_audacity_labels
 from .mastering.pipeline import find_master_artifact, run_mastering
 from .mastering.schemas import JobStatusResponse, MasterJobResponse, MasteringParams
-from .schemas import CapabilitiesResponse, Caption, OverlapRegionOut, Paragraph, RetranscribeRangeResponse, SpeakerAssignmentMode, SpeakerInput, SpeakerTurnOut, TranscriptResponse, WarningItem, WaveformAnalysisResponse, WordToken
+from .schemas import CapabilitiesResponse, Caption, OverlapRegionOut, Paragraph, RetranscribeRangeResponse, SpeakerInput, SpeakerTurnOut, TranscriptResponse, WarningItem, WaveformAnalysisResponse, WordToken
+from .schemas import SpeakerProfileResponse
+from .speaker_profiles import apply_speaker_profiles, enroll_speaker_profile, list_speaker_profiles
 from .conversion.schemas import ConversionParams, ConversionResult
 from .conversion.service import find_conversion_artifact, run_conversion
 from .restore.schemas import RestoreParams, RestoreResult
@@ -60,8 +62,27 @@ def health() -> dict[str, str]:
 def capabilities() -> CapabilitiesResponse:
     return CapabilitiesResponse(
         diarization_configured=bool(settings.diarization_auth_token),
+        speaker_profiles=list_speaker_profiles(),
         instance_id=BACKEND_INSTANCE_ID,
     )
+
+
+@app.post("/api/speaker-profiles", response_model=SpeakerProfileResponse)
+async def create_speaker_profile(
+    name: str = Form(...),
+    audio: UploadFile = File(...),
+) -> SpeakerProfileResponse:
+    clean_name = name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=422, detail="Speaker name must not be blank.")
+    temp_path = await save_upload_to_temp(audio)
+    try:
+        enrolled = enroll_speaker_profile(clean_name, temp_path)
+        return SpeakerProfileResponse(name=enrolled, speaker_profiles=list_speaker_profiles())
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finally:
+        delete_file_quietly(temp_path)
 
 
 @app.post("/api/analyze-waveform", response_model=WaveformAnalysisResponse)
@@ -108,8 +129,8 @@ def validate_speaker_request(speakers: list[SpeakerInput], speaker_count: int) -
 
 
 def resolve_requested_language(language: str | None, default_language: str | None) -> str | None:
-    normalized = (language or default_language or "").strip()
-    return normalized or None
+    """The workbench is intentionally English-only across every ASR path."""
+    return "en"
 
 
 def coerce_timestamp(value: object, fallback: float) -> float:
@@ -261,14 +282,16 @@ async def transcribe(
     model: str = Form("large-v3"),
     speaker_count: int = Form(1, ge=1, le=12),
     speakers_json: str = Form("[{\"id\":0,\"name\":\"Speaker 1\"}]"),
-    speaker_assignment_mode: SpeakerAssignmentMode = Form("word"),
+    # Kept as an ignored string for compatibility with older clients. Speaker
+    # attribution now always combines segment context with word-level timing.
+    speaker_assignment_mode: str = Form("hybrid"),
     language: str | None = Form(None),
     hotwords: str | None = Form(None),
     remove_disfluencies_enabled: bool = Form(False, alias="remove_disfluencies"),
 ):
     speakers = validate_speaker_request(parse_speakers_json(speakers_json), speaker_count)
     warnings: list[WarningItem] = []
-    requested_language = resolve_requested_language(language, settings.default_language)
+    requested_language = resolve_requested_language(language, None)
     diarization_audio_path = None
 
     temp_path = await save_upload_to_temp(audio)
@@ -317,6 +340,22 @@ async def transcribe(
                         auth_token=settings.diarization_auth_token,
                         cache_dir=settings.whisper_cache_dir,
                     )
+                    diarization_turns, raw_diarization_turns, profile_matches = apply_speaker_profiles(
+                        diarization_audio_path,
+                        diarization_turns,
+                        raw_diarization_turns,
+                        [speaker.name for speaker in speakers],
+                    )
+                    if profile_matches:
+                        matched = ", ".join(
+                            f"{match.name} ({match.similarity:.2f})" for match in profile_matches
+                        )
+                        warnings.append(
+                            WarningItem(
+                                code="speaker_profiles_applied",
+                                message=f"Saved voice profiles identified: {matched}.",
+                            )
+                        )
                     if not diarization_turns:
                         warnings.append(
                             WarningItem(
@@ -349,7 +388,7 @@ async def transcribe(
         words = build_words(
             segments,
             speaker_lookup,
-            speaker_assignment_mode=speaker_assignment_mode,
+            speaker_assignment_mode="hybrid",
         )
         if remove_disfluencies_enabled:
             words = remove_disfluencies(words)
@@ -367,8 +406,8 @@ async def transcribe(
             guide_blocks=guide_blocks,
             warnings=warnings,
             model=model,
-            speaker_assignment_mode=speaker_assignment_mode,
-            language=result.get("language"),
+            speaker_assignment_mode="hybrid",
+            language="en",
             gpu_enabled=gpu_enabled,
             speaker_turns=[
                 SpeakerTurnOut(
@@ -408,7 +447,7 @@ async def retranscribe_range(
     if end_seconds <= start_seconds:
         raise HTTPException(status_code=400, detail="The selected range must have a positive duration.")
 
-    requested_language = resolve_requested_language(language, settings.default_language)
+    requested_language = resolve_requested_language(language, None)
     clip_padding_seconds = 0.75
     clip_start = max(0.0, start_seconds - clip_padding_seconds)
     clip_end = end_seconds + clip_padding_seconds
@@ -429,7 +468,7 @@ async def retranscribe_range(
             build_words(
                 shifted_segments,
                 default_speaker_lookup,
-                speaker_assignment_mode="segment",
+                speaker_assignment_mode="hybrid",
             ),
             start_seconds,
             end_seconds,
@@ -455,7 +494,7 @@ async def retranscribe_range(
             captions=captions,
             warnings=warnings,
             model=model,
-            language=result.get("language"),
+            language="en",
             gpu_enabled=gpu_enabled,
         )
     finally:

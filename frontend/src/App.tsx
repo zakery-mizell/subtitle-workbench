@@ -26,7 +26,14 @@ import {
   X,
 } from "lucide-react";
 
-import { buildExportFilename, captionsAreSimultaneous, captionsToSrt, guideToSrt } from "./lib/exporters";
+import {
+  buildExportFilename,
+  captionsAreSimultaneous,
+  captionsToSrt,
+  guideToSrt,
+  stemWordsToSrt,
+  stemWordsToTranscriptText,
+} from "./lib/exporters";
 import {
   appendGlossaryTerms,
   detectJargonCandidates,
@@ -50,18 +57,26 @@ import {
   unionIntervals,
 } from "./lib/playbackSync";
 import type { SoloTrackState, SpeakerTrackInput, SpeakerVoice } from "./lib/playbackSync";
-import { materializeRegions, regionsToSpeakerMap, sanitizeSpeakerRegions } from "./lib/regions";
-import type { RegionMarker } from "./lib/regions";
+import { materializeRegions, panViewWindow, regionsToSpeakerMap, sanitizeSpeakerRegions, zoomViewWindow } from "./lib/regions";
+import type { RegionMarker, ViewWindow } from "./lib/regions";
 import { parseSrt } from "./lib/srt";
 import { formatClock, formatGutterClock } from "./lib/time";
 import MasteringPanel from "./MasteringPanel";
 import OverlapsPanel from "./OverlapsPanel";
+import OverlapDock, { overlapRegionKey } from "./OverlapDock";
+import type { RegionChoice } from "./OverlapDock";
 import RegionsPanel from "./RegionsPanel";
 import RestorePanel from "./RestorePanel";
 import ConvertPanel from "./ConvertPanel";
 import PatchPanel from "./PatchPanel";
 import VoicePanel from "./VoicePanel";
-import type { RegionReport, SeparationResult } from "./lib/separation";
+import type {
+  HandoffCorrection,
+  RegionReport,
+  SeparationResult,
+  SoloTracksMode,
+  StemWord,
+} from "./lib/separation";
 import { fetchSoloTracksJob, separatedAudioUrl, startSoloTracksJob } from "./lib/separation";
 import type {
   BackendCapabilities,
@@ -73,7 +88,6 @@ import type {
   RetranscribeRangeResponse,
   SpeechSpan,
   Speaker,
-  SpeakerAssignmentMode,
   SpeakerRegion,
   SpeakerTurn,
   TranscriptResponse,
@@ -175,11 +189,6 @@ const WEAK_LINE_ENDS = new Set([
   "been",
   "being",
 ]);
-const SPEAKER_ASSIGNMENT_OPTIONS: Array<{ value: SpeakerAssignmentMode; label: string }> = [
-  { value: "segment", label: "Segment (stable)" },
-  { value: "word", label: "Word (tighter switches)" },
-];
-
 // Fallback gate for muted-speaker playback before the rendered tracks exist:
 // audio outside the audible speakers' word spans is muted. Spans get edge padding
 // so word onsets are not clipped, and nearby spans merge so playback does not
@@ -417,23 +426,23 @@ export function buildSpeakerRegionsFromSpeech(
 // Bumped whenever the rendering itself changes in a way that makes older
 // artifacts unusable, so a reloaded session re-renders instead of adopting them.
 // v2: FLAC seektables (pre-v2 gated tracks seek tens of seconds off).
-const SOLO_TRACK_RENDER_VERSION = "v2";
+// v3: full-file stems + per-stem transcripts (pre-v3 tracks carry no words).
+// v7: isolated short replies use original-audio speaker verification.
+const SOLO_TRACK_RENDER_VERSION = "v7";
 
 function soloTracksSessionKey(
   session: TranscriptResponse,
+  mode: SoloTracksMode,
   restore: boolean,
   restoreEngine: RestoreEngineName,
   regionCount: number,
   renderNonce: number,
 ): string {
-  // The restore flag AND the engine are part of the key so restored tokens are
-  // never reused for a raw run, or across engines (they differ in sample rate
-  // as well as sound), after a reload. The region count stands
-  // in for the gating envelope: re-derived regions must re-render the tracks.
-  // Hand edits that only move boundaries keep the count, so the nonce carries an
-  // explicit re-render request -- rendering on every nudge would launch a
-  // minutes-long job per keystroke.
-  return `${SOLO_TRACK_RENDER_VERSION}|${session.audio_filename}|${session.duration ?? 0}|${(session.overlap_regions ?? []).length}|${regionCount}|${restore ? `restore-${restoreEngine}` : "raw"}|n${renderNonce}`;
+  // Targeted and legacy overlap-only tracks never share artifacts. A successful
+  // handoff correction can re-split captions, so targeted mode deliberately does
+  // not key on the derived region count and launch the same audit twice.
+  const gateKey = mode === "targeted" ? "handoff-windows" : String(regionCount);
+  return `${SOLO_TRACK_RENDER_VERSION}|${mode}|${session.audio_filename}|${session.duration ?? 0}|${(session.overlap_regions ?? []).length}|${gateKey}|${restore ? `restore-${restoreEngine}` : "raw"}|n${renderNonce}`;
 }
 
 // Cheap FNV-1a over the gating envelope, to tell whether the rendered tracks
@@ -585,7 +594,7 @@ interface WorkspaceState {
   editor: EditorState;
   words: WordToken[];
   warnings: WarningItem[];
-  language: string | null;
+  language: "en";
 }
 
 interface HistoryState {
@@ -599,7 +608,7 @@ interface CommitOptions {
   syncCaptionTiming?: boolean;
   transformWords?: (words: WordToken[]) => WordToken[];
   warnings?: WarningItem[];
-  language?: string | null;
+  language?: "en";
 }
 
 interface CaptionWordSyncOptions {
@@ -611,6 +620,10 @@ interface SoloTrackArtifacts {
   key: string;
   tokens: Record<number, string>;
   regionsSignature?: string;
+  // Per-speaker stem transcripts rendered alongside the tracks. Persisted with
+  // the tokens because the server artifact is audio only — losing these on a
+  // reload would silently drop the speaker-based transcripts.
+  words?: Record<number, StemWord[]>;
 }
 
 // Converted voices survive a reload the way solo tracks do: server tokens only,
@@ -627,7 +640,6 @@ interface PersistedWorkspace {
   model: string;
   speakerCount: number;
   speakerInputs: Speaker[];
-  speakerAssignmentMode: SpeakerAssignmentMode;
   glossaryText: string;
   skipCuts: boolean;
   clickToPlay: boolean;
@@ -844,13 +856,13 @@ function buildWorkspaceState(
   editor: EditorState,
   words: WordToken[],
   warnings: WarningItem[],
-  language: string | null,
+  _language: "en",
 ): WorkspaceState {
   return {
     editor: normalizeEditorState(editor),
     words: cloneWords(words),
     warnings: cloneWarnings(warnings),
-    language,
+    language: "en",
   };
 }
 
@@ -1783,6 +1795,50 @@ function detectSpeakerTimelineEvents(
     }
   }
 
+  // A whole short reply can carry the wrong speaker label, leaving no adjacent
+  // speaker change for the ordinary detector to see. Surface pause-bounded ASR
+  // segments as review events; the backend also voice-verifies these against
+  // every enrolled speaker automatically.
+  const wordPosition = new Map(orderedWords.map((word, index) => [word.id, index]));
+  const alignedSegments = new Map<string, WordToken[]>();
+  for (const word of orderedWords) {
+    const match = /^(\d+)-\d+$/.exec(word.id);
+    if (match) {
+      const segmentWords = alignedSegments.get(match[1]) ?? [];
+      segmentWords.push(word);
+      alignedSegments.set(match[1], segmentWords);
+    }
+  }
+  for (const [segmentId, segmentWords] of alignedSegments) {
+    segmentWords.sort((left, right) => left.start - right.start);
+    if (segmentWords.length < 1 || segmentWords.length > 3) {
+      continue;
+    }
+    const first = segmentWords[0];
+    const last = segmentWords[segmentWords.length - 1];
+    if (last.end - first.start > 1.25 || segmentWords.some((word) => word.speaker_id !== first.speaker_id)) {
+      continue;
+    }
+    const firstPosition = wordPosition.get(first.id) ?? -1;
+    const lastPosition = wordPosition.get(last.id) ?? -1;
+    if (firstPosition <= 0 || lastPosition < 0 || lastPosition >= orderedWords.length - 1) {
+      continue;
+    }
+    const gapBefore = first.start - orderedWords[firstPosition - 1].end;
+    const gapAfter = orderedWords[lastPosition + 1].start - last.end;
+    if (gapBefore < 0.3 || gapBefore > 2 || gapAfter < 0.3 || gapAfter > 2) {
+      continue;
+    }
+    pushTimelineEvent(events, {
+      id: `isolated-reply-${segmentId}`,
+      kind: "tight_handoff",
+      time: first.start + (last.end - first.start) / 2,
+      start: first.start,
+      end: last.end,
+      label: `Check ${speakerLabelForItem(first)}: “${segmentWords.map((word) => word.text).join(" ")}”`,
+    });
+  }
+
   return events.sort((left, right) => left.time - right.time);
 }
 
@@ -2243,8 +2299,8 @@ function buildImportedSession(audioFilename: string, captions: Caption[]): Trans
       },
     ],
     model: "imported",
-    speaker_assignment_mode: "segment",
-    language: null,
+    speaker_assignment_mode: "hybrid",
+    language: "en",
     gpu_enabled: false,
   };
 }
@@ -2532,9 +2588,30 @@ interface WaveformTimelineProps {
   captions: Caption[];
   speakerEvents: SpeakerTimelineEvent[];
   overlapRegions: OverlapRegion[];
+  enabledOverlapKeys: ReadonlySet<string>;
+  selectedOverlapIndex: number | null;
+  focusRequest: { start: number; end: number; nonce: number } | null;
   currentTime: number;
   theme: "light" | "dark";
   onSeek: (time: number, options?: { play?: boolean }) => void;
+  onSelectOverlap: (index: number | null) => void;
+}
+
+// The main waveform can zoom well past the frame resolution, but past ~0.5 s
+// per screen there is nothing new to see in 20 ms peaks.
+const WAVEFORM_MIN_VIEW_SECONDS = 0.5;
+const WAVEFORM_TICK_STEPS = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+// timeupdate fires ~4x a second, so playback never advances the playhead by
+// more than a fraction of a second between renders; anything larger is a seek.
+const WAVEFORM_FOLLOW_MAX_STEP_S = 1;
+
+function timelineDuration(props: WaveformTimelineProps): number {
+  return Math.max(
+    props.analysis?.duration ?? 0,
+    props.captions[props.captions.length - 1]?.end ?? 0,
+    props.currentTime,
+    1,
+  );
 }
 
 function themeColor(name: string, fallback: string): string {
@@ -2547,6 +2624,7 @@ function drawWaveformTimeline(
   props: WaveformTimelineProps,
   width: number,
   height: number,
+  view: ViewWindow | null,
 ) {
   const context = canvas.getContext("2d");
   if (!context) {
@@ -2560,13 +2638,11 @@ function drawWaveformTimeline(
   canvas.style.height = `${height}px`;
   context.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-  const { analysis, captions, currentTime } = props;
-  const duration = Math.max(
-    analysis?.duration ?? 0,
-    captions[captions.length - 1]?.end ?? 0,
-    currentTime,
-    1,
-  );
+  const { analysis, currentTime } = props;
+  const duration = timelineDuration(props);
+  const viewStart = view?.start ?? 0;
+  const viewSeconds = view?.seconds ?? duration;
+  const timeToX = (time: number) => ((time - viewStart) / viewSeconds) * width;
 
   context.clearRect(0, 0, width, height);
 
@@ -2577,19 +2653,28 @@ function drawWaveformTimeline(
     return;
   }
 
-  // Overlap regions sit behind the bars as translucent bands.
-  if (props.overlapRegions.length) {
-    context.fillStyle = themeColor("--overlap-band", "rgba(216, 90, 48, 0.16)");
-    for (const region of props.overlapRegions) {
-      const left = clampNumber((region.start / duration) * width, 0, width);
-      const right = clampNumber((region.end / duration) * width, 0, width);
-      if (right - left > 0.5) {
-        context.fillRect(left, 1, right - left, height - 2);
-      }
+  // Overlap regions sit behind the bars as translucent bands; enabled ones
+  // pick up a stronger tint so the waveform mirrors the dock's choices.
+  const bandColor = themeColor("--overlap-band", "rgba(216, 90, 48, 0.16)");
+  const bandActiveColor = themeColor("--overlap-band-active", "rgba(216, 90, 48, 0.32)");
+  for (const [index, region] of props.overlapRegions.entries()) {
+    const left = clampNumber(timeToX(region.start), 0, width);
+    const right = clampNumber(timeToX(region.end), 0, width);
+    if (right - left <= 0.5) {
+      continue;
+    }
+    context.fillStyle = props.enabledOverlapKeys.has(overlapRegionKey(region)) ? bandActiveColor : bandColor;
+    context.fillRect(left, 1, right - left, height - 2);
+    if (index === props.selectedOverlapIndex) {
+      context.strokeStyle = themeColor("--playhead", "#d85a30");
+      context.lineWidth = 1.5;
+      context.strokeRect(left + 0.75, 1.75, right - left - 1.5, height - 3.5);
     }
   }
 
-  // Amplitude bars, split into played and unplayed at the playhead.
+  // Amplitude bars, split into played and unplayed at the playhead. Each bar
+  // takes the peak over its slice of the (uniformly spaced) analysis frames,
+  // so zooming in never leaves empty bars behind.
   const barWidth = 3;
   const barGap = 2;
   const step = barWidth + barGap;
@@ -2598,39 +2683,106 @@ function drawWaveformTimeline(
   const maxBar = height * 0.86;
   const playedColor = themeColor("--wave-played", "#1d9e75");
   const restColor = themeColor("--wave-rest", "#b4b2a9");
-  const playheadX = clampNumber((currentTime / duration) * width, 0, width);
+  const playheadX = timeToX(currentTime);
 
-  // One pass over the frames: bucket each into its bar and keep the peak.
-  const peaks = new Float32Array(barCount);
-  for (const frame of analysis.frames) {
-    const barIndex = Math.min(barCount - 1, Math.floor((frame.time / duration) * barCount));
-    const amplitude = Math.max(Math.abs(frame.max), Math.abs(frame.min));
-    if (amplitude > peaks[barIndex]) {
-      peaks[barIndex] = amplitude;
-    }
-  }
-
+  const frames = analysis.frames;
+  const frameOrigin = frames[0].time;
+  // Display frames are downsampled server-side (DISPLAY_FRAME_LIMIT) while
+  // `frame_duration` keeps reporting the analysis resolution, so the real
+  // spacing has to be measured off the frames themselves. They stay uniformly
+  // spaced (fixed bucket size), which keeps the bucket edges O(1).
+  const frameSpacing =
+    frames.length > 1
+      ? Math.max(0.001, (frames[frames.length - 1].time - frameOrigin) / (frames.length - 1))
+      : analysis.frame_duration > 0
+        ? analysis.frame_duration
+        : 0.02;
+  const secondsPerBar = viewSeconds / barCount;
   for (let barIndex = 0; barIndex < barCount; barIndex += 1) {
+    const barStart = viewStart + barIndex * secondsPerBar;
+    const firstFrame = Math.max(0, Math.floor((barStart - frameOrigin) / frameSpacing));
+    const lastFrame = Math.min(frames.length - 1, Math.ceil((barStart + secondsPerBar - frameOrigin) / frameSpacing));
+    let peak = 0;
+    for (let frameIndex = firstFrame; frameIndex <= lastFrame; frameIndex += 1) {
+      const frame = frames[frameIndex];
+      const amplitude = Math.max(Math.abs(frame.max), Math.abs(frame.min));
+      if (amplitude > peak) {
+        peak = amplitude;
+      }
+    }
     const x = barIndex * step;
-    const barHeight = Math.max(3, peaks[barIndex] * maxBar);
+    const barHeight = Math.max(3, peak * maxBar);
     context.fillStyle = x + barWidth / 2 <= playheadX ? playedColor : restColor;
     context.beginPath();
     context.roundRect(x, centerY - barHeight / 2, barWidth, barHeight, 1.5);
     context.fill();
   }
 
-  context.strokeStyle = themeColor("--playhead", "#d85a30");
-  context.lineWidth = 2;
-  context.beginPath();
-  context.moveTo(playheadX, 2);
-  context.lineTo(playheadX, height - 2);
-  context.stroke();
+  // Overlap labels ride on top of the bars once the band is wide enough. The
+  // left edge is clamped to the canvas, so bands that both span the view would
+  // stack their labels on the same pixel: the later one is dropped instead.
+  context.font = "600 10px Inter, sans-serif";
+  let lastLabelRight = Number.NEGATIVE_INFINITY;
+  for (const [index, region] of props.overlapRegions.entries()) {
+    const left = clampNumber(timeToX(region.start), 0, width);
+    const right = clampNumber(timeToX(region.end), 0, width);
+    if (right - left < 64) {
+      continue;
+    }
+    const label = `Overlap ${index + 1}`;
+    const labelX = left + 5;
+    if (labelX < lastLabelRight + 6) {
+      continue;
+    }
+    context.fillStyle = themeColor("--playhead", "#d85a30");
+    context.fillText(label, labelX, 12);
+    lastLabelRight = labelX + context.measureText(label).width;
+  }
+
+  // Time ticks keep the zoomed window oriented; the full view stays clean.
+  if (view) {
+    const minTickPx = 76;
+    const tickStep =
+      WAVEFORM_TICK_STEPS.find((candidate) => (candidate / viewSeconds) * width >= minTickPx) ??
+      WAVEFORM_TICK_STEPS[WAVEFORM_TICK_STEPS.length - 1];
+    context.font = "9px Inter, sans-serif";
+    const tickColor = themeColor("--muted", "#647184");
+    for (let tick = Math.ceil(viewStart / tickStep) * tickStep; tick <= viewStart + viewSeconds; tick += tickStep) {
+      const x = timeToX(tick);
+      context.strokeStyle = tickColor;
+      context.lineWidth = 1;
+      context.beginPath();
+      context.moveTo(x, height - 7);
+      context.lineTo(x, height - 1);
+      context.stroke();
+      context.fillStyle = tickColor;
+      // Tenths, not milliseconds: the smallest tick step is 0.5 s.
+      context.fillText(formatGutterClock(tick), x + 3, height - 2);
+    }
+  }
+
+  if (playheadX >= 0 && playheadX <= width) {
+    context.strokeStyle = themeColor("--playhead", "#d85a30");
+    context.lineWidth = 2;
+    context.beginPath();
+    context.moveTo(playheadX, 2);
+    context.lineTo(playheadX, height - 2);
+    context.stroke();
+  }
 }
 
 const WaveformTimeline = memo(function WaveformTimeline(props: WaveformTimelineProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const [size, setSize] = useState({ width: 640, height: 132 });
+  // null means "fit the whole recording" — the pre-zoom behavior.
+  const [view, setView] = useState<ViewWindow | null>(null);
+  const durationRef = useRef(1);
+  durationRef.current = timelineDuration(props);
+  // The wheel listener is attached once (it needs a non-passive listener), so it
+  // reads the current window through a ref rather than through its closure.
+  const viewRef = useRef<ViewWindow | null>(null);
+  viewRef.current = view;
 
   useEffect(() => {
     const wrapper = wrapperRef.current;
@@ -2657,24 +2809,140 @@ const WaveformTimeline = memo(function WaveformTimeline(props: WaveformTimelineP
     if (!canvas) {
       return;
     }
-    drawWaveformTimeline(canvas, props, size.width, size.height);
-  }, [props, size]);
+    drawWaveformTimeline(canvas, props, size.width, size.height, view);
+  }, [props, size, view]);
 
-  const scrubbing = useRef(false);
-
-  function seekFromPointer(clientX: number) {
-    const canvas = canvasRef.current;
-    if (!canvas) {
+  // Wheel zoom needs preventDefault (the page must not scroll under the
+  // gesture), which React's passive wheel listener cannot do.
+  useEffect(() => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper) {
       return;
     }
+    const onWheel = (event: WheelEvent) => {
+      // Trackpads pan with the horizontal axis (or shift); the vertical
+      // axis — the plain scroll — zooms around the cursor.
+      const isPan = Math.abs(event.deltaX) > Math.abs(event.deltaY) || event.shiftKey;
+      // Zooming out at fit is a no-op, so the page keeps its scroll there —
+      // otherwise the waveform would trap the wheel over its whole height.
+      if (!isPan && event.deltaY > 0 && viewRef.current === null) {
+        return;
+      }
+      event.preventDefault();
+      const rect = wrapper.getBoundingClientRect();
+      const width = Math.max(1, rect.width);
+      const duration = durationRef.current;
+      setView((current) => {
+        const base = current ?? { start: 0, seconds: duration };
+        if (isPan) {
+          if (!current) {
+            return current;
+          }
+          const delta = ((event.deltaX || event.deltaY) / width) * base.seconds;
+          return panViewWindow(base, delta, duration);
+        }
+        const anchor = base.start + ((event.clientX - rect.left) / width) * base.seconds;
+        const next = zoomViewWindow(
+          base,
+          event.deltaY > 0 ? 1.25 : 1 / 1.25,
+          anchor,
+          duration,
+          WAVEFORM_MIN_VIEW_SECONDS,
+        );
+        return next.seconds >= duration ? null : next;
+      });
+    };
+    wrapper.addEventListener("wheel", onWheel, { passive: false });
+    return () => wrapper.removeEventListener("wheel", onWheel);
+  }, []);
+
+  // Follow the playhead only on the tick where playback carries it out of the
+  // zoomed window. Re-centering on "is outside" alone would fight every pan or
+  // zoom away from the playhead, since timeupdate fires ~4x a second. A seek
+  // that jumps clean out of the window is the user's own move, so it is left
+  // where it lands — only a step small enough to be playback follows.
+  const previousTimeRef = useRef(props.currentTime);
+  useEffect(() => {
+    const previous = previousTimeRef.current;
+    previousTimeRef.current = props.currentTime;
+    setView((current) => {
+      if (!current) {
+        return current;
+      }
+      const inside = (time: number) => time >= current.start && time <= current.start + current.seconds;
+      if (inside(props.currentTime) || !inside(previous)) {
+        return current;
+      }
+      if (Math.abs(props.currentTime - previous) > WAVEFORM_FOLLOW_MAX_STEP_S) {
+        return current;
+      }
+      return panViewWindow(
+        { start: props.currentTime - current.seconds * 0.35, seconds: current.seconds },
+        0,
+        durationRef.current,
+      );
+    });
+  }, [props.currentTime]);
+
+  // External "zoom to this overlap" requests (the chip in the strip below).
+  useEffect(() => {
+    const focus = props.focusRequest;
+    if (!focus) {
+      return;
+    }
+    const duration = durationRef.current;
+    const span = Math.max(focus.end - focus.start, 0.1);
+    // The 4 s floor keeps a short overlap from filling the screen, but it may
+    // not exceed the recording itself or the clamp inverts and nothing zooms.
+    const seconds = clampNumber(span * 3, Math.min(4, duration), Math.max(duration, WAVEFORM_MIN_VIEW_SECONDS));
+    const start = clampNumber(focus.start - (seconds - span) / 2, 0, Math.max(0, duration - seconds));
+    setView(seconds >= duration ? null : { start, seconds });
+  }, [props.focusRequest]);
+
+  const dragRef = useRef<{ kind: "seek" | "pan"; downX: number; anchorStart: number; moved: boolean } | null>(null);
+
+  function viewWindow(): { start: number; seconds: number } {
+    return view ?? { start: 0, seconds: durationRef.current };
+  }
+
+  function timeFromPointer(clientX: number): number {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return 0;
+    }
     const rect = canvas.getBoundingClientRect();
-    const duration = Math.max(
-      props.analysis?.duration ?? 0,
-      props.captions[props.captions.length - 1]?.end ?? 0,
-      1,
-    );
+    const currentView = viewWindow();
     const fraction = clampNumber((clientX - rect.left) / rect.width, 0, 1);
-    props.onSeek(fraction * duration, { play: false });
+    return currentView.start + fraction * currentView.seconds;
+  }
+
+  function overlapIndexAtPointer(clientX: number): number | null {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return null;
+    }
+    const rect = canvas.getBoundingClientRect();
+    const currentView = viewWindow();
+    const x = clientX - rect.left;
+    // At fit on a long recording several bands share a hit zone, so the nearest
+    // center wins rather than the first match — otherwise the later overlaps in
+    // a cluster can never be selected. The ±3 px slop keeps thin bands clickable.
+    let bestIndex: number | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < props.overlapRegions.length; index += 1) {
+      const region = props.overlapRegions[index];
+      const left = ((region.start - currentView.start) / currentView.seconds) * rect.width;
+      const right = ((region.end - currentView.start) / currentView.seconds) * rect.width;
+      if (x < left - 3 || x > right + 3) {
+        continue;
+      }
+      const distance = Math.abs(x - (left + right) / 2);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestIndex = index;
+      }
+    }
+    return bestIndex;
   }
 
   return (
@@ -2683,23 +2951,61 @@ const WaveformTimeline = memo(function WaveformTimeline(props: WaveformTimelineP
         ref={canvasRef}
         className="waveform-canvas"
         onPointerDown={(event) => {
-          scrubbing.current = true;
           event.currentTarget.setPointerCapture(event.pointerId);
-          seekFromPointer(event.clientX);
+          // Shift pans, but there is nothing to pan at fit — that drag seeks.
+          if (event.shiftKey && view) {
+            dragRef.current = { kind: "pan", downX: event.clientX, anchorStart: viewWindow().start, moved: false };
+            return;
+          }
+          dragRef.current = { kind: "seek", downX: event.clientX, anchorStart: 0, moved: false };
+          props.onSeek(Math.max(0, timeFromPointer(event.clientX)), { play: false });
         }}
         onPointerMove={(event) => {
-          if (scrubbing.current) {
-            seekFromPointer(event.clientX);
+          const drag = dragRef.current;
+          if (!drag) {
+            return;
           }
+          if (Math.abs(event.clientX - drag.downX) > 4) {
+            drag.moved = true;
+          }
+          if (drag.kind === "seek") {
+            props.onSeek(Math.max(0, timeFromPointer(event.clientX)), { play: false });
+            return;
+          }
+          const rect = event.currentTarget.getBoundingClientRect();
+          const currentView = viewWindow();
+          const delta = ((drag.downX - event.clientX) / Math.max(1, rect.width)) * currentView.seconds;
+          setView(view ? panViewWindow({ start: drag.anchorStart, seconds: view.seconds }, delta, durationRef.current) : view);
         }}
         onPointerUp={(event) => {
-          scrubbing.current = false;
+          const drag = dragRef.current;
+          dragRef.current = null;
           event.currentTarget.releasePointerCapture(event.pointerId);
+          if (drag && drag.kind === "seek" && !drag.moved) {
+            // Only a hit on a band changes the selection: clicking bare
+            // waveform to seek must not close the dock over in-progress
+            // settings. The dock's ✕ dismisses it.
+            const hit = overlapIndexAtPointer(event.clientX);
+            if (hit !== null) {
+              props.onSelectOverlap(hit);
+            }
+          }
         }}
         onPointerCancel={() => {
-          scrubbing.current = false;
+          dragRef.current = null;
         }}
+        onDoubleClick={() => setView(null)}
       />
+      {view ? (
+        <div className="waveform-zoom-badge">
+          <span>
+            {formatClock(view.start)}–{formatClock(view.start + view.seconds)}
+          </span>
+          <button type="button" onClick={() => setView(null)}>
+            Fit
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 });
@@ -2938,7 +3244,6 @@ function App() {
   const [speakerCount, setSpeakerCount] = useState(1);
   const [speakerInputs, setSpeakerInputs] = useState<Speaker[]>(() => buildDefaultSpeakers());
   const [model, setModel] = useState("large-v3");
-  const [speakerAssignmentMode, setSpeakerAssignmentMode] = useState<SpeakerAssignmentMode>("word");
   const [glossaryText, setGlossaryText] = useState("");
   const [findText, setFindText] = useState("");
   const [replaceText, setReplaceText] = useState("");
@@ -2999,11 +3304,12 @@ function App() {
   // Set by the audibility pass when no usable track set exists yet, so the clock
   // has to stand in gated. The only state in which the frontend touches volume.
   const [fallbackGateActive, setFallbackGateActive] = useState(false);
-  // Auto-prepared per-speaker tracks whose overlap sections contain only that
-  // speaker's separated voice; keyed by speaker index (appearance order).
+  // Auto-prepared per-speaker tracks whose overlap and rapid-handoff windows
+  // contain only that speaker's separated voice; keyed by appearance order.
+  // `words` is the speaker-based transcript of the rendered stem.
   const [soloTracks, setSoloTracks] = useState<{
     status: "idle" | "running" | "done" | "error";
-    tracks: Record<number, { url: string; token: string; filename?: string }>;
+    tracks: Record<number, { url: string; token: string; filename?: string; words?: StemWord[] | null }>;
   }>({ status: "idle", tracks: {} });
   // Conversions of the isolated tracks, by speaker id. A conversion of a
   // server-gated full-length track is itself gated and full-length, so it drops
@@ -3033,6 +3339,7 @@ function App() {
   const [captionFocusRequest, setCaptionFocusRequest] = useState<{ index: number; request: FocusRequest } | null>(null);
   const [acknowledgedLowConfidenceWordIds, setAcknowledgedLowConfidenceWordIds] = useState<string[]>([]);
   const [backendCapabilities, setBackendCapabilities] = useState<BackendCapabilities | null>(null);
+  const [profileUploadingName, setProfileUploadingName] = useState<string | null>(null);
 
   // The clock: the element whose currentTime is authoritative. Never repointed by
   // muting -- see the clock effect below.
@@ -3048,6 +3355,7 @@ function App() {
   // is). Read back as the `alreadyAudible` hysteresis input per track.
   const audibleTrackTokensRef = useRef<Set<string>>(new Set());
   const soloTracksAttemptRef = useRef<string | null>(null);
+  const handoffAuditAppliedRef = useRef<string | null>(null);
   const persistedSoloTokensRef = useRef<SoloTrackArtifacts | null>(null);
   // Restored converted-voice records, waiting for the HEAD revalidation below.
   const persistedConvertedVoicesRef = useRef<ConvertedVoiceArtifacts | null>(null);
@@ -3056,7 +3364,6 @@ function App() {
   const viewOptionsRef = useRef<HTMLDivElement | null>(null);
   const paragraphRefs = useRef<Array<HTMLElement | null>>([]);
   const captionRefs = useRef<Array<HTMLElement | null>>([]);
-  const suppressAutoSpeakerModeRef = useRef(false);
   const autosaveReadyRef = useRef(false);
   const autosaveTimerRef = useRef<number | null>(null);
   const lastTextEditRef = useRef<{ kind: SelectionKind; index: number; timestamp: number } | null>(null);
@@ -3064,6 +3371,35 @@ function App() {
   const activeEditor = activeWorkspace?.editor ?? null;
   const currentAudioFilename = selectedFile?.name ?? session?.audio_filename ?? null;
   const overlapRegions = useMemo<OverlapRegion[]>(() => session?.overlap_regions ?? [], [session]);
+  // Overlap untangling lives on the main waveform: clicking a band selects a
+  // region, and the dock under the waveform carries its controls.
+  const [overlapChoices, setOverlapChoices] = useState<Record<string, RegionChoice>>({});
+  const [selectedOverlapIndex, setSelectedOverlapIndex] = useState<number | null>(null);
+  const [waveformFocus, setWaveformFocus] = useState<{ start: number; end: number; nonce: number } | null>(null);
+  const enabledOverlapKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const region of overlapRegions) {
+      const key = overlapRegionKey(region);
+      if (overlapChoices[key]?.enabled) {
+        keys.add(key);
+      }
+    }
+    return keys;
+  }, [overlapRegions, overlapChoices]);
+  // Overlap picks belong to one recording: choices are keyed by region time, so
+  // loading another file or re-transcribing would otherwise leave the dock
+  // showing controls for a region the user never picked. Derived from the
+  // regions rather than the session object, which is also replaced by edits
+  // like renaming a speaker.
+  const overlapSessionKey = useMemo(
+    () => `${session?.audio_filename ?? ""}|${overlapRegions.map((region) => overlapRegionKey(region)).join(",")}`,
+    [session, overlapRegions],
+  );
+  useEffect(() => {
+    setOverlapChoices({});
+    setSelectedOverlapIndex(null);
+    setWaveformFocus(null);
+  }, [overlapSessionKey]);
   const speakerTurns = useMemo<SpeakerTurn[]>(() => session?.speaker_turns ?? [], [session]);
   const activeWords = activeWorkspace?.words ?? session?.words ?? [];
   // The speakers the mute toggles cover. Only speakers that actually say
@@ -3142,6 +3478,10 @@ function App() {
         converted: converted
           ? { url: converted.url, download: `${basename} — ${speaker.name}.converted.${extensionOf(converted.filename)}` }
           : null,
+        // The speaker-based transcript of the rendered stem, when the render
+        // included transcription.
+        words: isolated?.words?.length ? isolated.words : null,
+        transcriptBasename: `${basename} — ${speaker.name}`,
       };
     });
   }, [convertedVoices, currentAudioFilename, session, soloableSpeakers, soloTracks]);
@@ -3223,7 +3563,6 @@ function App() {
             model: typeof saved.model === "string" ? saved.model : model,
             speakerCount: Math.max(1, saved.speakerCount ?? restoredSpeakers.length),
             speakerInputs: normalizeSpeakers(restoredSpeakers),
-            speakerAssignmentMode: saved.speakerAssignmentMode === "segment" ? "segment" : "word",
             glossaryText: mergeVocabularyTexts(
               typeof saved.glossaryText === "string" ? saved.glossaryText : "",
               typeof saved.hotwords === "string" ? saved.hotwords : "",
@@ -3288,20 +3627,6 @@ function App() {
   }, [speakerCount]);
 
   useEffect(() => {
-    if (suppressAutoSpeakerModeRef.current) {
-      suppressAutoSpeakerModeRef.current = false;
-      return;
-    }
-
-    if (speakerCount <= 1) {
-      setSpeakerAssignmentMode("segment");
-      return;
-    }
-
-    setSpeakerAssignmentMode("word");
-  }, [speakerCount]);
-
-  useEffect(() => {
     if (!selection || !activeEditor) {
       return;
     }
@@ -3345,7 +3670,7 @@ function App() {
         autosaveTimerRef.current = null;
       }
     };
-  }, [acknowledgedLowConfidenceWordIds, activeVoice, activeWorkspace, clickToPlay, convertedVoices, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, lowConfidenceThreshold, model, normalizeExportTimingTo30Fps, removeDisfluencies, restoreEngine, restoreSoloTracks, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, soloTracks, speakerAssignmentMode, speakerCount, speakerInputs, trackRenderNonce, viewMode]);
+  }, [acknowledgedLowConfidenceWordIds, activeVoice, activeWorkspace, clickToPlay, convertedVoices, extendCaptionsOnExport, followPlayback, glossaryText, isGuidePanelCollapsed, lowConfidenceThreshold, model, normalizeExportTimingTo30Fps, removeDisfluencies, restoreEngine, restoreSoloTracks, session, showLineGuides, showSpeakerAttributionOptions, showTimingHighlights, sidePanelTab, skipCuts, soloTracks, speakerCount, speakerInputs, trackRenderNonce, viewMode]);
 
   // One stable ref callback per token. An inline arrow would be a fresh function
   // on every render, and React detaches (null) then re-attaches a changed ref
@@ -3972,19 +4297,161 @@ function App() {
   const soloTracksStale =
     renderedRegionsSignature !== null && renderedRegionsSignature !== currentRegionsSignature;
 
-  // Solo tracks are prepared automatically: as soon as a transcription reports
-  // overlap regions — or the captions yield snapped speaker regions — one
-  // background job renders a per-speaker version of the recording whose overlaps
-  // contain only that speaker's separated voice, gated to that speaker's regions.
-  // The mute toggles then just work — no extra buttons. With nobody muted these
-  // tracks are never audible.
-  useEffect(() => {
-    const canSeparate = overlapRegions.length > 0 && speakerTurns.length > 0;
-    if (!session || !selectedFile || (!canSeparate && !soloTrackRegionCount)) {
+  async function applyAutomaticHandoffCorrections(
+    corrections: HandoffCorrection[],
+    attemptKey: string,
+  ) {
+    if (!session || !corrections.length || handoffAuditAppliedRef.current === attemptKey) {
       return;
     }
+
+    const speakers = session.speakers;
+    const currentById = new Map(activeWords.map((word) => [word.id, word]));
+    const applicable = corrections.filter((correction) => {
+      const word = currentById.get(correction.word_id);
+      return word?.speaker_id === speakers[correction.from_speaker_index]?.id;
+    });
+    if (!applicable.length) {
+      handoffAuditAppliedRef.current = attemptKey;
+      return;
+    }
+
+    const correctionById = new Map(applicable.map((correction) => [correction.word_id, correction]));
+    const correctedSnapshot = activeWords.map((word) => {
+      const correction = correctionById.get(word.id);
+      const speaker = correction ? speakers[correction.to_speaker_index] : null;
+      return speaker ? { ...word, speaker_id: speaker.id, speaker_name: speaker.name } : word;
+    });
+
+    // Ask the existing deterministic splitter to move corrected boundary words
+    // into the proper speaker caption. If it is unavailable, word attribution is
+    // still fixed and existing caption text is preserved.
+    let rebuiltCaptions: Caption[] | null = null;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/rebuild-captions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ words: correctedSnapshot }),
+      });
+      if (response.ok) {
+        const payload = (await response.json()) as { captions: Caption[] };
+        rebuiltCaptions = payload.captions;
+      }
+    } catch {
+      // The correction itself does not depend on this presentational re-split.
+    }
+
+    handoffAuditAppliedRef.current = attemptKey;
+    const originalCaptionById = new Map(session.captions.map((caption) => [caption.id, caption]));
+    setHistory((current) => {
+      if (!current.present) {
+        return current;
+      }
+      const next = cloneWorkspaceState(current.present);
+      let appliedCount = 0;
+      next.words = next.words.map((word) => {
+        const correction = correctionById.get(word.id);
+        if (!correction) {
+          return word;
+        }
+        const from = speakers[correction.from_speaker_index];
+        const to = speakers[correction.to_speaker_index];
+        // A manual change made while UniSE was running always wins.
+        if (!from || !to || word.speaker_id !== from.id) {
+          return word;
+        }
+        appliedCount += 1;
+        return { ...word, speaker_id: to.id, speaker_name: to.name };
+      });
+      if (!appliedCount) {
+        return current;
+      }
+
+      if (rebuiltCaptions) {
+        // Only replace the connected caption group around corrected words. This
+        // keeps unrelated subtitle edits intact while allowing a word to cross
+        // the old speaker-caption boundary.
+        const affectedWordIds = new Set(correctionById.keys());
+        let expanded = true;
+        while (expanded) {
+          expanded = false;
+          for (const caption of [...next.editor.captions, ...rebuiltCaptions]) {
+            if (!caption.word_ids.some((wordId) => affectedWordIds.has(wordId))) {
+              continue;
+            }
+            for (const wordId of caption.word_ids) {
+              if (!affectedWordIds.has(wordId)) {
+                affectedWordIds.add(wordId);
+                expanded = true;
+              }
+            }
+          }
+        }
+        const affectedCurrent = next.editor.captions.filter((caption) =>
+          caption.word_ids.some((wordId) => affectedWordIds.has(wordId)),
+        );
+        const affectedTextWasEdited = affectedCurrent.some((caption) => {
+          const original = originalCaptionById.get(caption.id);
+          return !original || original.lines.join("\n") !== caption.lines.join("\n");
+        });
+        if (!affectedTextWasEdited) {
+          next.editor.captions = [
+            ...next.editor.captions.filter(
+              (caption) => !caption.word_ids.some((wordId) => affectedWordIds.has(wordId)),
+            ),
+            ...rebuiltCaptions.filter((caption) =>
+              caption.word_ids.some((wordId) => affectedWordIds.has(wordId)),
+            ),
+          ].sort((left, right) => left.start - right.start || left.end - right.end);
+        } else {
+          next.editor.captions = applyBlockSpeakers(next.editor.captions, next.words);
+        }
+      } else {
+        next.editor.captions = applyBlockSpeakers(next.editor.captions, next.words);
+      }
+      next.editor.paragraphs = buildParagraphsFromCaptions(next.editor.captions);
+      next.warnings = [
+        ...next.warnings.filter((warning) => warning.code !== "handoff_speakers_corrected"),
+        {
+          code: "handoff_speakers_corrected",
+          message: `The voice audit corrected ${appliedCount} word-level speaker assignment${appliedCount === 1 ? "" : "s"} near handoffs or isolated replies.`,
+        },
+      ];
+      return {
+        past: [...current.past, cloneWorkspaceState(current.present)].slice(-120),
+        present: next,
+        future: [],
+      };
+    });
+    setStatusMessage(
+      `The voice audit checked handoffs and isolated replies, then corrected ${applicable.length} speaker assignment${applicable.length === 1 ? "" : "s"}. Undo is available.`,
+    );
+  }
+
+  // Speaker tracks are prepared automatically for every diarized multi-speaker
+  // upload. Raw UniSE results from targeted overlap/handoff windows independently
+  // audit rapid word-level boundaries before the safe playback gate is applied.
+  useEffect(() => {
+    const canSeparate = overlapRegions.length > 0 && speakerTurns.length > 0;
+    const canAuditHandoffs = session !== null && session.speakers.length > 1 && speakerTurns.length > 0;
+    if (!session || !selectedFile || (!canSeparate && !soloTrackRegionCount && !canAuditHandoffs)) {
+      return;
+    }
+    const currentSession = session;
+    // A zero region count while the waveform analysis is still in flight means
+    // "not derivable yet", not "no regions": rendering now would gate on an
+    // empty list, producing ungated tracks that clobber the persisted gated
+    // ones and push playback onto the audibly-pumping fallback clock gate.
+    if (!soloTrackRegionCount && !waveformAnalysis) {
+      return;
+    }
+    // Targeted separation sends UniSE only merged windows around overlaps and
+    // rapid handoffs. The assembled speaker tracks are still transcribed so the
+    // window evidence and the ordinary word/segment transcript can work together.
+    const mode: SoloTracksMode = canAuditHandoffs ? "targeted" : "gated";
     const attemptKey = soloTracksSessionKey(
       session,
+      mode,
       restoreSoloTracks,
       restoreEngine,
       soloTrackRegionCount,
@@ -4016,9 +4483,15 @@ function App() {
           return;
         }
         if (alive.length && alive.every(Boolean)) {
-          const tracks: Record<number, { url: string; token: string }> = {};
+          const tracks: Record<number, { url: string; token: string; words?: StemWord[] | null }> = {};
           for (const [index, token] of entries) {
-            tracks[Number(index)] = { url: separatedAudioUrl(API_BASE_URL, token), token };
+            tracks[Number(index)] = {
+              url: separatedAudioUrl(API_BASE_URL, token),
+              token,
+              // The artifact is audio only; the stem transcript rides along in
+              // the persisted record.
+              words: persisted.words?.[Number(index)] ?? null,
+            };
           }
           setSoloTracks({ status: "done", tracks });
           // These artifacts are gated to the regions recorded alongside them,
@@ -4045,11 +4518,33 @@ function App() {
           renderedRegions,
           restoreSoloTracks,
           restoreEngine,
+          {
+            mode,
+            // Always transcribe the assembled tracks as a second source of
+            // speaker-timed information alongside the targeted raw windows.
+            transcribe: true,
+            transcribeModel: model,
+            auditWords: currentSession.words.flatMap((word) => {
+              const speakerIndex = currentSession.speakers.findIndex((speaker) => speaker.id === word.speaker_id);
+              return speakerIndex < 0
+                ? []
+                : [{
+                    id: word.id,
+                    text: word.text,
+                    start: word.start,
+                    end: word.end,
+                    speaker_index: speakerIndex,
+                  }];
+            }),
+          },
         );
         while (!cancelled) {
           const status = await fetchSoloTracksJob(API_BASE_URL, jobId);
           if (status.status === "done" && status.result) {
-            const tracks: Record<number, { url: string; token: string; filename?: string }> = {};
+            const tracks: Record<
+              number,
+              { url: string; token: string; filename?: string; words?: StemWord[] | null }
+            > = {};
             for (const track of status.result.tracks) {
               tracks[track.speaker_index] = {
                 url: separatedAudioUrl(API_BASE_URL, track.token),
@@ -4057,9 +4552,11 @@ function App() {
                 // Kept for the export tab's download name only; a reload adopts
                 // tokens alone and falls back to the rendered format there.
                 filename: track.output_filename,
+                words: track.words ?? null,
               };
             }
             if (!cancelled) {
+              await applyAutomaticHandoffCorrections(status.result.handoff_corrections ?? [], attemptKey);
               // Record the artifacts under the very key this attempt ran with.
               // The autosave snapshot writes this record verbatim rather than
               // recomputing the key, so the two can never drift apart.
@@ -4069,6 +4566,11 @@ function App() {
                   Object.entries(tracks).map(([index, track]) => [index, track.token]),
                 ),
                 regionsSignature: renderedSignature,
+                words: Object.fromEntries(
+                  Object.entries(tracks)
+                    .filter(([, track]) => track.words?.length)
+                    .map(([index, track]) => [index, track.words!]),
+                ),
               };
               setSoloTracks({ status: "done", tracks });
               setRenderedRegionsSignature(renderedSignature);
@@ -4094,7 +4596,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [session, selectedFile, overlapRegions, speakerTurns, soloTrackRegionCount, restoreSoloTracks, restoreEngine, trackRenderNonce]);
+  }, [session, selectedFile, overlapRegions, speakerTurns, soloTrackRegionCount, waveformAnalysis, restoreSoloTracks, restoreEngine, model, trackRenderNonce]);
 
   // Only the fallback gate needs per-frame gain: it rides region edges on the
   // clock, which timeupdate's ~4 Hz would step through audibly. Once the speaker
@@ -4564,7 +5066,6 @@ function App() {
       model,
       speakerCount,
       speakerInputs: normalizeSpeakers(speakerInputs),
-      speakerAssignmentMode,
       glossaryText,
       skipCuts,
       clickToPlay,
@@ -4626,19 +5127,19 @@ function App() {
       legacyHotwords,
     );
 
-    suppressAutoSpeakerModeRef.current = true;
     setSession(
       persisted.session
         ? {
             ...persisted.session,
             speakers: normalizeSpeakers(persisted.session.speakers),
+            speaker_assignment_mode: "hybrid",
+            language: "en",
           }
         : null,
     );
     setSpeakerInputs(restoredSpeakerInputs);
     setSpeakerCount(Math.max(1, persisted.speakerCount ?? restoredSpeakerInputs.length));
     setModel(typeof persisted.model === "string" ? persisted.model : "large-v3");
-    setSpeakerAssignmentMode(persisted.speakerAssignmentMode === "segment" ? "segment" : "word");
     setGlossaryText(restoredGlossaryText);
     setSkipCuts(typeof persisted.skipCuts === "boolean" ? persisted.skipCuts : false);
     setClickToPlay(typeof persisted.clickToPlay === "boolean" ? persisted.clickToPlay : true);
@@ -4722,7 +5223,7 @@ function App() {
             },
             persisted.session?.words ?? [],
             persisted.session?.warnings ?? [],
-            persisted.session?.language ?? null,
+            "en",
           )
         : null;
     replaceWorkspace(restoredWorkspace);
@@ -4849,6 +5350,7 @@ function App() {
     setConvertedVoices(new Map());
     setActiveVoice(new Map());
     soloTracksAttemptRef.current = null;
+    handoffAuditAppliedRef.current = null;
     // persistedSoloTokensRef survives on purpose: re-loading the session's own
     // audio after a reload should adopt the finished tracks, and the session
     // key check rejects tokens that belong to a different transcription.
@@ -5050,7 +5552,6 @@ function App() {
   function buildTranscriptionFormData(audioFile: File, overrides?: TranscriptionOverrides): FormData {
     const effectiveSpeakers = normalizeSpeakers(overrides?.speakers ?? speakerInputs);
     const effectiveSpeakerCount = overrides?.speakers ? effectiveSpeakers.length : speakerCount;
-    const effectiveSpeakerAssignmentMode: SpeakerAssignmentMode = effectiveSpeakerCount > 1 ? speakerAssignmentMode : "segment";
     const formData = new FormData();
     formData.append("audio", audioFile);
     formData.append("model", overrides?.model ?? model);
@@ -5059,7 +5560,7 @@ function App() {
       "speakers_json",
       JSON.stringify(effectiveSpeakers.map((speaker) => ({ id: speaker.id, name: speaker.name }))),
     );
-    formData.append("speaker_assignment_mode", effectiveSpeakerAssignmentMode);
+    formData.append("speaker_assignment_mode", "hybrid");
     formData.append("remove_disfluencies", String(removeDisfluencies));
     if (transcriptionVocabulary.trim()) {
       formData.append("hotwords", transcriptionVocabulary.trim());
@@ -5121,7 +5622,6 @@ function App() {
     setResumeSubtitleFile(null);
     setSpeakerCount(1);
     setSpeakerInputs(buildDefaultSpeakers());
-    setSpeakerAssignmentMode("word");
     setMutedSpeakerIds(new Set());
     setGlossaryText("");
     setFindText("");
@@ -5297,17 +5797,15 @@ function App() {
         ...payload,
         speakers: normalizeSpeakers(payload.speakers),
       };
-      suppressAutoSpeakerModeRef.current = true;
       setSession(normalizedPayload);
       setSpeakerCount(normalizedPayload.speakers.length);
       setSpeakerInputs(normalizedPayload.speakers);
-      setSpeakerAssignmentMode(normalizedPayload.speaker_assignment_mode);
       replaceWorkspace(buildWorkspaceFromSession(normalizedPayload));
       setAcknowledgedLowConfidenceWordIds([]);
       setViewMode("subtitles");
       setSelection(null);
       setStatusMessage(
-        `Transcribed with ${normalizedPayload.model}${normalizedPayload.gpu_enabled ? " on GPU" : " on CPU"} using ${normalizedPayload.speaker_assignment_mode}-level speaker assignment.`,
+        `Transcribed with ${normalizedPayload.model}${normalizedPayload.gpu_enabled ? " on GPU" : " on CPU"} in English using hybrid speaker timing (word boundaries with segment fallback).`,
       );
       notifyWorkFinished("Transcription finished", selectedFile.name);
     } catch (error) {
@@ -5373,7 +5871,6 @@ function App() {
           model,
           speakerCount: normalizedImportedSession.speakers.length,
           speakerInputs: normalizedImportedSession.speakers,
-          speakerAssignmentMode: normalizedImportedSession.speaker_assignment_mode,
           glossaryText,
           skipCuts,
           clickToPlay,
@@ -5441,6 +5938,36 @@ function App() {
     }, {
       transformWords: (words) => words.map((word) => (word.speaker_id === targetSpeakerId ? { ...word, speaker_name: name } : word)),
     });
+  }
+
+  async function learnSpeakerProfile(name: string, file: File) {
+    const cleanName = name.trim();
+    if (!cleanName) {
+      setStatusMessage("Name the speaker before learning their voice.");
+      return;
+    }
+    const form = new FormData();
+    form.append("name", cleanName);
+    form.append("audio", file);
+    setProfileUploadingName(cleanName);
+    setStatusMessage(`Learning ${cleanName}'s voice from ${file.name}...`);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/speaker-profiles`, { method: "POST", body: form });
+      const payload = await response.json().catch(() => null) as { speaker_profiles?: string[]; detail?: string } | null;
+      if (!response.ok) {
+        throw new Error(payload?.detail ?? `Could not learn the voice (${response.status}).`);
+      }
+      setBackendCapabilities((current) => ({
+        diarization_configured: current?.diarization_configured ?? false,
+        instance_id: current?.instance_id,
+        speaker_profiles: payload?.speaker_profiles ?? current?.speaker_profiles ?? [],
+      }));
+      setStatusMessage(`${cleanName}'s voice is saved. Future recordings can identify it automatically.`);
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : "Could not learn that voice.");
+    } finally {
+      setProfileUploadingName(null);
+    }
   }
 
   function updateSpeakerAttribution(index: number, showAttribution: boolean) {
@@ -5554,7 +6081,7 @@ function App() {
             ...current.present.warnings.filter((warning) => warning.code !== "retranscribe_empty"),
             ...cloneWarnings(payload.warnings),
           ],
-          language: payload.language ?? current.present.language,
+          language: "en",
         },
         future: [],
       };
@@ -6064,35 +6591,51 @@ function App() {
             <input type="number" min={1} max={12} value={speakerCount} onChange={(event) => setSpeakerCount(Math.max(1, Number(event.target.value) || 1))} />
           </label>
 
-          <label>
-            Speaker timing mode
-            <select
-              value={speakerAssignmentMode}
-              onChange={(event) => setSpeakerAssignmentMode(event.target.value as SpeakerAssignmentMode)}
-              disabled={speakerCount <= 1}
-            >
-              {SPEAKER_ASSIGNMENT_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>{option.label}</option>
-              ))}
-            </select>
-          </label>
-
           <div className="speaker-list">
-            {speakerInputs.map((speaker, index) => (
-              <label key={speaker.id}>
-                Speaker {index + 1}
-                <input
-                  value={speaker.name}
-                  onChange={(event) => updateSpeakerName(index, event.target.value)}
-                  onBlur={(event) => {
-                    const trimmed = event.target.value.trim();
-                    if (trimmed !== event.target.value || !trimmed) {
-                      updateSpeakerName(index, trimmed || `Speaker ${index + 1}`);
-                    }
-                  }}
-                />
-              </label>
-            ))}
+            {speakerInputs.map((speaker, index) => {
+              const hasProfile = backendCapabilities?.speaker_profiles?.some(
+                (name) => name.toLocaleLowerCase() === speaker.name.trim().toLocaleLowerCase(),
+              ) ?? false;
+              return (
+                <div className="speaker-config-card" key={speaker.id}>
+                  <label>
+                    Speaker {index + 1}
+                    <input
+                      value={speaker.name}
+                      onChange={(event) => updateSpeakerName(index, event.target.value)}
+                      onBlur={(event) => {
+                        const trimmed = event.target.value.trim();
+                        if (trimmed !== event.target.value || !trimmed) {
+                          updateSpeakerName(index, trimmed || `Speaker ${index + 1}`);
+                        }
+                      }}
+                    />
+                  </label>
+                  <label>
+                    {hasProfile ? "Voice learned" : "Learn voice (optional)"}
+                    <input
+                      type="file"
+                      accept="audio/*,video/*"
+                      disabled={profileUploadingName !== null}
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        if (file) {
+                          void learnSpeakerProfile(speaker.name, file);
+                        }
+                        event.target.value = "";
+                      }}
+                    />
+                  </label>
+                  <p className="helper-text">
+                    {profileUploadingName === speaker.name.trim()
+                      ? "Learning this voice..."
+                      : hasProfile
+                        ? "The diarizer will match this name by voice, not by speaking order."
+                        : "Use a clean solo clip or an already isolated track once."}
+                  </p>
+                </div>
+              );
+            })}
           </div>
 
           <label className="toggle-row">
@@ -6102,7 +6645,7 @@ function App() {
 
           <p className="helper-text">`Word` mode switches speakers using each word timestamp, which is usually tighter around handoffs. The project vocabulary lives in the Vocab tab and biases transcription toward names and technical terms Whisper tends to mishear.</p>
           {showPyannoteSetupHint ? (
-            <p className="helper-text">Multiple speakers need Hugging Face access for `pyannote/speaker-diarization-3.1`. Put `DIARIZATION_AUTH_TOKEN=hf_...` in `.env`.</p>
+            <p className="helper-text">Multiple speakers need Hugging Face access for `pyannote/speaker-diarization-community-1`. Put `DIARIZATION_AUTH_TOKEN=hf_...` in `.env`.</p>
           ) : null}
 
           <button className="primary-button" disabled={loading || retranscribing || !selectedFile} onClick={handleTranscribe}>
@@ -6377,8 +6920,26 @@ function App() {
             captions={activeEditor?.captions ?? []}
             speakerEvents={speakerTimelineEvents}
             overlapRegions={overlapRegions}
+            enabledOverlapKeys={enabledOverlapKeys}
+            selectedOverlapIndex={selectedOverlapIndex}
+            focusRequest={waveformFocus}
             currentTime={currentTime}
             theme={themeDark ? "dark" : "light"}
+            onSeek={seekAudio}
+            onSelectOverlap={setSelectedOverlapIndex}
+          />
+          <OverlapDock
+            apiBaseUrl={API_BASE_URL}
+            audioFile={selectedFile}
+            regions={overlapRegions}
+            turns={speakerTurns}
+            speakers={activeEditor?.speakers ?? speakerInputs}
+            choices={overlapChoices}
+            onChoicesChange={setOverlapChoices}
+            selectedIndex={selectedOverlapIndex}
+            onSelectIndex={setSelectedOverlapIndex}
+            onProcessed={handleSeparationProcessed}
+            onApplyWords={applySeparatedWords}
             onSeek={seekAudio}
           />
           <div className="waveform-strip">
@@ -6411,10 +6972,12 @@ function App() {
               <button
                 type="button"
                 className="waveform-event-chip event-overlap"
-                title="Open the Overlaps panel to spotlight or mute a voice"
+                title="Zoom the waveform to the next overlap — click a highlighted band to spotlight or mute a voice"
                 onClick={() => {
-                  setSidePanelTab("overlaps");
-                  setIsGuidePanelCollapsed(false);
+                  const next = selectedOverlapIndex === null ? 0 : (selectedOverlapIndex + 1) % overlapRegions.length;
+                  const region = overlapRegions[next];
+                  setSelectedOverlapIndex(next);
+                  setWaveformFocus((current) => ({ start: region.start, end: region.end, nonce: (current?.nonce ?? 0) + 1 }));
                 }}
               >
                 <AudioLines size={12} aria-hidden />
@@ -6422,8 +6985,8 @@ function App() {
               </button>
             ) : null}
             {soloTracks.status === "running" ? (
-              <span className="metric-chip" title="Preparing per-speaker audio so the speaker mute toggles isolate voices inside overlaps">
-                <Loader2 size={12} className="spin" aria-hidden /> Isolating overlap voices…
+              <span className="metric-chip" title="Checking each voice inside overlap and rapid-handoff windows">
+                <Loader2 size={12} className="spin" aria-hidden /> Checking overlap and handoff voices…
               </span>
             ) : null}
             {soloTracks.status === "done" && Object.keys(soloTracks.tracks).length ? (
@@ -6977,19 +7540,11 @@ function App() {
 
                 {sidePanelTab === "overlaps" ? (
                   <OverlapsPanel
-                    apiBaseUrl={API_BASE_URL}
-                    audioFile={selectedFile}
                     regions={overlapRegions}
-                    turns={speakerTurns}
-                    speakers={activeEditor?.speakers ?? speakerInputs}
-                    language={activeWorkspace?.language ?? session?.language ?? null}
                     restoreSoloTracks={restoreSoloTracks}
                     onRestoreSoloTracksChange={setRestoreSoloTracks}
                     restoreEngine={restoreEngine}
                     onRestoreEngineChange={setRestoreEngine}
-                    onProcessed={handleSeparationProcessed}
-                    onApplyWords={applySeparatedWords}
-                    onSeek={seekAudio}
                   />
                 ) : null}
 
@@ -7160,6 +7715,42 @@ function App() {
                             </Fragment>
                           ))}
                         </div>
+                        {speakerAudioExports.some((entry) => entry.words) ? (
+                          <>
+                            <p className="helper-text">
+                              Per-speaker transcripts, taken from each isolated track on its own — timings are on the
+                              shared timeline, so they line up with the audio above even inside overlaps.
+                            </p>
+                            <div className="inline-actions">
+                              {speakerAudioExports.map((entry) =>
+                                entry.words ? (
+                                  <Fragment key={`words-${entry.speakerId}`}>
+                                    <button
+                                      onClick={() =>
+                                        downloadText(
+                                          `${entry.transcriptBasename}.subtitles.srt`,
+                                          stemWordsToSrt(entry.words!),
+                                        )
+                                      }
+                                    >
+                                      {entry.name} — subtitles (.srt)
+                                    </button>
+                                    <button
+                                      onClick={() =>
+                                        downloadText(
+                                          `${entry.transcriptBasename}.transcript.txt`,
+                                          stemWordsToTranscriptText(entry.words!, entry.name),
+                                        )
+                                      }
+                                    >
+                                      {entry.name} — transcript (.txt)
+                                    </button>
+                                  </Fragment>
+                                ) : null,
+                              )}
+                            </div>
+                          </>
+                        ) : null}
                       </>
                     ) : (
                       <p className="helper-text">
@@ -7272,4 +7863,3 @@ function App() {
 }
 
 export default App;
-

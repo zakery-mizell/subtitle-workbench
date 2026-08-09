@@ -22,22 +22,6 @@ from .schemas import TtsParams, TtsResult
 TTS_REFERENCE_RATE = 24000  # Qwen resamples internally; feed it 24 kHz mono
 MAX_REFERENCE_SECONDS = 30.0
 
-# Our language names mapped to whisper ISO codes for reference transcription.
-_WHISPER_LANG: dict[str, str | None] = {
-    "Auto": None,
-    "English": "en",
-    "Chinese": "zh",
-    "German": "de",
-    "Italian": "it",
-    "Portuguese": "pt",
-    "Spanish": "es",
-    "Japanese": "ja",
-    "Korean": "ko",
-    "French": "fr",
-    "Russian": "ru",
-}
-
-
 def tts_output_dir() -> Path:
     return Path(settings.mastering_output_dir).parent / "tts"
 
@@ -119,7 +103,7 @@ def _resolve_ref_text(
             result, _, _ = transcribe_with_whisperx(
                 ref_path,
                 model_name=params.whisper_model,
-                requested_language=_WHISPER_LANG.get(params.language),
+                requested_language="en",
                 hotwords=None,
             )
         finally:
@@ -179,7 +163,7 @@ def run_tts(
     reporter.stage("synthesize", 0.30, 0.94, "Synthesizing speech")
     audio, out_sr = synthesize_speech(
         params.text,
-        language=params.language,
+        language="English",
         ref_wav=ref_wav,
         ref_sr=TTS_REFERENCE_RATE,
         ref_text=ref_text,

@@ -69,12 +69,27 @@ The token's Hugging Face account needs gated access to:
 
 - `https://hf.co/pyannote/speaker-diarization-community-1`
 
+### Remembering speaker identities
+
+Diarization produces anonymous voice clusters; a typed name does not tell the
+model what that person sounds like. In the Source panel, **Learn voice** saves a
+local voice profile from a clean solo clip or an already isolated track. On
+later recordings, entering the same speaker name makes the workbench match the
+anonymous clusters to the saved voices automatically. Profiles stay local in
+`models/speaker_profiles/` and only need to be learned once.
+
+Without a saved profile, names still fall back to detected speaking order. That
+is convenient but inherently fallible when the diarizer briefly invents a
+speaker at the beginning or misses someone's first short reply.
+
 The first multi-speaker run also needs internet access to download the gated pyannote models. After those assets are cached locally, later runs can work offline.
 
-Diarization uses community-1's exclusive mode (a single most-likely speaker at any moment), which
-keeps word-level speaker assignment stable through overlaps and backchannels. Multi-speaker runs
-default to the "Word (tighter switches)" speaker timing mode so captions split exactly where the
-speaker changes; "Segment (stable)" is still available in the setup drawer.
+Diarization uses community-1's exclusive mode (a single most-likely speaker at any moment). Speaker
+assignment always uses one hybrid policy: word timing places precise handoffs, segment timing repairs
+a short stray edge when diarization splits one coherent aligned sentence, and the raw targeted-window
+UniSE audit can correct clear mistakes without fragmenting a segment that already has a strong speaker
+majority. There is no timing-mode selector. All transcription and generated speech is
+English-only; language auto-detection and language selectors are intentionally disabled.
 
 When a transcript has multiple speakers, the transport bar gains a speaker selector ("All speakers"
 / "Only <name>") that mutes playback outside the chosen speaker's words, so you can audit one voice
@@ -110,15 +125,36 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-unise.ps1   # Windows
 
 What it does:
 
-- **Automatic solo tracks** — after transcription, a background job renders one full-length track
-  per speaker in which every overlap is replaced by that speaker's isolated voice (UniSE
-  target-speaker extraction, enrollment picked from the speaker's nearest clean solo span). The
+- **Automatic targeted solo tracks** — after transcription, a background job renders one
+  timeline-preserving track per speaker. UniSE target-speaker extraction inspects merged
+  windows around detected overlaps and rapid speaker handoffs, but replaces audio **only inside
+  genuine overlaps**. Ordinary handoffs keep the untouched recording. UniSE always receives at least its
+  native five seconds of surrounding context, while audible corrections remain confined to overlapping speech. Those windows use a nearby clean
+  solo voice sample; everywhere else keeps the untouched original sound. The assembled track is
+  then muted outside that speaker's speech regions. The
   "Only <name>" selector uses these tracks transparently; "All speakers" playback always stays the
   untouched original, so a false-positive overlap can never degrade normal listening. Finished
   tracks persist across page reloads (artifacts are revalidated instead of re-rendered).
-- **Overlaps tab** — per-region controls to *spotlight* one voice (duck the original mix ~11 dB and
-  lay the separated voice on top) or *mute* one voice (replace the region with the
-  everyone-but-X reconstruction). The result plugs into the instant Original/Separated A/B toggle.
+- **Per-speaker transcripts** — every rendered track is also transcribed on its own with WhisperX
+  (the *speaker-based* transcript, complementing the word-based mixture transcript). Because each
+  stem carries a single voice, its words survive overlaps that the mixture transcript loses. The
+  Export tab offers per-speaker subtitles (.srt) and transcript (.txt), timed on the shared
+  timeline so they line up with the isolated audio downloads.
+- **Automatic handoff auditing** — on every diarized multi-speaker upload, the app compares words
+  near rapid speaker changes against the raw UniSE target-speaker window results. It automatically
+  reassigns only words that are clearly present in the other speaker's stem and absent from the
+  currently assigned stem; ambiguous cases stay unchanged. Confirmed changes re-split the affected
+  subtitle boundary and create an undo checkpoint. Each target window is transcribed before it is
+  blended or gated, so a mistaken diarization boundary cannot erase the evidence needed to correct it.
+  Short pause-bounded utterances (up to three words) are also treated as candidates even when both
+  surrounding gaps are too large to count as a fast handoff. Because generated UniSE stems can leak,
+  these candidates are assigned by comparing the original utterance against every speaker's clean
+  pyannote voice embedding; one speaker must win by conservative absolute and relative margins.
+- **Overlaps on the waveform** — overlap regions are highlighted bands on the main waveform
+  (scroll to zoom in, click a band to open its controls under the waveform): *spotlight* one voice
+  (duck the original mix ~16 dB and lay the separated voice on top) or *mute* one voice (replace
+  the region with the everyone-but-X reconstruction). The result plugs into the instant
+  Original/Separated A/B toggle.
 - **Word recovery** — spotlighted stems are transcribed with WhisperX; recovered words (usually
   lost, because mixed audio transcribes only the dominant voice) can be added to the transcript as
   a caption for that speaker with one click.
@@ -129,12 +165,12 @@ What it does:
 
 Notes:
 
-- Separation is generative 16 kHz re-synthesis confined to the overlap regions (the rest of the
-  audio is untouched, bit-for-bit). Words can occasionally warble — review recovered text before
+- Separation is generative 16 kHz re-synthesis confined to overlap and rapid-handoff windows (the
+  rest of the audio is untouched). Words can occasionally warble — review recovered text before
   trusting it, and treat spotlight/mute renders as listening/repair aids rather than mastering
   output.
-- Inference cost scales with total overlap duration x speakers involved, not file length
-  (roughly 2.4x real-time per speaker per overlap on Apple Silicon MPS; much faster on CUDA).
+- Automatic separation cost scales with the total duration of merged overlap/handoff windows and
+  the relevant speakers in each window, rather than the full recording duration.
 - UniSE model code is vendored into `vendor/unified-audio/` and checkpoints into
   `checkpoints/unise/` by the install script; `backend/tools/demo_unise.py` builds a synthetic
   two-voice overlap clip and verifies the engine end to end.
@@ -315,8 +351,7 @@ How it works (the "Voice" tab):
 - With no transcript at all (auto-transcribe off or failed), it falls back to **voice-signature
   mode** — cloning from the speaker embedding alone. It still sounds like the speaker, but with
   lower fidelity; the result is labeled accordingly.
-- Language select covers the 10 supported languages (Chinese, English, German, Italian,
-  Portuguese, Spanish, Japanese, Korean, French, Russian) plus Auto-detect.
+- Language is fixed to English for synthesis and reference transcription.
 - Advanced: a smaller `0.6b` model variant (faster, ~2.5 GB, downloads lazily on first use) and
   the WhisperX model used for reference transcription.
 

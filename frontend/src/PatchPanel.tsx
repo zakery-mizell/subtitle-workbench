@@ -5,14 +5,12 @@ import {
   defaultSpeechEditParams,
   deleteSpeechEdit,
   fetchSpeechEditJob,
-  SPEECHEDIT_LANGUAGES,
   speechEditAudioUrl,
   startSpeechEditJob,
 } from "./lib/speechedit";
 import type {
   PatchEdit,
   SpeechEditJobStatus,
-  SpeechEditLanguage,
   SpeechEditMode,
   SpeechEditOutputFormat,
   SpeechEditParams,
@@ -380,19 +378,6 @@ export function PatchPanel({ apiBaseUrl, audioFile }: PatchPanelProps) {
                 })
               }
             />
-          </label>
-          <label>
-            Transcription language
-            <select
-              value={params.language}
-              onChange={(event) => update((draft) => void (draft.language = event.target.value as SpeechEditLanguage))}
-            >
-              {SPEECHEDIT_LANGUAGES.map((language) => (
-                <option key={language} value={language}>
-                  {language}
-                </option>
-              ))}
-            </select>
           </label>
           <label>
             Transcription model

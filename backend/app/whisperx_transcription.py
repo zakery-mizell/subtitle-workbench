@@ -62,6 +62,10 @@ def transcribe_with_whisperx(
     requested_language: str | None,
     hotwords: str | None = None,
 ) -> tuple[dict[str, Any], list[WarningItem], bool]:
+    # Deliberately enforce this at the shared lowest-level entrypoint as well as
+    # in each UI/API workflow. Future callers cannot accidentally reintroduce
+    # auto-detection or a second alignment language.
+    requested_language = "en"
     with suppress_known_audio_stack_warnings():
         import torch
         import whisperx

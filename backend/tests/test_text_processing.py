@@ -5,6 +5,33 @@ from backend.app.text_processing import build_guide_blocks, build_words
 
 
 class TextProcessingTests(unittest.TestCase):
+    def test_hybrid_speaker_assignment_uses_word_timing_then_segment_fallback(self) -> None:
+        calls: list[tuple[float, float]] = []
+
+        def lookup(start: float, end: float):
+            calls.append((start, end))
+            if (start, end) == (0.0, 2.0):
+                return 0, "Speaker 1"  # stable segment context
+            if start >= 1.0:
+                return 1, "Speaker 2"  # precise word-level handoff
+            return None, None  # word gap falls back to the segment
+
+        segments = [
+            {
+                "start": 0.0,
+                "end": 2.0,
+                "words": [
+                    {"word": "before", "start": 0.2, "end": 0.6},
+                    {"word": "after", "start": 1.2, "end": 1.6},
+                ],
+            }
+        ]
+
+        # Legacy mode values no longer alter the single universal policy.
+        for legacy_mode in ("segment", "word", "hybrid"):
+            words = build_words(segments, lookup, speaker_assignment_mode=legacy_mode)
+            self.assertEqual([word.speaker_id for word in words], [0, 1])
+
     def test_build_words_tolerates_missing_alignment_values(self) -> None:
         words = build_words(
             [
@@ -28,6 +55,48 @@ class TextProcessingTests(unittest.TestCase):
         self.assertEqual(words[1].start, 11.2)
         self.assertGreater(words[1].end, words[1].start)
         self.assertAlmostEqual(words[1].confidence, 0.9)
+
+    def test_hybrid_repairs_a_short_wrong_speaker_prefix_inside_one_segment(self) -> None:
+        def lookup(start: float, end: float):
+            if (start, end) == (138.766, 139.006):
+                return 2, "Speaker 3"
+            if (start, end) == (139.338, 141.34):
+                return 1, "Speaker 2"
+            if start < 139.975:
+                return 2, "Speaker 3"
+            return 1, "Speaker 2"
+
+        words = build_words(
+            [
+                {
+                    "start": 138.766,
+                    "end": 139.006,
+                    "words": [{"word": "So,", "start": 138.766, "end": 139.006}],
+                },
+                {
+                    "start": 139.338,
+                    "end": 141.34,
+                    "words": [
+                        {"word": "That's", "start": 139.338, "end": 139.538},
+                        {"word": "too", "start": 139.578, "end": 139.718},
+                        {"word": "good", "start": 139.738, "end": 139.898},
+                        {"word": "a", "start": 139.918, "end": 139.938},
+                        {"word": "work", "start": 139.979, "end": 140.159},
+                        {"word": "of", "start": 140.199, "end": 140.259},
+                        {"word": "art", "start": 140.339, "end": 140.499},
+                        {"word": "for", "start": 140.539, "end": 140.619},
+                        {"word": "me", "start": 140.659, "end": 140.739},
+                        {"word": "to", "start": 140.779, "end": 140.839},
+                        {"word": "cry", "start": 140.879, "end": 141.099},
+                        {"word": "over.", "start": 141.179, "end": 141.34},
+                    ],
+                },
+            ],
+            lookup,
+        )
+
+        self.assertEqual(words[0].speaker_id, 2)
+        self.assertEqual({word.speaker_id for word in words[1:]}, {1})
 
     def test_build_words_estimates_word_timing_when_alignment_is_missing(self) -> None:
         words = build_words(

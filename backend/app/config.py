@@ -15,11 +15,11 @@ class Settings(BaseSettings):
     diarization_max_duration_seconds: float = 3600.0
     low_confidence_threshold: float = 0.55
     silence_seconds: float = 5.0
-    default_language: str | None = None
     mastering_output_dir: str = str(ROOT_DIR / "tmp" / "mastering")
     mastering_device: str = "auto"
     mastering_job_ttl_seconds: float = 14400.0
     model_cache_dir: str = str(ROOT_DIR / "models")
+    speaker_profile_dir: str = str(ROOT_DIR / "models" / "speaker_profiles")
     # Diamond restore device (env RESTORE_DEVICE). None = auto: cuda if
     # available else cpu (never auto-mps; see restore/engine.py device notes).
     restore_device: str | None = None

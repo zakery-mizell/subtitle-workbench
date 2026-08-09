@@ -104,10 +104,10 @@ class MainApiTests(unittest.TestCase):
             ],
         )
 
-    def test_resolve_requested_language_allows_auto_detection(self) -> None:
-        self.assertIsNone(resolve_requested_language(None, None))
-        self.assertEqual(resolve_requested_language("  es  ", None), "es")
-        self.assertEqual(resolve_requested_language(None, "fr"), "fr")
+    def test_resolve_requested_language_is_always_english(self) -> None:
+        self.assertEqual(resolve_requested_language(None, None), "en")
+        self.assertEqual(resolve_requested_language("  es  ", None), "en")
+        self.assertEqual(resolve_requested_language(None, "fr"), "en")
 
     def test_shift_segment_times_tolerates_missing_word_timestamps(self) -> None:
         shifted = shift_segment_times(

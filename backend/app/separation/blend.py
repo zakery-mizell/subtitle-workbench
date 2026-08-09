@@ -14,8 +14,13 @@ import numpy as np
 import soxr
 
 DEFAULT_CROSSFADE_SECONDS = 0.06
-DEFAULT_DUCK_DB = -11.0
+# The stem is lifted to roughly the two-speaker mixture level, so the duck has to
+# carry the whole target-to-interferer ratio on its own; -11 dB left the other
+# voice plainly audible.
+DEFAULT_DUCK_DB = -16.0
 STEM_HEADROOM_DB = -1.0
+# A near-silent stem makes the RMS ratio explode; +12 dB is as far as we trust it.
+MAX_STEM_GAIN = 4.0
 
 
 @dataclass(slots=True)
@@ -46,7 +51,7 @@ def match_stem_gain(stem: np.ndarray, reference: np.ndarray, headroom_db: float 
     ref_rms = _rms(reference)
     if stem_rms < 1e-6 or ref_rms < 1e-6:
         return stem.astype(np.float32)
-    gain = (ref_rms / stem_rms) * (10.0 ** (headroom_db / 20.0))
+    gain = min((ref_rms / stem_rms) * (10.0 ** (headroom_db / 20.0)), MAX_STEM_GAIN)
     return (stem * gain).astype(np.float32)
 
 
@@ -60,6 +65,11 @@ def _edge_ramps(length: int, fade: int) -> np.ndarray:
         envelope[:fade] = curve
         envelope[length - fade :] = curve[::-1]
     return envelope
+
+
+def _complement(blend: np.ndarray) -> np.ndarray:
+    """The other half of an equal-power pair: cos where `blend` is sin."""
+    return np.sqrt(np.clip(1.0 - np.square(blend), 0.0, 1.0)).astype(np.float32)
 
 
 def region_envelope(
@@ -193,6 +203,7 @@ def apply_replace(
     fade = int(crossfade_seconds * sample_rate)
     blend = _edge_ramps(end - start, fade)
 
-    samples[:, start:end] *= 1.0 - blend
+    # Equal power: 1 - blend would dip 2.3 dB at every fade midpoint.
+    samples[:, start:end] *= _complement(blend)
     samples[:, start:end] += piece * blend
     _limit_region(samples, start, end)

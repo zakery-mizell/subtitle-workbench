@@ -9,21 +9,7 @@ from ..schemas import WarningItem
 SpeechEditMode = Literal["edit", "generate"]
 SpeechEditOutputFormat = Literal["wav", "flac", "mp3", "aac", "opus"]
 
-# Language names mapped to whisper ISO codes for reference/window transcription;
-# copied from the tts engine so the two panels offer the same set.
-SpeechEditLanguage = Literal[
-    "Auto",
-    "Chinese",
-    "English",
-    "German",
-    "Italian",
-    "Portuguese",
-    "Spanish",
-    "Japanese",
-    "Korean",
-    "French",
-    "Russian",
-]
+SpeechEditLanguage = Literal["English"]
 
 
 class PatchEdit(BaseModel):
@@ -52,7 +38,7 @@ class SpeechEditParams(BaseModel):
     ref_text: str = ""
     auto_ref_text: bool = True
     whisper_model: str = "small"
-    language: SpeechEditLanguage = "Auto"
+    language: SpeechEditLanguage = "English"
     # Flow-matching function evaluations; more = higher quality, slower.
     nfe_step: int = Field(32, ge=8, le=64)
     speed: float = Field(1.0, ge=0.5, le=2.0)

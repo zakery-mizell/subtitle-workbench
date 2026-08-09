@@ -22,9 +22,7 @@ It is based on the wired-up code in:
 - Whisper model selection from `tiny` through `large-v3` and `turbo`.
 - Configurable speaker count, up to 12 speakers.
 - Editable speaker names before and after transcription.
-- Speaker timing mode toggle for multi-speaker sessions:
-  - `segment`
-  - `word`
+- Fixed hybrid speaker timing for multi-speaker sessions: word-level switch placement with segment-level context/fallback; no user-selectable mode.
 - Single project glossary / jargon list used as WhisperX hotwords during transcription.
 - Optional filler-word / simple-stutter cleanup for full transcription and range retranscription.
 - WhisperX transcription with GPU or CPU execution.
@@ -40,9 +38,10 @@ It is based on the wired-up code in:
 ## 2. Speaker Handling
 
 - Optional multi-speaker diarization path through WhisperX / pyannote when multiple speakers are requested and a diarization token is configured.
+- Persistent local voice profiles learned from a clean solo clip or isolated track; saved profiles map anonymous diarization clusters to requested speaker names by voice similarity instead of relying on first-appearance order.
 - Fallback to single-speaker labeling when diarization is unavailable, not configured, or fails.
 - Duration-based diarization cutoff for long files, with warning messaging instead of attempting an expensive diarization pass.
-- Segment-level or word-level speaker assignment after diarization.
+- One universal hybrid speaker assignment policy after diarization: word-level timing places precise switches; segment identity supplies fallback and repairs a ≤0.75 s stray prefix/suffix only when its speaker clearly dominates the rest of that aligned segment; the later raw targeted-window UniSE audit corrects strongly supported handoff mistakes but cannot fragment a segment whose current speaker already has a clear majority. No timing-mode control remains.
 - Imported speaker labels from SRT can be normalized into app speaker identities.
 - Speaker reassignment from a selected caption forward across the current contiguous speaker run.
 - Per-speaker subtitle attribution can be turned on or off for export.
@@ -182,15 +181,15 @@ It is based on the wired-up code in:
   - model
   - speaker count
   - speakers JSON
-  - speaker assignment mode
-  - optional language
+  - legacy speaker assignment field (accepted but ignored; hybrid is always used)
+  - legacy language field (accepted but ignored; English is always used)
   - optional hotwords
   - optional disfluency cleanup
 - `POST /api/retranscribe-range` accepts wired-up request fields for:
   - audio upload
   - model
   - start / end timestamps
-  - optional language
+  - legacy language field (accepted but ignored; English is always used)
   - optional hotwords
   - optional disfluency cleanup
 - Structured API responses for:
@@ -199,8 +198,8 @@ It is based on the wired-up code in:
   - captions
   - guide blocks
   - warnings
-  - language
-  - speaker assignment mode
+  - fixed language (`en`)
+  - fixed speaker assignment policy (`hybrid`)
   - GPU usage flag
 
 ## 10. Runtime and Processing Details
@@ -210,7 +209,7 @@ It is based on the wired-up code in:
 - Configurable diarization cutoff.
 - Configurable low-confidence threshold.
 - Configurable silence threshold used for `SILENT` guide blocks.
-- Configurable default language.
+- English-only WhisperX alignment/transcription across uploads, range retranscription, UniSE stems, voice references, and speech-edit windows.
 - Audio is normalized to mono 16 kHz WAV when needed for diarization and retranscription clipping.
 - GPU out-of-memory handling returns a user-facing error that recommends closing other GPU apps or using a smaller model.
 - Warning propagation from backend to UI when alignment or diarization fall back.
@@ -243,19 +242,23 @@ Local Auphonic-style post production implemented in `backend/app/mastering/` and
 - Follow playback is on by default; the caption/transcript list auto-scrolls to the active block and suspends for 3 s after manual scrolling.
 - Streamlined layout: one-row transport bar (clock, A/B, view mode, jump, gear popover with view toggles), consolidated waveform strip, sticky player panel, collapsible source/setup rail with summary card, warnings as a collapsible strip, and Export moved into the side panel as its own tab.
 
-## 13. Overlap Separation (Overlaps tab, UniSE)
+## 13. Overlap Separation (main waveform, UniSE)
 
 - Diarization now surfaces the raw (non-exclusive) pyannote annotation alongside the exclusive one; `/api/transcribe` returns `speaker_turns` and `overlap_regions` (spans where 2+ speakers talk at once, ≥0.4 s, merged across ≤0.4 s gaps).
-- Overlap regions render as translucent bands on the waveform plus an "N overlaps to untangle" chip that opens the Overlaps side-panel tab.
-- Per-region controls: Spotlight one voice (duck the original mix ~11 dB and overlay the AI-separated voice) or Mute one voice (replace the region with the everyone-but-X reconstruction), with a speaker picker per region.
+- Overlap regions render as labeled clickable bands directly on the main waveform; the "N overlaps to untangle" chip zooms the waveform to the next overlap and selects it. The main waveform zooms with plain scroll (anchored at the cursor, trackpad horizontal / shift+drag pans, double-click or the Fit badge resets) with time ticks while zoomed.
+- Per-region controls live in a dock under the waveform (opened by clicking a band or a chip in the dock's numbered overlap strip, which also shows each region's enabled state): Spotlight one voice (duck the original mix ~16 dB and overlay the AI-separated voice) or Mute one voice (replace the region with the everyone-but-X reconstruction), with a speaker picker per region; the Overlaps side-panel tab keeps only the global solo-track settings.
 - Separation engine: vendored Alibaba QuarkAudio-UniSE (decoder-only AR-LM over BiCodec speech tokens, WavLM features, 16 kHz, 5 s windows) in `backend/app/separation/`; task modes `se`/`tse`/`rtse`; enrollment audio picked automatically from the target speaker's nearest clean solo span (≥1.5 s, ideally 5 s); MPS→CPU fallback; `transformers_compat.py` bridges the vendored code onto transformers ≥4.5x.
 - `POST /api/separate` job (shared job registry/polling with mastering) blends stems back into the full-length original at its native sample rate with equal-power crossfades, RMS matching, and a region peak limiter; artifacts under `tmp/separation/` with audio/waveform/delete endpoints.
 - Optional per-region WhisperX transcription of the spotlighted stem returns recovered words; one click adds them to the transcript as a new caption for that speaker (words in overlaps are otherwise usually lost — the mixed audio transcribes only the dominant voice).
 - Result playback goes through the existing instant A/B toggle, relabeled Original/Separated; download button for the processed file.
 - Install via `scripts/install-unise.sh` / `.ps1` (clones vendor repo, installs `backend/requirements-separation.txt`, downloads ~2.8 GB of checkpoints into `checkpoints/unise/`); `backend/tools/demo_unise.py` builds a synthetic two-voice overlap clip and verifies separation end to end.
 - Unit tests for overlap/solo-span math, enrollment picking, and blend rendering (`backend/tests/test_separation.py`).
-- Automatic solo tracks: when a transcription reports overlap regions, a background job (`POST /api/separate-solo`) renders one full-length track per involved speaker with every overlap replaced by that speaker's isolated voice (UniSE tse). The "Only <speaker>" transport selector then plays original audio in solo passages and the separated voice through overlaps — no manual steps. While soloing with a ready track, the mute gate opens on diarized turns (not just transcript words) so overlap speech whose words never transcribed is still audible. Main "All speakers" playback never uses these tracks, so false-positive overlaps cannot degrade normal listening. Status chips: "Isolating overlap voices…" / "Solo voices ready".
+- Automatic solo tracks: every diarized multi-speaker transcription starts a background job (`POST /api/separate-solo`) that renders one full-length track per speaker. UniSE patches only merged overlap and rapid-handoff windows; the original audio remains elsewhere before the track is gated to that speaker. The "Only <speaker>" transport selector uses these tracks with no manual steps. Main "All speakers" playback never uses them, so a false-positive target window cannot degrade normal listening. Status chips: "Checking overlap and handoff voices…" / "Solo voices ready".
 - Simultaneous-speech subtitles: captions of different speakers that share >50% of the shorter one's duration merge into a single broadcast-style dialogue cue on SRT export (one line per speaker, "- " dashes or "NAME: " prefixes when attribution is on), so exports never contain overlapping timecodes. In the editor those captions get an overlap badge with a left accent border, and playback highlights every caption under the playhead, not just the first. Auto solo tracks are encoded as FLAC to halve disk use.
+- Targeted voice separation (`mode: "targeted"` on `POST /api/separate-solo`, the default for every diarized multi-speaker recording): rapid word-level speaker boundaries become 2.5-second candidate windows, overlap spans are added, and nearby/overlapping candidates are merged. UniSE TSE runs only for the relevant speakers inside those windows, using the nearest clean solo enrollment. The inference slice always carries at least UniSE's native five seconds of context so a short target does not wrap the outgoing voice into the model input; only the detected core is audited and patched. Each full-length playback track keeps the original audio elsewhere and is then gated to that speaker's speech regions. There is no full-recording UniSE option in the UI.
+- Speaker-based transcription (`transcribe: true`, always sent by the frontend): each assembled, gated speaker track is transcribed on the shared timeline for per-speaker SRT/TXT export. In addition, every raw targeted UniSE window is transcribed before blending or gating when handoff auditing is active; these independent words are not erased by the diarization boundary being checked. Results persist across reloads with the track tokens.
+- Automatic rapid-handoff audit (default for every diarized multi-speaker upload): raw targeted-window transcripts are compared only against mixture words within 1 second of a tight speaker transition. The service returns conservative corrections when the alternate voice extraction has strong time-aligned lexical evidence while the assigned extraction does not. The frontend applies confirmed word-speaker changes, re-runs the deterministic caption splitter for the connected boundary captions, preserves unrelated or concurrently edited subtitle text, records a warning, and adds one undo checkpoint. Short acknowledgements require a corroborating neighbouring correction; ambiguous/leaky evidence never changes attribution.
+- Missed-handoff recovery for isolated replies: a pause-bounded aligned segment of up to three words and 1.25 seconds becomes a targeted candidate even when no adjacent word already carries a different speaker label. All enrolled speakers are included in its UniSE listening window, but attribution uses the original audio rather than generated stems: the cached pyannote Community-1 embedding model compares the reply (with 100 ms silent-side context) against each speaker's nearest clean five-second enrollment. A correction requires similarity ≥0.20, ≥0.10 over the runner-up, and ≥0.15 over the currently assigned speaker. Missing/ambiguous embeddings leave the label unchanged. This catches fully mislabeled one-word replies that ordinary boundary discovery cannot see.
 
 ## 14. Speech Restoration (Restore tab: Sidon + Diamond)
 
@@ -280,9 +283,9 @@ Local Auphonic-style post production implemented in `backend/app/mastering/` and
 - Two clone modes: higher-fidelity ICL "transcript" mode when a reference transcript exists — a manually typed transcript wins, else the clip is auto-transcribed with WhisperX (toggleable, selectable model, default `small`) — falling back to x-vector-only "voice-signature" mode (speaker embedding alone, lower fidelity) with a warning when transcription is off, fails, or comes back empty. The result reports the clone mode and the exact transcript used.
 - Reference clips are decoded to mono 24 kHz and trimmed to the first 30 s with a truncation warning; the clone prompt is built once per job and reused across chunks.
 - Synthesis text up to 20,000 chars is split into ≤300-char chunks at sentence boundaries (over-long sentences hard-split on whitespace), rendered chunk by chunk with per-chunk progress, stitched with 0.12 s gaps, then peak-normalized once; both RNGs seeded for reproducibility.
-- 10 languages (Chinese, English, German, Italian, Portuguese, Spanish, Japanese, Korean, French, Russian) plus Auto; model sizes `1.7b` (default) and `0.6b` (faster, downloads lazily on first use); output wav/flac/mp3/aac/opus (default FLAC).
+- English-only synthesis and reference transcription; model sizes `1.7b` (default) and `0.6b` (faster, downloads lazily on first use); output wav/flac/mp3/aac/opus (default FLAC).
 - Device policy: cuda → mps → cpu — MPS IS auto-picked here (unlike Diamond, the transformer is compute-bound); bfloat16 on cuda but float32 on mps/cpu (fp16/bf16 cloning is broken on MPS); flash_attention_2 only on cuda when `flash_attn` imports, else sdpa; `TTS_DEVICE` env override; cached engine per (size, device) with CPU fallback that rebuilds the clone prompt and retries the chunk.
-- Voice side-panel tab: reference dropzone, auto-transcribe toggle, editable reference transcript, text-to-speak with character count, language/format selects, Advanced settings (model size, WhisperX model), progress bar, result chips (rate, duration, format, device, clone mode), inline player, "Reference transcript used" disclosure, download, and discard.
+- Voice side-panel tab: reference dropzone, auto-transcribe toggle, editable reference transcript, text-to-speak with character count, format select, Advanced settings (model size, WhisperX model), progress bar, result chips (rate, duration, format, device, clone mode), inline player, "Reference transcript used" disclosure, download, and discard. Language is fixed to English with no selector.
 - Install via `scripts/install-tts.sh` / `.ps1`: `qwen-tts` installed `--no-deps` so its transformers/gradio pins cannot fight the venv, then unpinned accelerate, then the ~4.5 GB 1.7B checkpoint into the `models/` HF cache.
 
 ## 16. Seed-VC voice conversion (Convert tab)
@@ -344,5 +347,5 @@ do not do it.
 - Mel-infill mechanics (mirrors `infer/speech_edit.py`): RMS-normalize quiet windows up to 0.1 (un-scaled on output), build a kept/zero mel with a matching edit mask via the pure `build_edit_arrays` frame plan (`hop_length` 256, `target_sample_rate` 24000, 100 mel channels, frame = round(sec · 24000 / 256)), feed `convert_char_to_pinyin([window_text])`, `ema_model.sample(..., edit_mask=...)` then `vocoder.decode` under `torch.inference_mode()`. Generate mode calls `F5TTS.infer` (target_rms 0.1, cross_fade 0.15, sway −1, cfg 2). NFE steps (8–64, default 32), speed (0.5–2.0), and an optional seed are exposed.
 - Windowing/mask/splice math (validation, window computation, word-replacement text, frame math, crossfade splice) is kept in PURE functions so `backend/tests/test_speechedit.py` covers it without loading a model, alongside params validation and mocked-engine endpoint tests for both modes.
 - Device policy: cuda → mps → cpu — MPS IS auto-picked here (compute-bound transformer, unlike Diamond); F5-TTS enforces fp32 off-cuda itself (MPS-safe), so no dtype is set; `SPEECHEDIT_DEVICE` env override; cached engine per device with CPU fallback. `HF_HOME` is hard-set to `models/` (not setdefault — the whisper transcription pass repoints it process-wide) alongside the explicit `hf_cache_dir` F5TTS honors.
-- Patch side-panel tab: mode toggle (Patch words / Generate speech), file dropzone (edit mode prefilled from the workspace audio), an editable list of edit rows (start, end, replacement text, plus a per-row Advanced disclosure for target duration and window-text override, with add/remove-span buttons), generate-mode reference/transcript/text fields and a speed slider, an Advanced section (NFE steps, seed, transcription language and model), output-format select, progress bar, result chips (rate, duration, format, device), inline player, a "Patched N spans" list rendering `regions`, download, and discard.
+- Patch side-panel tab: mode toggle (Patch words / Generate speech), file dropzone (edit mode prefilled from the workspace audio), an editable list of edit rows (start, end, replacement text, plus a per-row Advanced disclosure for target duration and window-text override, with add/remove-span buttons), generate-mode reference/transcript/text fields and a speed slider, an Advanced section (NFE steps, seed, transcription model), output-format select, progress bar, result chips (rate, duration, format, device), inline player, a "Patched N spans" list rendering `regions`, download, and discard. Transcription and generation are fixed to English.
 - Install via `scripts/install-speechedit.sh` / `.ps1`: `f5-tts` installed `--no-deps` (its gradio/bitsandbytes pins would collide with the app), then the runtime deps traced through real imports (`cached_path hydra-core vocos torchdiffeq pypinyin rjieba tomli ema_pytorch wandb datasets` — the last three are import-time-only landmines that `f5_tts/model/__init__.py` pulls in via the Trainer/dataset modules), then the ~1.35 GB `F5TTS_v1_Base` checkpoint and the ~54 MB `charactr/vocos-mel-24khz` vocoder into the `models/` HF cache. `pip check` flags f5-tts's own skipped pins as expected noise (the script warns rather than fails).

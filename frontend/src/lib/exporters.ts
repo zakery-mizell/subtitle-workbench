@@ -262,6 +262,66 @@ function buildSpeakerLabel(speakers: Speaker[]): string {
   return extraCount > 0 ? `${visible.join("-")}-plus${extraCount}` : visible.join("-");
 }
 
+interface TimedWord {
+  text: string;
+  start: number;
+  end: number;
+}
+
+// Grouping for the per-speaker stem transcripts: a new block on a real pause,
+// or when a block grows past comfortable caption size.
+const STEM_BLOCK_GAP_SECONDS = 0.9;
+const STEM_BLOCK_MAX_SECONDS = 6.0;
+const STEM_BLOCK_MAX_CHARS = 84;
+
+function groupWordsIntoBlocks(words: TimedWord[]): Array<{ start: number; end: number; text: string }> {
+  const blocks: Array<{ start: number; end: number; text: string }> = [];
+  let current: { start: number; end: number; parts: string[]; chars: number } | null = null;
+  const sorted = [...words].sort((left, right) => left.start - right.start || left.end - right.end);
+  for (const word of sorted) {
+    const text = word.text.trim();
+    if (!text) {
+      continue;
+    }
+    const splits =
+      current !== null &&
+      (word.start - current.end > STEM_BLOCK_GAP_SECONDS ||
+        word.end - current.start > STEM_BLOCK_MAX_SECONDS ||
+        current.chars + text.length + 1 > STEM_BLOCK_MAX_CHARS);
+    if (current === null || splits) {
+      if (current) {
+        blocks.push({ start: current.start, end: current.end, text: current.parts.join(" ") });
+      }
+      current = { start: word.start, end: word.end, parts: [text], chars: text.length };
+    } else {
+      current.end = Math.max(current.end, word.end);
+      current.parts.push(text);
+      current.chars += text.length + 1;
+    }
+  }
+  if (current) {
+    blocks.push({ start: current.start, end: current.end, text: current.parts.join(" ") });
+  }
+  return blocks;
+}
+
+/** SRT of one speaker's stem transcript (timings live on the shared timeline). */
+export function stemWordsToSrt(words: TimedWord[]): string {
+  return groupWordsIntoBlocks(words)
+    .map(
+      (block, index) =>
+        `${index + 1}\n${formatSrtTimestamp(block.start)} --> ${formatSrtTimestamp(block.end)}\n${block.text}\n`,
+    )
+    .join("\n");
+}
+
+/** Plain-text transcript of one speaker's stem, one paragraph per pause. */
+export function stemWordsToTranscriptText(words: TimedWord[], speakerName?: string): string {
+  const blocks = groupWordsIntoBlocks(words);
+  const header = speakerName ? `${speakerName}\n\n` : "";
+  return header + blocks.map((block) => block.text).join("\n\n") + (blocks.length ? "\n" : "");
+}
+
 export function buildExportFilename(
   audioFilename: string | null | undefined,
   speakers: Speaker[],

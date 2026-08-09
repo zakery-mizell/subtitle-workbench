@@ -43,21 +43,6 @@ CROSSFADE_SECONDS = 0.15
 # more audio than the model sees and derail cloning.
 MAX_REFERENCE_SECONDS = 12.0
 
-_WHISPER_LANG: dict[str, str | None] = {
-    "Auto": None,
-    "English": "en",
-    "Chinese": "zh",
-    "German": "de",
-    "Italian": "it",
-    "Portuguese": "pt",
-    "Spanish": "es",
-    "Japanese": "ja",
-    "Korean": "ko",
-    "French": "fr",
-    "Russian": "ru",
-}
-
-
 # --------------------------------------------------------------------------- #
 # Artifact helpers                                                            #
 # --------------------------------------------------------------------------- #
@@ -265,7 +250,7 @@ def _transcribe_wav(audio: np.ndarray, params: SpeechEditParams) -> dict[str, An
         result, _, _ = transcribe_with_whisperx(
             ref_path,
             model_name=params.whisper_model,
-            requested_language=_WHISPER_LANG.get(params.language),
+            requested_language="en",
             hotwords=None,
         )
         return result
